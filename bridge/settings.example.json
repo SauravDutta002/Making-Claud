@@ -1,0 +1,19 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_statusline.py\""
+  },
+  "hooks": {
+    "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "PreToolUse":        [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "PostToolUse":       [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "PostToolUseFailure":[{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "Notification":      [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "Stop":              [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "PreCompact":        [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "SessionStart":      [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }],
+    "SessionEnd":        [{ "hooks": [{ "type": "command", "command": "python \"C:\\Users\\91745\\Downloads\\Making Claud\\bridge\\claude_hook.py\"" }] }]
+  }
+}
