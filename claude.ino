@@ -13,6 +13,13 @@
 
    Libraries: Adafruit GFX + Adafruit SH110X
 
+   ON ITS OWN (no laptop, or nobody touching it for 45 s)
+     A "life director" picks what Claude does: moods, work scenes,
+     naps, and self-playing games (build crane, flappy clawd,
+     permission panic, whack a bug). After a game it reacts — happy
+     or a trophy if it did well, sad or grumpy if it lost.
+     Every scene has its own quiet sound (Sound mode ALL).
+
    TOUCH
      single tap  -> next face
      double tap  -> SETTINGS  (brightness, volume, sound mode)
@@ -41,6 +48,9 @@
      U:<5h>,<wk>,<min>   usage % (5-hour, weekly), minutes to 5h reset
      X:<pct>        context window % used
      C:<hash>       new git commit (shown in the git graph)
+     T:<text>       what Claude is doing now ("editing app.py")
+     S:<commits>,<tasks>,<tests>,<cents>,<added>,<removed>,<minutes>
+                    today's stats + this session's cost/lines/time
      G:1 / G:0      start / stop the game
    ============================================================= */
 
@@ -67,7 +77,7 @@
 #define C_BLACK  SH110X_BLACK
 
 #define FRAME_MS    25       // ~40 fps
-#define SCENE_MS    5000     // auto-cycle dwell time
+#define RESUME_MS   45000    // no input this long -> Claude goes back to living on its own
 #define EYE_RADIUS  0        // 0 = hard square corners, 6-9 = rounded
 
 /* eye styles — plain defines so no custom type appears in any
@@ -96,9 +106,17 @@ uint32_t nextBlink  = 0;
 uint8_t  blinkQueue = 0;
 const uint16_t BLINK_DUR = 170;
 
-bool     autoCycle  = true;
+bool     autoCycle  = true;       // the "life" director picks scenes on its own
 uint8_t  scene      = 0;
 uint32_t sceneSince = 0;
+uint32_t sceneTick0 = 0;          // tick when the current scene started
+uint32_t sceneDur   = 5000;       // how long the director keeps this scene
+uint32_t lastInput  = 0;          // last touch / serial key, to resume autonomy
+
+/* self-playing games report how they're doing to the director */
+int8_t   playLives  = -1;
+uint16_t playScore  = 0;
+bool     playOver   = false;
 
 /* ============================================================
    LIVE DATA  (pushed from the laptop over USB serial)
@@ -116,6 +134,27 @@ char     commits[5][8] = { "1a49713", "5acfded", "0f2d768", "aaad437", "2e5f783"
 
 uint8_t  followStage = 0;             // after "done": trophy -> usage -> idle
 uint32_t followAt    = 0;
+
+char     ticker[44]  = "";            // what Claude is doing right now (T:)
+uint32_t tickerAt    = 0;
+
+bool     statsKnown  = false;         // today's stats (S:) from the bridge
+uint16_t stCommits = 0, stTasks = 0, stTests = 0, stAdded = 0, stRemoved = 0, stMin = 0;
+uint32_t stCostC   = 0;               // session cost in cents
+
+/* ============================================================
+   XP & LEVELS — Claude grows when you work together
+   commit +10, tests pass +6, task done +4, petting +1 (once a minute)
+   ============================================================ */
+uint32_t xp           = 0;
+uint8_t  level        = 0;
+bool     levelPending = false;        // show the level-up scene when possible
+uint32_t lastPetXp    = 0;
+const char* TITLES[] = { "hatchling", "intern", "junior dev", "developer", "senior dev",
+                         "staff eng", "principal", "architect", "wizard", "legend" };
+
+uint32_t xpNeed(uint8_t L) { return 15UL * L * (L + 1); }     // total xp to reach level L
+const char* levelTitle() { return TITLES[level < 9 ? level : 9]; }
 
 /* ============================================================
    GAME STATE
@@ -141,7 +180,7 @@ const uint8_t BRI_LEVELS[] = { 1, 10, 25, 50, 90, 150, 207, 255 };
 const uint8_t BRI_COUNT    = sizeof(BRI_LEVELS) / sizeof(BRI_LEVELS[0]);
 uint8_t  briIndex   = 5;          // default level, overwritten from flash
 
-const uint16_t VOL_LEVELS[] = { 8, 16, 28, 48, 80, 130, 220 };   // PWM duty of 1023
+const uint16_t VOL_LEVELS[] = { 30, 60, 110, 180, 270, 380, 512 };   // PWM duty of 1023 (512 = max)
 const uint8_t  VOL_COUNT    = sizeof(VOL_LEVELS) / sizeof(VOL_LEVELS[0]);
 uint8_t  volIndex   = 3;
 
@@ -259,6 +298,15 @@ void steam(int x, int y, uint32_t f, int cols) {
 #define BUZZER_PIN  6
 #define BUZZ_BITS   10        // loudness = VOL_LEVELS[volIndex], set in SETTINGS
 
+/* LOUDER, no wiring: small piezos are loudest around 2-4 kHz, so every
+   sound is lifted by PITCH_LIFT (1.0 = original, softer pitch).        */
+#define PITCH_LIFT  1.6f
+
+/* LOUDER, one wire: put the buzzer between GPIO6 and BUZZER_PIN2 (instead
+   of GND). That pin plays the inverted signal, doubling the voltage across
+   the buzzer (~4x power). -1 = off (buzzer's other leg on GND).          */
+#define BUZZER_PIN2 -1
+
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   #define BZ_ID BUZZER_PIN    // core 3.x addresses LEDC by pin
 #else
@@ -288,7 +336,13 @@ void soundTask(void* arg) {
 
 void buzzInit() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcAttach(BUZZER_PIN, 1000, BUZZ_BITS);
+  #if BUZZER_PIN2 >= 0
+    ledcAttachChannel(BUZZER_PIN,  1000, BUZZ_BITS, 0);   // both pins on one channel,
+    ledcAttachChannel(BUZZER_PIN2, 1000, BUZZ_BITS, 0);   // the second one inverted
+    ledcOutputInvert(BUZZER_PIN2, true);
+  #else
+    ledcAttach(BUZZER_PIN, 1000, BUZZ_BITS);
+  #endif
 #else
   ledcSetup(BZ_ID, 1000, BUZZ_BITS);
   ledcAttachPin(BUZZER_PIN, BZ_ID);
@@ -317,8 +371,8 @@ void sndClear() {
 void sndPushV(uint16_t f0, uint16_t f1, uint16_t dur, uint16_t gap, uint8_t v) {
   if (!sndLock) return;
   xSemaphoreTake(sndLock, portMAX_DELAY);
+  if (sqLen == 0) { sqHead = 0; sylStart = millis(); }   // reuse the buffer from the start
   if (sqHead + sqLen < 24) {
-    if (sqLen == 0) sylStart = millis();
     sq[sqHead + sqLen] = { f0, f1, dur, gap, v };
     sqLen++;
   }
@@ -337,7 +391,7 @@ void soundUpdate() {
   if (t < s.dur) {
     float k = (float)t / s.dur;
     float f = s.f0 + ((float)s.f1 - s.f0) * k;
-    f *= 1.0f + 0.012f * sinf(t * 0.07f);              // little vibrato
+    f *= (1.0f + 0.012f * sinf(t * 0.07f)) * PITCH_LIFT;   // vibrato + loudness lift
     // soft attack / release, shortened for tiny clicks
     uint16_t att = s.dur / 4 < 8  ? s.dur / 4 : 8;
     uint16_t rel = s.dur / 3 < 14 ? s.dur / 3 : 14;
@@ -345,11 +399,14 @@ void soundUpdate() {
     float env = 1.0f;
     if (att && t < att) env = (float)t / att;
     if (rel && rem < rel && (float)rem / rel < env) env = (float)rem / rel;
-    buzzOut((uint16_t)f, (uint16_t)(VOL_LEVELS[volIndex] * env * s.v / 100.0f) + 1);
+    // quiet effects (v 12-45 %) are lifted so they're still clearly audible
+    float vol = 0.45f + 0.55f * s.v / 100.0f;
+    buzzOut((uint16_t)f, (uint16_t)(VOL_LEVELS[volIndex] * env * vol) + 1);
   } else if (t < (uint32_t)s.dur + s.gap) {
     buzzOut(0, 0);
   } else {
     sqHead++; sqLen--;
+    if (sqLen == 0) sqHead = 0;
     sylStart = now;
   }
   xSemaphoreGive(sndLock);
@@ -385,6 +442,13 @@ void sndYay()     { static const uint16_t n[] = { 1047, 1319, 1568 }; sndNotes(n
 void sndJump()    { if (soundOn) { sndClear(); sndPush(700, 1100, 40, 0); } }
 void sndOver()    { static const uint16_t n[] = { 784, 659, 523 }; sndNotes(n, 3, 100, 30); }
 void sndHiScore() { static const uint16_t n[] = { 523, 659, 784, 1047 }; sndNotes(n, 4, 80, 20); }
+void sndLevelUp() {
+  if (!soundOn) return;
+  static const uint16_t n[] = { 784, 988, 1175, 1568 };
+  sndClear();
+  for (uint8_t i = 0; i < 4; i++) sndPushV(n[i], n[i], 70, 20, 90);
+  sndPushV(1568, 2093, 220, 0, 100);
+}
 
 /* --- petting voice ------------------------------------------
    hold starts -> "oo-h!"   while held -> coos / purr-trills
@@ -500,9 +564,67 @@ const uint16_t MELODY[] = { 1047, 1175, 1319, 1568, 1760 };
 bool ambOk() { return soundMode == SND_ALL && sqLen == 0; }
 void amb(uint16_t f0, uint16_t f1, uint16_t dur, uint8_t v) { if (ambOk()) sndPushV(f0, f1, dur, 0, v); }
 
+/* game effects: these matter, so they cut in instead of waiting */
+void fx(uint16_t f0, uint16_t f1, uint16_t dur, uint8_t v) {
+  if (soundMode != SND_ALL) return;
+  sndClear(); sndPushV(f0, f1, dur, 0, v);
+}
+void fx2(uint16_t a, uint16_t b, uint16_t dur, uint8_t v) {
+  if (soundMode != SND_ALL) return;
+  sndClear(); sndPushV(a, a, dur, dur / 2, v); sndPushV(b, b, dur + 20, 0, v);
+}
+
+/* tap to change face: a little two-note "pip-pip", pitched per scene */
+void sndTap() {
+  if (!soundOn) return;
+  uint16_t b = (uint16_t)(988 * SCALE[scene % 5]);
+  sndClear();
+  sndPushV(b, b, 30, 15, 45);
+  sndPushV((uint16_t)(b * 1.5f), (uint16_t)(b * 1.5f), 45, 0, 40);
+}
+
+/* the director moving to a new scene on its own: a softer chime */
+void sndEnter() {
+  if (!ambOk()) return;
+  uint16_t b = (uint16_t)(880 * SCALE[random(5)]);
+  sndPushV(b, (uint16_t)(b * 1.25f), 40, 0, 22);
+}
+
 void sceneSfx(uint8_t sc, uint32_t f) {
   if (soundMode != SND_ALL) return;
   switch (sc) {
+    case 0:                                               // idle: a little murmur now and then
+      if (f % 160 == 0 && ambOk()) {
+        uint16_t b = (uint16_t)(760 * SCALE[random(5)]);
+        sndPushV(b, b + 60, 60, 50, 22); sndPushV(b + 40, b - 40, 80, 0, 18);
+      }
+      break;
+    case 7:  if (f % 8 == 0 && (f / 8) % 6) amb(1500, 1500, 10, 22); break;    // letters pop in
+    case 10: if (f % 16 == 0) amb(1760, 1568, 40, 30); break;          // needs you: alert
+    case 11: if (f % 15 == 0) amb(1200, 1200, 8, 15); break;           // context ticking up
+    case 12:                                              // coffee: sip-sip
+      if (f % 70 == 0 && ambOk()) { sndPushV(600, 500, 60, 40, 20); sndPushV(620, 480, 60, 0, 18); }
+      break;
+    case 19: if (f % 80 == 0) amb(1100, 950, 120, 30); break;          // petted face: coo
+    case 24: if (f % 100 == 0) amb(1319, 1568, 60, 30); break;         // feeling great
+    case 25:                                              // not amused: grumble
+      if (f % 90 == 0 && ambOk()) { sndPushV(500, 430, 120, 30, 28); sndPushV(470, 400, 120, 0, 24); }
+      break;
+    case 26: if (f % 20 == 0) amb(1800, 1400, 20, 15); break;          // tears: plink
+    case 27: if (f % 30 == 0) amb(600, 560, 150, 22); break;           // hmmmm
+    case 28: if (f % 100 == 0) amb(2093, 2093, 60, 25); break;         // wink: ting
+    case 29: if (f % 120 == 0) amb(600, 1400, 200, 28); break;         // whoa!
+    case 33: if (f % 43 == 42 && ambOk()) { sndPushV(1319, 1319, 40, 20, 28); sndPushV(1760, 1760, 70, 0, 28); } break;   // merged
+    case 34: if (f % 18 == 0) amb(1000, 1300, 20, 18); break;          // packages pop
+    case 35:                                              // trophy fanfare
+      if (f % 80 == 0 && ambOk()) {
+        sndPushV(1047, 1047, 50, 15, 30); sndPushV(1319, 1319, 50, 15, 30); sndPushV(1568, 1568, 90, 0, 30);
+      }
+      break;
+    case 37: if (f % 96 == 0) amb(1600, 1600, 10, 15); break;          // usage meter tick
+    case 38: if (f % 120 == 0) amb(800, 500, 200, 25); break;          // limit hit
+    case 39: if (f % 16 == 0) amb(500, 420, 80, 28); break;            // test failed
+    case 40: case 41: if (f % 8 == 0) amb(1300, 1300, 8, 14); break;   // checking / waiting dots
     case 1: case 2:                                       // thinking: soft twinkle
       if (f % 120 == 0 && ambOk()) { sndPushV(1568, 1568, 40, 30, 30); sndPushV(2093, 2093, 70, 0, 22); }
       break;
@@ -1313,6 +1435,25 @@ void claudeFB(int x, int y, bool flip, int arm) {
   display.fillRect(x + 5,  ly, 2, 7, C_WHITE);
   display.fillRect(x + 19, ly, 2, 7, C_WHITE);
   display.fillRect(x + 23, ly, 2, 7, C_WHITE);
+  if (!flip) hatFor(x, y);
+}
+
+/* hats unlock as Claude levels up: party hat (2), crown (5), wizard (8) */
+void hatFor(int x, int y) {
+  int cx = x + 13;
+  if (level >= 8) {
+    display.fillTriangle(cx - 9, y, cx + 9, y, cx + 3, y - 14, C_WHITE);
+    display.drawPixel(cx, y - 5, C_BLACK);
+    display.drawPixel(cx + 2, y - 8, C_BLACK);
+    display.drawPixel(cx - 3, y - 2, C_BLACK);
+  } else if (level >= 5) {
+    display.fillRect(cx - 7, y - 4, 15, 4, C_WHITE);
+    for (int i = 0; i < 3; i++)
+      display.fillTriangle(cx - 7 + i * 5, y - 4, cx - 3 + i * 5, y - 4, cx - 5 + i * 5, y - 8, C_WHITE);
+  } else if (level >= 2) {
+    display.fillTriangle(cx - 5, y, cx + 5, y, cx, y - 9, C_WHITE);
+    display.fillCircle(cx, y - 10, 1, C_WHITE);
+  }
 }
 
 void ballFB(int x, int y) {            // black fill so it shows over white
@@ -1365,6 +1506,466 @@ void sc_bicycleKick(uint32_t f) {
   claudeFB(46, 34 + dy, flip, flip ? -2 : 0);
   ballFB(bx, by);
   display.drawFastHLine(4, 54, 120, C_WHITE);
+}
+
+/* ============================================================
+   SELF-PLAYING GAMES  (Claude plays these on its own)
+   Each keeps its state in statics and restarts when the scene is
+   entered again; it reports lives/score to the director.
+   ============================================================ */
+void miniClaude(int x, int y, bool armsUp) {      // 18x10 sprite, x,y = top-left
+  display.fillRect(x + 2, y, 14, 7, C_WHITE);
+  display.fillRect(x, y + (armsUp ? 1 : 3), 18, 3, C_WHITE);
+  display.fillRect(x + 5, y + 2, 1, 2, C_BLACK);
+  display.fillRect(x + 12, y + 2, 1, 2, C_BLACK);
+  display.drawFastVLine(x + 3,  y + 7, 3, C_WHITE);
+  display.drawFastVLine(x + 6,  y + 7, 3, C_WHITE);
+  display.drawFastVLine(x + 11, y + 7, 3, C_WHITE);
+  display.drawFastVLine(x + 14, y + 7, 3, C_WHITE);
+}
+
+void heartS(int x, int y, bool full) {             // 5x5 life heart
+  static const uint8_t F[5] = { 0x0A, 0x1F, 0x1F, 0x0E, 0x04 };
+  static const uint8_t E[5] = { 0x0A, 0x15, 0x11, 0x0A, 0x04 };
+  const uint8_t* p = full ? F : E;
+  for (uint8_t r = 0; r < 5; r++)
+    for (uint8_t c = 0; c < 5; c++)
+      if (p[r] & (0x10 >> c)) display.drawPixel(x + c, y + r, C_WHITE);
+}
+
+void livesRow(uint8_t lives, uint8_t maxLives) {
+  for (uint8_t i = 0; i < maxLives; i++) heartS(1 + i * 7, 1, i < lives);
+}
+
+void scoreTR(uint16_t s) {
+  char b[8];
+  snprintf(b, sizeof(b), "%u", s);
+  txt(128 - (int)strlen(b) * 6, 0, 1, b);
+}
+
+void dottedRect(int x, int y, int w, int h) {
+  for (int i = 0; i < w; i += 2) { display.drawPixel(x + i, y, C_WHITE); display.drawPixel(x + i, y + h - 1, C_WHITE); }
+  for (int j = 0; j < h; j += 2) { display.drawPixel(x, y + j, C_WHITE); display.drawPixel(x + w - 1, y + j, C_WHITE); }
+}
+
+void gameOverBox(uint16_t score) {
+  char b[16];
+  display.fillRect(22, 20, 84, 24, C_BLACK);
+  display.drawRect(22, 20, 84, 24, C_WHITE);
+  txtC(24, 1, "GAME OVER");
+  snprintf(b, sizeof(b), "score %u", score);
+  txtC(34, 1, b);
+}
+
+/* after game over: the director moves on, or (manual) it restarts */
+bool gameOverTick(uint16_t& overT) {
+  if (++overT < 100) return false;
+  if (autoCycle) { playOver = true; return false; }
+  return true;
+}
+
+/* --- build crane -------------------------------------------- */
+void brick(int x, int y) {
+  display.fillRect(x, y, 24, 5, C_WHITE);
+  display.drawFastHLine(x + 2,  y + 2, 5, C_BLACK);
+  display.drawFastHLine(x + 9,  y + 2, 6, C_BLACK);
+  display.drawFastHLine(x + 17, y + 2, 5, C_BLACK);
+}
+
+void sc_crane(uint32_t f) {
+  const uint16_t CY = 165;                         // frames per block
+  uint32_t lt = f - sceneTick0;
+  uint8_t  n  = (lt / CY) % 7;                     // blocks on the stack (6 = finished)
+  uint16_t ph = lt % CY;
+  int stackTop = 59 - n * 5;
+  int dropHy   = stackTop - 10;
+  int tx = 40, hy = 16;                            // trolley x, hook y
+
+  if (n < 6) {
+    if (ph < 60)       tx = 40 + 72 * ph / 60;                                  // carry right
+    else if (ph < 85)  { tx = 112; hy = 16 + (dropHy - 16) * (ph - 60) / 25; }   // lower
+    else if (ph < 95)  { tx = 112; hy = dropHy; }                               // release
+    else if (ph < 115) { tx = 112; hy = dropHy - (dropHy - 16) * (ph - 95) / 20; } // raise
+    else               tx = 112 - 72 * (ph - 115) / 50;                         // back
+  }
+  bool    carrying = n < 6 && ph < 85;
+  uint8_t shown    = n + ((n < 6 && ph >= 85) ? 1 : 0);
+
+  // jib, apex and mast
+  display.drawFastHLine(10, 8, 117, C_WHITE);
+  display.drawFastHLine(10, 11, 117, C_WHITE);
+  for (int x = 10; x < 124; x += 6) {
+    display.drawLine(x, 11, x + 3, 8, C_WHITE);
+    display.drawLine(x + 3, 8, x + 6, 11, C_WHITE);
+  }
+  display.drawLine(18, 8, 21, 2, C_WHITE);
+  display.drawLine(24, 8, 21, 2, C_WHITE);
+  display.drawLine(21, 2, 70, 8, C_WHITE);
+  display.drawFastVLine(18, 11, 48, C_WHITE);
+  display.drawFastVLine(24, 11, 48, C_WHITE);
+  for (int y = 11; y < 56; y += 6) {
+    display.drawLine(18, y, 24, y + 3, C_WHITE);
+    display.drawLine(24, y + 3, 18, y + 6, C_WHITE);
+  }
+  display.fillRect(10, 12, 7, 6, C_WHITE);         // counterweight
+  display.drawRect(25, 12, 8, 7, C_WHITE);         // cab
+  display.drawPixel(28, 14, C_WHITE);
+
+  // trolley, cable, hook / load
+  display.fillRect(tx - 3, 11, 7, 3, C_WHITE);
+  display.drawFastVLine(tx, 14, hy - 14, C_WHITE);
+  if (carrying) {
+    display.drawLine(tx, hy, tx - 9, hy + 5, C_WHITE);
+    display.drawLine(tx, hy, tx + 9, hy + 5, C_WHITE);
+    brick(tx - 12, hy + 5);
+  } else {
+    display.drawLine(tx, hy, tx + 2, hy + 3, C_WHITE);
+    display.drawLine(tx + 2, hy + 3, tx, hy + 4, C_WHITE);
+  }
+
+  for (uint8_t i = 0; i < shown; i++) brick(100, 54 - i * 5);
+  display.drawFastHLine(0, 59, 128, C_WHITE);
+
+  // Claude supervising with a little flag, cheering after each drop
+  bool cheer = (n < 6 && ph >= 85 && ph < 120) || n == 6;
+  int dy = cheer ? -(int)(fabsf(sinf(f * 0.3f)) * 3) : 0;
+  claudeFB(44, 40 + dy, false, cheer ? -3 : 0);
+  display.drawFastVLine(77, 26 + dy, 18, C_WHITE);
+  display.fillRect(78, 26 + dy + (cheer && (f / 4) % 2 ? 1 : 0), 6, 4, C_WHITE);
+  if (n == 6) { sparkle(112, 20, f, 3); sparkle(92, 26, f + 5, 2); }
+
+  // sounds
+  if (n < 6) {
+    if ((ph < 60 || ph >= 115) && ph % 8 == 0) amb(700, 700, 5, 12);  // trolley motor
+    else if (ph == 60)  amb(900, 650, 450, 14);                       // lowering
+    else if (ph == 85)  fx(500, 280, 45, 45);                         // clunk
+    else if (ph == 95)  amb(650, 900, 400, 12);                       // hoist up
+  } else if (ph == 0 && soundMode == SND_ALL) {
+    static const uint16_t done[] = { 1047, 1319, 1568, 2093 };
+    sndClear();
+    for (uint8_t i = 0; i < 4; i++) sndPushV(done[i], done[i], 70, 20, 35);
+  }
+}
+
+/* --- G3 flappy clawd ---------------------------------------- */
+void sc_flappy(uint32_t f) {
+  static uint32_t enter = 0xFFFFFFFF;
+  static bool     restart = false;
+  static float    y, vy, px[2];
+  static int8_t   gy[2];
+  static bool     scored[2];
+  static uint8_t  lives, hurt, lazy;
+  static uint16_t score, overT;
+  const int BX = 16, PW = 10, GAP = 24;
+
+  if (enter != sceneTick0 || restart) {
+    enter = sceneTick0; restart = false;
+    y = 28; vy = 0; lives = 3; score = 0; hurt = 0; lazy = 0; overT = 0;
+    for (uint8_t i = 0; i < 2; i++) { px[i] = 110 + i * 70; gy[i] = random(12, 34); scored[i] = false; }
+  }
+
+  if (lives > 0) {
+    // aim for the nearest pipe that's still ahead
+    uint8_t nx = (px[0] + PW < BX || (px[1] < px[0] && px[1] + PW >= BX)) ? 1 : 0;
+    if (lazy) lazy--;
+    else if (random(1000) < 5) lazy = 22;          // daydreams now and then...
+    if (!lazy && y > gy[nx] + 9 && vy > -0.5f) { vy = -2.3f; amb(900, 1300, 18, 18); }
+    vy += 0.2f; if (vy > 2.8f) vy = 2.8f;
+    y += vy;    if (y < 9) { y = 9; vy = 0; }
+
+    for (uint8_t i = 0; i < 2; i++) {
+      px[i] -= 1.3f;
+      if (px[i] < -PW - 2) { px[i] += 140; gy[i] = random(12, 34); scored[i] = false; }
+      if (!scored[i] && px[i] + PW < BX) { scored[i] = true; score++; fx2(1760, 2093, 40, 30); }
+      bool overX = px[i] < BX + 16 && px[i] + PW > BX + 2;
+      if (!hurt && overX && (y + 1 < gy[i] || y + 9 > gy[i] + GAP)) {
+        lives--; hurt = 45; fx(700, 180, 220, 45);
+        if (!lives) sndOver();
+      }
+    }
+    if (!hurt && y + 9 >= 60) {
+      lives--; hurt = 45; y = 28; vy = -1.5f; fx(700, 180, 220, 45);
+      if (!lives) sndOver();
+    }
+    if (hurt) hurt--;
+  } else if (gameOverTick(overT)) {
+    restart = true;
+  }
+
+  livesRow(lives, 3);
+  scoreTR(score);
+  for (int x = -(int)(f % 4); x < 128; x += 4) display.drawPixel(x, 61, C_WHITE);
+  for (uint8_t i = 0; i < 2; i++) {
+    int x = (int)px[i], by = gy[i] + GAP;
+    display.drawRect(x, -1, PW, gy[i] + 1, C_WHITE);
+    display.drawRect(x - 2, gy[i] - 4, PW + 4, 4, C_WHITE);
+    display.drawRect(x, by, PW, 61 - by, C_WHITE);
+    display.drawRect(x - 2, by, PW + 4, 4, C_WHITE);
+    for (int yy = by + 7; yy < 59; yy += 4) display.drawPixel(x + 4, yy, C_WHITE);
+  }
+  if (!hurt || (hurt / 4) % 2) miniClaude(BX, (int)y, vy < 0);
+  if (!lives) gameOverBox(score);
+  playLives = lives; playScore = score;
+}
+
+/* --- G2 permission panic ------------------------------------ */
+struct Perm { const char* title; const char* cmd; bool safe; };
+const Perm PERMS[] = {
+  { "Allow Bash?",  "$ pwd",            true  },
+  { "Allow Bash?",  "$ ls -la",         true  },
+  { "Allow Bash?",  "$ git status",     true  },
+  { "Allow Bash?",  "$ npm test",       true  },
+  { "Allow Edit?",  "src/app.py",       true  },
+  { "Allow Fetch?", "docs.python.org",  true  },
+  { "Allow Bash?",  "$ rm -rf /",       false },
+  { "Allow Bash?",  "$ curl x.sh | sh", false },
+  { "Allow Bash?",  "$ git push -f",    false },
+  { "Allow Edit?",  "~/.ssh/id_rsa",    false },
+};
+const uint8_t PERM_COUNT = sizeof(PERMS) / sizeof(PERMS[0]);
+
+void sc_permPanic(uint32_t f) {
+  static uint32_t enter = 0xFFFFFFFF;
+  static bool     restart = false, allow;
+  static uint8_t  lives, cur, st, res;             // st: 0 asking, 1 result, 2 game over
+  static uint16_t score, t, T, decideAt, overT;
+
+  bool fresh = (enter != sceneTick0 || restart);
+  if (fresh) { enter = sceneTick0; restart = false; lives = 5; score = 0; overT = 0; }
+  if (fresh || (st == 1 && t > 40 && lives)) {
+    // next prompt; the clock gets shorter as the score climbs
+    cur = random(PERM_COUNT); st = 0; t = 0;
+    T = 130 - (score * 5 > 80 ? 80 : score * 5);
+    if (PERMS[cur].safe) { allow = true;  decideAt = random(15, T + 20); }     // may be too slow
+    else if (random(100) < 7) { allow = true; decideAt = random(10, 40); }      // panics and allows!
+    else { allow = false; decideAt = random(10, 45); }
+    fx2(1568, 1319, 60, 35);
+  }
+
+  if (st == 0) {
+    t++;
+    if (T > t && T - t < T * 3 / 10 && t % 8 == 0) amb(2000, 2000, 6, 20);   // clock ticking
+    if (t == decideAt || t >= T) {
+      bool safe = PERMS[cur].safe;
+      if (t >= T && t != decideAt) res = safe ? 4 : 2;      // time ran out
+      else res = allow ? (safe ? 1 : 3) : 2;
+      if (res == 1 || res == 2) score++; else lives--;
+      if (res == 1)      fx(1047, 1568, 60, 35);
+      else if (res == 2) fx2(880, 660, 50, 35);
+      else               fx(500, 250, 220, 45);
+      if (!lives) sndOver();
+      st = 1; t = 0;
+    }
+  } else if (st == 1) {
+    t++;
+    if (!lives && t > 40) st = 2;
+  } else if (gameOverTick(overT)) {
+    restart = true;
+  }
+
+  livesRow(lives, 5);
+  scoreTR(score);
+  dottedRect(2, 10, 124, 36);
+  txt(6, 14, 1, PERMS[cur].title);
+  txt(6, 25, 1, PERMS[cur].cmd);
+  display.drawRect(6, 36, 116, 6, C_WHITE);
+  if (st == 0) {
+    int w = 112 * (T - t) / T;
+    bool urgent = T - t < T * 3 / 10;
+    if (!urgent || (f / 4) % 2) display.fillRect(8, 38, w, 2, C_WHITE);
+    char b[24];
+    snprintf(b, sizeof(b), "deciding%.*s", (int)((f / 8) % 4), "...");
+    txtC(53, 1, b);
+  } else if (st == 1) {
+    static const char* RES[]  = { "", "ALLOWED", "DENIED", "OOPS!", "TOO SLOW" };
+    static const char* HINT[] = { "", "+1 safe command", "+1 blocked danger", "-1 that was risky", "-1 too slow" };
+    display.fillRect(34, 18, 60, 14, C_WHITE);
+    txtCol(64 - (int)strlen(RES[res]) * 3, 21, RES[res], C_BLACK);
+    txtC(53, 1, HINT[res]);
+  } else {
+    gameOverBox(score);
+  }
+  playLives = lives; playScore = score;
+}
+
+/* --- G7 whack a bug ----------------------------------------- */
+void bugSprite(int x, int y) {                     // x = centre, y = top
+  display.fillRoundRect(x - 6, y + 2, 12, 6, 2, C_WHITE);
+  display.fillRect(x - 3, y, 6, 3, C_WHITE);
+  display.drawPixel(x - 2, y + 1, C_BLACK);
+  display.drawPixel(x + 1, y + 1, C_BLACK);
+  display.drawLine(x - 2, y, x - 4, y - 3, C_WHITE);
+  display.drawLine(x + 2, y, x + 4, y - 3, C_WHITE);
+  for (int s = -1; s <= 1; s += 2) {
+    display.drawLine(x + s * 6, y + 3, x + s * 9, y + 1, C_WHITE);
+    display.drawLine(x + s * 6, y + 6, x + s * 9, y + 8, C_WHITE);
+  }
+}
+
+void sc_whack(uint32_t f) {
+  static uint32_t enter = 0xFFFFFFFF;
+  static bool     restart = false;
+  static float    cx;
+  static uint8_t  lives, st, hole, react, ham;     // st: 0 empty 1 rising 2 up 3 hiding 4 squashed
+  static uint16_t score, t, upFor, overT;
+  const int HX[3] = { 22, 64, 106 };
+
+  if (enter != sceneTick0 || restart) {
+    enter = sceneTick0; restart = false;
+    cx = 64; lives = 3; score = 0; st = 0; t = 0; upFor = 20; ham = 0; overT = 0; hole = 1;
+  }
+
+  if (lives > 0) {
+    t++;
+    switch (st) {
+      case 0: if (t > upFor) { st = 1; t = 0; hole = random(3); react = random(4, 24);
+                               upFor = random(26, 44); ham = 0; amb(500, 900, 40, 30); } break;
+      case 1: if (t >= 8) { st = 2; t = 0; } break;
+      case 2: if (t > upFor) { st = 3; t = 0; } break;
+      case 3: if (t >= 8) {                           // got away
+                st = 0; t = 0; upFor = random(10, 30); lives--;
+                fx(300, 200, 160, 40);
+                if (!lives) sndOver();
+              } break;
+      case 4: if (t >= 18) { st = 0; t = 0; upFor = random(8, 26); } break;
+    }
+    // Claude scoots over the hole and drops the hammer
+    bool bugOut = (st == 1 || st == 2);
+    if (bugOut && !ham) {
+      if (react) react--;
+      else {
+        float d = HX[hole] - cx;
+        if (d > 2.2f)       cx += 2.2f;
+        else if (d < -2.2f) cx -= 2.2f;
+        else { cx = HX[hole]; ham = 1; }
+      }
+    }
+    if (ham) {
+      ham++;
+      if (ham == 6 && bugOut) { st = 4; t = 0; score++; fx(900, 150, 70, 50); }
+      if (ham > 10) ham = 0;
+    }
+  } else if (gameOverTick(overT)) {
+    restart = true;
+  }
+
+  livesRow(lives, 3);
+  scoreTR(score);
+  int c = (int)cx;
+  miniClaude(c - 9, 9, ham > 0);
+  if (ham) {
+    int len = (ham < 6 ? ham : 6) * 5;
+    for (int yy = 20; yy < 20 + len; yy += 2) display.drawPixel(c, yy, C_WHITE);
+    display.fillRect(c - 3, 20 + len, 7, 3, C_WHITE);
+  }
+  if (st >= 1 && st <= 3) {
+    int rise = st == 1 ? t * 10 / 8 : st == 2 ? 10 : 10 - t * 10 / 8;
+    bugSprite(HX[hole], 54 - rise);
+  } else if (st == 4) {
+    display.fillRect(HX[hole] - 8, 52, 16, 2, C_WHITE);
+    sparkle(HX[hole], 44, f, 3);
+  }
+  for (uint8_t i = 0; i < 3; i++) {                  // holes hide the bug's lower half
+    display.fillRect(HX[i] - 14, 54, 28, 6, C_BLACK);
+    display.drawRect(HX[i] - 14, 54, 28, 6, C_WHITE);
+    for (int xx = 2; xx < 26; xx += 2) display.drawPixel(HX[i] - 14 + xx, 56, C_WHITE);
+  }
+  for (int x = 0; x < 128; x += 2) display.drawPixel(x, 62, C_WHITE);
+  if (!lives) gameOverBox(score);
+  playLives = lives; playScore = score;
+}
+
+/* ============================================================
+   STATS, LEVEL UP, PROFILE
+   ============================================================ */
+void titleBar(const char* left, const char* right) {
+  display.fillRect(0, 0, 128, 11, C_WHITE);
+  txtCol(3, 2, left, C_BLACK);
+  txtCol(125 - (int)strlen(right) * 6, 2, right, C_BLACK);
+}
+
+void sc_stats(uint32_t f) {
+  char b[24], lv[8];
+  snprintf(lv, sizeof(lv), "Lv %u", level);
+  titleBar("TODAY", lv);
+  if (!statsKnown) {
+    txtC(22, 1, "no stats yet");
+    txtC(34, 1, "start the bridge");
+    miniClaude(55, 48 + (int)wobble(f, 0.15f, 1), false);
+    return;
+  }
+  snprintf(b, sizeof(b), "commits %u", stCommits);           txt(3, 15, 1, b);
+  snprintf(b, sizeof(b), "tasks %u", stTasks);               txt(72, 15, 1, b);
+  snprintf(b, sizeof(b), "tests %u", stTests);               txt(3, 26, 1, b);
+  snprintf(b, sizeof(b), "%uh%02u", stMin / 60, stMin % 60); txt(72, 26, 1, b);
+  snprintf(b, sizeof(b), "+%u -%u", stAdded, stRemoved);     txt(3, 37, 1, b);
+  snprintf(b, sizeof(b), "$%lu.%02lu", (unsigned long)(stCostC / 100), (unsigned long)(stCostC % 100));
+  txt(72, 37, 1, b);
+  for (int x = 0; x < 128; x += 2) display.drawPixel(x, 47, C_WHITE);
+
+  const char* cheer = stCommits == 0 ? "let's ship!" : stCommits < 3 ? "nice start!"
+                    : stCommits < 6 ? "on a roll!" : "unstoppable!";
+  miniClaude(4, 51 + (int)wobble(f, 0.2f, 1), (f / 10) % 2);
+  txt(28, 53, 1, cheer);
+}
+
+void sc_levelUp(uint32_t f) {
+  uint32_t lt = f - sceneTick0;
+  for (uint8_t i = 0; i < 16; i++) {                      // confetti
+    int x = (i * 37 + 11) % 128;
+    int y = (int)((lt * (1 + i % 3) + i * 13) % 64);
+    display.drawPixel(x, y, C_WHITE);
+    if (i % 2) display.drawPixel(x + 1, y + 1, C_WHITE);
+  }
+  if ((lt / 6) % 5 != 4) txtC(1, 2, "LEVEL UP!");
+  int dy = -(int)(fabsf(sinf(f * 0.3f)) * 4);
+  claudeFB(51, 32 + dy, false, (f / 5) % 2 ? -3 : 0);
+  display.drawFastHLine(20, 51, 88, C_WHITE);
+  sparkle(16, 32, f, 3);
+  sparkle(112, 32, f + 6, 3);
+  char b[24];
+  snprintf(b, sizeof(b), "Lv %u  %s", level, levelTitle());
+  txtC(55, 1, b);
+}
+
+void sc_profile(uint32_t f) {
+  char b[24], lv[8];
+  snprintf(lv, sizeof(lv), "Lv %u", level);
+  titleBar(lv, levelTitle());
+  claudeFB(10, 32 + (int)wobble(f, 0.12f, 1), false, 0);
+  display.drawFastHLine(0, 51, 46, C_WHITE);
+
+  uint32_t lo = xpNeed(level), hi = xpNeed(level + 1);
+  uint8_t pct = (uint8_t)((xp - lo) * 100 / (hi - lo));
+  txt(50, 16, 1, "xp");
+  meter(66, 15, 58, 9, pct);
+  snprintf(b, sizeof(b), "%lu/%lu", (unsigned long)xp, (unsigned long)hi);
+  txt(50, 28, 1, b);
+  snprintf(b, sizeof(b), "next: Lv %u", level + 1);
+  txt(50, 39, 1, b);
+  static const char* HOW[] = { "+10 commit", "+6 tests ok", "+4 task done", "+1 pet me" };
+  txt(50, 54, 1, HOW[(f / 60) % 4]);
+}
+
+/* the live "what Claude is doing" strip at the bottom of work scenes */
+bool tickerScene(uint8_t s) {
+  static const uint8_t L[] = { 1, 2, 4, 5, 7, 8, 9, 10, 32, 33, 34, 41, 42 };
+  for (uint8_t i = 0; i < sizeof(L); i++) if (L[i] == s) return true;
+  return false;
+}
+
+void drawTicker() {
+  if (!live || !ticker[0] || millis() - tickerAt > 20000 || !tickerScene(scene)) return;
+  int w = (int)strlen(ticker) * 6;
+  display.fillRect(0, 54, 128, 10, C_BLACK);
+  for (int x = 0; x < 128; x += 2) display.drawPixel(x, 54, C_WHITE);
+  if (w <= 124) {
+    txt((128 - w) / 2, 56, 1, ticker);
+  } else {                                                // marquee
+    int span = w + 40, off = (int)((tick * 2) % span);
+    txt(2 - off, 56, 1, ticker);
+    txt(2 - off + span, 56, 1, ticker);
+  }
 }
 
 /* ============================================================
@@ -1421,6 +2022,13 @@ const Scene SCENES[] = {
   { NULL,              0, sc_typingAlong },   // 44
   { "goal",            2, sc_goalCheer   },   // 45
   { "bicycle kick",    2, sc_bicycleKick },   // 46
+  { NULL,              0, sc_crane       },   // 47  build crane
+  { NULL,              0, sc_flappy      },   // 48  G3 flappy clawd
+  { NULL,              0, sc_permPanic   },   // 49  G2 permission panic
+  { NULL,              0, sc_whack       },   // 50  G7 whack a bug
+  { NULL,              0, sc_stats       },   // 51  today's stats
+  { NULL,              0, sc_levelUp     },   // 52  level up!
+  { NULL,              0, sc_profile     },   // 53  level / xp / hat
 };
 const uint8_t SCENE_COUNT = sizeof(SCENES) / sizeof(SCENES[0]);
 
@@ -1471,7 +2079,61 @@ void setScene(uint8_t i) {
   gameMode = false;                    // any scene change leaves the game
   scene = i % SCENE_COUNT;
   sceneSince = millis();
+  sceneTick0 = tick;
+  playLives = -1; playOver = false;
   Serial.printf("scene %u\n", scene);
+}
+
+/* ============================================================
+   LIFE DIRECTOR — when nobody is driving, Claude lives on its own:
+   moods, a bit of work, games (and reacts to how they went), naps.
+   ============================================================ */
+const uint8_t MOODS[] = { 0, 24, 27, 28, 29, 12, 18, 21, 3, 19, 53 };
+const uint8_t WORKS[] = { 1, 2, 4, 5, 6, 7, 8, 9, 11, 30, 31, 32, 33, 34, 40, 41, 44, 51, 37 };
+const uint8_t PLAYS[] = { 47, 48, 49, 50, 48, 49, 50, 45, 46, 36, 20, 13, 14, 15, 16, 17 };
+const uint8_t RESTS[] = { 22, 23, 21 };
+const uint8_t WINS[]  = { 35, 24, 45, 28 };
+const uint8_t LOSES[] = { 26, 25 };
+
+bool isGameScene(uint8_t s) { return s >= 48 && s <= 50; }
+bool isLongScene(uint8_t s) { return s >= 47 && s <= 50; }
+
+void director() {
+  uint32_t now = millis();
+  if (now - sceneSince < sceneDur && !playOver) return;
+
+  if (isGameScene(scene)) {                          // react to how the game went
+    bool won = playLives > 0;
+    setScene(won ? WINS[random(sizeof(WINS))] : LOSES[random(sizeof(LOSES))]);
+    if (won) sndYay(); else sndFail();
+    sceneDur = 3500;
+    return;
+  }
+
+  uint8_t r = random(100), next;
+  do {
+    if (r < 30)      next = MOODS[random(sizeof(MOODS))];
+    else if (r < 58) next = WORKS[random(sizeof(WORKS))];
+    else if (r < 90) next = PLAYS[random(sizeof(PLAYS))];
+    else             next = RESTS[random(sizeof(RESTS))];
+  } while (next == scene);
+
+  if (isLongScene(next))  sceneDur = random(16000, 24000);
+  else if (r < 30)        sceneDur = random(4000, 6500);
+  else if (r < 58)        sceneDur = random(5000, 8000);
+  else if (r < 90)        sceneDur = random(6000, 9000);
+  else                    sceneDur = random(6000, 10000);
+  setScene(next);
+  sndEnter();
+}
+
+void addXp(uint16_t n) {
+  xp += n;
+  while (level < 250 && xp >= xpNeed(level + 1)) { level++; levelPending = true; }
+  prefs.begin("face", false);
+  prefs.putULong("xp", xp);
+  prefs.end();
+  Serial.printf("xp %lu (Lv %u)\n", (unsigned long)xp, level);
 }
 
 /* ============================================================
@@ -1546,6 +2208,9 @@ void gameStep() {
   if (gSpeed < 5.5f) gSpeed += 0.0015f;
   gameTick++;
   gScore = gameTick / 4;
+  if (gameTick % 400 == 0 && soundOn) {             // every 100 points
+    sndClear(); sndPushV(1319, 1319, 50, 20, 50); sndPushV(1760, 1760, 80, 0, 50);
+  }
 }
 
 void gameDraw() {
@@ -1602,6 +2267,8 @@ const Ev EVENTS[] = {
   { "merge", 33 }, { "wait", 41 }, { "bug", 43 },   { "plane", 42 },
   { "compact", 11 }, { "pkg", 34 }, { "key", 44 },
   { "goal", 45 }, { "kick", 46 },
+  { "crane", 47 }, { "flappy", 48 }, { "panic", 49 }, { "whack", 50 },
+  { "stats", 51 }, { "profile", 53 },
 };
 const uint8_t EVENT_COUNT = sizeof(EVENTS) / sizeof(EVENTS[0]);
 
@@ -1609,6 +2276,8 @@ void onEvent(const char* name) {
   uint32_t now = millis();
   static uint32_t lastNeed = 0, lastHm = 0, lastDone = 0;
   live = true; lastEvent = now; autoCycle = false; followStage = 0;
+  if (!strcmp(name, "done"))     addXp(4);
+  else if (!strcmp(name, "bug")) addXp(6);
 
   if (!strcmp(name, "need")) {                     // Claude needs you: leave the game
     gameMode = false;
@@ -1656,7 +2325,20 @@ void handleLine(char* line) {
       break;
     }
     case 'X': ctxPct = constrain(atoi(v), 0, 100); break;
-    case 'C': pushCommit(v); onEvent("git"); if (!gameMode) sndCommit(); break;
+    case 'C': pushCommit(v); onEvent("git"); addXp(10); if (!gameMode) sndCommit(); break;
+    case 'T':
+      strncpy(ticker, v, sizeof(ticker) - 1);
+      ticker[sizeof(ticker) - 1] = 0;
+      tickerAt = millis();
+      break;
+    case 'S': {
+      int a[7] = { 0 };
+      sscanf(v, "%d,%d,%d,%d,%d,%d,%d", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6]);
+      stCommits = a[0]; stTasks = a[1]; stTests = a[2];
+      stCostC = a[3]; stAdded = a[4]; stRemoved = a[5]; stMin = a[6];
+      statsKnown = true;
+      break;
+    }
     case 'G': if (atoi(v)) startGame(); else if (gameMode) exitGame(); break;
   }
 }
@@ -1731,6 +2413,7 @@ void drawFrame() {
     SCENES[scene].draw(tick);
     drawCaption(SCENES[scene].cap, SCENES[scene].capStyle, tick);
     sceneSfx(scene, tick);
+    drawTicker();
   }
 
   drawToast();
@@ -1758,6 +2441,7 @@ void handleTouch() {
     if (touchState) {                  // finger down
       touchDown = now;
       touchPressed = true;
+      lastInput = now;
     } else {                           // finger up
       touchReleased = true;
       if (gameMode)          { }       // the game reads the edges itself
@@ -1772,7 +2456,10 @@ void handleTouch() {
   uint32_t holdMs = menuOpen ? MENU_HOLD_MS : PET_HOLD_MS;
   if (touchState && !gameMode && !petting && !holdConsumed && now - touchDown > holdMs) {
     if (menuOpen) { menuHold(); holdConsumed = true; }
-    else          { petting = true; tapCount = 0; sndPetStart(); }
+    else {
+      petting = true; tapCount = 0; sndPetStart();
+      if (now - lastPetXp > 60000 || lastPetXp == 0) { addXp(1); lastPetXp = now; }
+    }
   }
 
   // resolve taps once the multi-tap window closes
@@ -1780,6 +2467,7 @@ void handleTouch() {
     if (tapCount == 1) {
       setScene(scene + 1);
       autoCycle = false;
+      sndTap();
     } else if (tapCount == 2) {
       openMenu();                      // double tap opens settings
     } else if (tapCount == 3) {
@@ -1795,10 +2483,12 @@ void handleTouch() {
 }
 
 void handleKey(char c) {
-  if      (c == 'n') { setScene(scene + 1);               autoCycle = false; live = false; }
-  else if (c == 'p') { setScene(scene + SCENE_COUNT - 1); autoCycle = false; live = false; }
-  else if (c == 'r') { setScene(random(SCENE_COUNT));     autoCycle = false; live = false; }
-  else if (c == 'c') { autoCycle = !autoCycle; sceneSince = millis(); }
+  if (c == '\n' || c == '\r') return;
+  lastInput = millis();
+  if      (c == 'n') { setScene(scene + 1);               autoCycle = false; live = false; sndTap(); }
+  else if (c == 'p') { setScene(scene + SCENE_COUNT - 1); autoCycle = false; live = false; sndTap(); }
+  else if (c == 'r') { setScene(random(SCENE_COUNT));     autoCycle = false; live = false; sndTap(); }
+  else if (c == 'c') { autoCycle = !autoCycle; sceneSince = millis(); sceneDur = 0; }
   else if (c == '+') { if (briIndex < BRI_COUNT - 1) briIndex++; applyBrightness(); saveSettings(); }
   else if (c == '-') { if (briIndex > 0)             briIndex--; applyBrightness(); saveSettings(); }
   else if (c == ']') { if (volIndex < VOL_COUNT - 1) volIndex++; sndPreview(); saveSettings(); }
@@ -1815,7 +2505,7 @@ void handleKey(char c) {
 
 /* Upper-case first char starts a protocol line ("E:think\n");
    anything else is a single-key command, as before. */
-char    lineBuf[40];
+char    lineBuf[72];
 uint8_t lineLen = 0;
 bool    inLine  = false;
 
@@ -1881,13 +2571,16 @@ void setup() {
     while (true) delay(1000);
   }
   display.setRotation(0);                 // use 2 if mounted upside down
+  display.setTextWrap(false);             // long ticker text scrolls instead of wrapping
 
   prefs.begin("face", true);              // read-only
   briIndex = prefs.getUChar("bri", 5);
   volIndex = prefs.getUChar("vol", 3);
   uint8_t m = prefs.getUChar("sndm", SND_ALL);
   gHi      = prefs.getUShort("hi", 0);
+  xp       = prefs.getULong("xp", 0);
   prefs.end();
+  while (level < 250 && xp >= xpNeed(level + 1)) level++;
   if (briIndex >= BRI_COUNT) briIndex = 5;
   if (volIndex >= VOL_COUNT) volIndex = 3;
   setSoundMode(m > SND_ALL ? SND_ALL : m);
@@ -1912,8 +2605,18 @@ void loop() {
   updateLive();
   petUpdate();                            // sound itself plays in soundTask
 
-  if (autoCycle && !petting && !menuOpen && !gameMode && millis() - sceneSince > SCENE_MS)
-    setScene(scene + 1);
+  // nobody around for a while: Claude goes back to living on its own
+  if (!autoCycle && !live && !petting && !menuOpen && !gameMode && millis() - lastInput > RESUME_MS) {
+    autoCycle = true; sceneDur = 0;
+  }
+  if (autoCycle && !petting && !menuOpen && !gameMode) director();
+
+  if (levelPending && !petting && !menuOpen && !gameMode) {   // celebrate a level up
+    levelPending = false;
+    setScene(52);
+    sceneDur = 4500; followStage = 0;
+    sndLevelUp();
+  }
 
   uint32_t now = millis();
   if (now - lastFrame >= FRAME_MS) {
@@ -1926,7 +2629,8 @@ void loop() {
 /* =============================================================
    TUNING
      EYE_RADIUS      0 = square corners (current), 8 = rounded
-     SCENE_MS        dwell time per scene when auto-cycling
+     RESUME_MS       idle time before Claude goes back to living on its own
+     MOODS/WORKS/PLAYS/RESTS[]   which scenes the life director picks from
      PET_HOLD_MS     how long a press must last to count as a hold
      TAP_WINDOW_MS   gap that separates a single tap from a double
      BRI_LEVELS[]    the brightness steps the menu walks through

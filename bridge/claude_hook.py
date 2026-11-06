@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from urllib.parse import urlparse
 
 ADDR = ("127.0.0.1", 47800)
 HEAD_FILE = os.path.join(tempfile.gettempdir(), "claude_oled_head.txt")
@@ -84,6 +85,41 @@ def bash_event(cmd, phase, cwd, resp_text):
     return ["E:bash"] if phase == "pre" else []
 
 
+def clean(text, limit=40):
+    """One short ASCII line the OLED font can draw."""
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    text = "".join(c if 32 <= ord(c) < 127 else "?" for c in text)
+    return text[:limit - 2] + ".." if len(text) > limit else text
+
+
+def ticker(tool, inp):
+    """What Claude is doing, in a few words: 'editing app.py', '$ npm test'..."""
+    name = lambda p: os.path.basename(str(p).rstrip("/\\")) or str(p)
+    if tool == "Read":
+        return "reading " + name(inp.get("file_path", ""))
+    if tool in ("Edit", "MultiEdit"):
+        return "editing " + name(inp.get("file_path", ""))
+    if tool == "Write":
+        return "writing " + name(inp.get("file_path", ""))
+    if tool == "NotebookEdit":
+        return "editing " + name(inp.get("notebook_path", ""))
+    if tool == "Bash":
+        return "$ " + str(inp.get("command", "")).splitlines()[0] if inp.get("command") else "$"
+    if tool == "Grep":
+        return "grep " + str(inp.get("pattern", ""))
+    if tool == "Glob":
+        return "find " + str(inp.get("pattern", ""))
+    if tool == "WebSearch":
+        return "search: " + str(inp.get("query", ""))
+    if tool == "WebFetch":
+        return "fetch " + (urlparse(str(inp.get("url", ""))).netloc or "page")
+    if tool in ("Task", "Agent"):
+        return "agent: " + str(inp.get("description", ""))
+    if tool == "TodoWrite":
+        return "planning todos"
+    return tool.split("__")[-1].lower()             # mcp__server__tool -> tool
+
+
 def main():
     try:
         d = json.load(sys.stdin)
@@ -93,6 +129,11 @@ def main():
     tool = d.get("tool_name", "") or ""
     inp = d.get("tool_input") or {}
     cwd = d.get("cwd") or None
+
+    if ev == "PreToolUse":
+        send("T:" + clean(ticker(tool, inp)))
+    elif ev == "UserPromptSubmit" and d.get("prompt"):
+        send("T:" + clean("> " + d["prompt"]))
 
     if ev in SIMPLE_EVENT:
         send(f"E:{SIMPLE_EVENT[ev]}")

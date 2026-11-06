@@ -14,6 +14,8 @@ board. Run it once and leave it open:
     python claude_bridge.py --list         # show serial ports
 """
 import argparse
+import json
+import os
 import socket
 import sys
 import time
@@ -79,6 +81,43 @@ class KeyWatcher:
         return any(t in title for t in self.titles)
 
 
+STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
+
+
+class Stats:
+    """Today's commits / tasks / passed tests (saved, reset at midnight),
+    plus the current session's cost, lines and time from the status line."""
+
+    def __init__(self):
+        self.day = {"date": "", "commits": 0, "tasks": 0, "tests": 0}
+        self.session = [0, 0, 0, 0]          # cost cents, lines added, removed, minutes
+        try:
+            with open(STATS_FILE) as f:
+                self.day.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+        self._roll()
+
+    def _roll(self):
+        today = time.strftime("%Y-%m-%d")
+        if self.day["date"] != today:
+            self.day = {"date": today, "commits": 0, "tasks": 0, "tests": 0}
+
+    def bump(self, key):
+        self._roll()
+        self.day[key] += 1
+        try:
+            with open(STATS_FILE, "w") as f:
+                json.dump(self.day, f)
+        except OSError:
+            pass
+
+    def line(self):
+        self._roll()
+        d = self.day
+        return "S:%d,%d,%d,%d,%d,%d,%d" % (d["commits"], d["tasks"], d["tests"], *self.session)
+
+
 def send_one(line):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(line.encode(), (UDP_HOST, UDP_PORT))
@@ -123,7 +162,8 @@ def main():
         sys.exit(f"UDP port {UDP_PORT} is busy - is the bridge already running?")
     sock.settimeout(0.1)
 
-    sticky = {}          # last U:/X: line per kind, replayed after a reconnect
+    stats = Stats()
+    sticky = {"S": stats.line()}   # last U:/X:/S: line per kind, replayed after a reconnect
     last_event = ("", 0.0)
     ser = None
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
@@ -162,19 +202,36 @@ def main():
                     continue
                 if line[0] in "UX":
                     sticky[line[0]] = line
-                if line[0] == "E":
+                stats_changed = False
+                if line[0] == "K":                 # session cost/lines/time -> S: line
+                    try:
+                        stats.session = [int(x) for x in line[2:].split(",")][:4]
+                    except ValueError:
+                        continue
+                    line, stats_changed = stats.line(), True
+                elif line[0] == "C":
+                    stats.bump("commits")
+                    stats_changed = True
+                elif line[0] == "E":
                     ev = line[2:]
-                    last_hook = "E:idle" if ev in ("done", "need", "idle") else line
-                    if typing and ev not in ("done", "need"):
-                        continue       # the typing face wins while you type
                     # drop identical events fired back-to-back
                     now = time.time()
                     if line == last_event[0] and now - last_event[1] < 0.4:
                         continue
                     last_event = (line, now)
+                    if ev in ("done", "bug"):
+                        stats.bump("tasks" if ev == "done" else "tests")
+                        stats_changed = True
+                    last_hook = "E:idle" if ev in ("done", "need", "idle") else line
+                    if typing and ev not in ("done", "need"):
+                        continue       # the typing face wins while you type
                 if a.verbose:
                     print(">", line)
                 ser.write((line + "\n").encode())
+                if stats_changed:
+                    sticky["S"] = stats.line()
+                    if line != sticky["S"]:
+                        ser.write((sticky["S"] + "\n").encode())
             if keys is not None:
                 now = time.time()
                 if keys.active():

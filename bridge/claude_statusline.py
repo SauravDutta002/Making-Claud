@@ -35,6 +35,13 @@ def main():
         lines.append(f"U:{-1 if a is None else a},{-1 if w is None else w},{mins}")
     if ctx is not None:
         lines.append(f"X:{ctx}")
+    cost = d.get("cost") or {}
+    if cost:                                    # session cost / lines / time -> bridge stats
+        lines.append("K:%d,%d,%d,%d" % (
+            round((cost.get("total_cost_usd") or 0) * 100),
+            cost.get("total_lines_added") or 0,
+            cost.get("total_lines_removed") or 0,
+            (cost.get("total_duration_ms") or 0) // 60000))
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for line in lines:
