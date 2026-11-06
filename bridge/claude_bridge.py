@@ -44,6 +44,41 @@ def list_ports_cmd():
         print(f"{p.device:8} {vid}  {p.description}")
 
 
+class KeyWatcher:
+    """Reports whether *any* key is held while a matching window is in front.
+
+    It never records which key it is - only a yes/no "someone is typing".
+    Windows only; elsewhere active() is always False.
+    """
+
+    def __init__(self, titles):
+        self.titles = [t.strip().lower() for t in titles.split(",") if t.strip()]
+        self.ok = sys.platform == "win32"
+        if self.ok:
+            import ctypes
+            self.u = ctypes.windll.user32
+            self.ct = ctypes
+
+    def _title(self):
+        hwnd = self.u.GetForegroundWindow()
+        buf = self.ct.create_unicode_buffer(256)
+        self.u.GetWindowTextW(hwnd, buf, 256)
+        return buf.value.lower()
+
+    def active(self):
+        if not self.ok:
+            return False
+        down = False
+        for vk in range(8, 255):               # 1-6 are mouse buttons
+            if self.u.GetAsyncKeyState(vk) & 0x8000:
+                down = True
+                break
+        if not down:
+            return False
+        title = self._title()
+        return any(t in title for t in self.titles)
+
+
 def send_one(line):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(line.encode(), (UDP_HOST, UDP_PORT))
@@ -65,6 +100,11 @@ def main():
     ap.add_argument("--port")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--send", metavar="LINE")
+    ap.add_argument("--no-typing", action="store_true",
+                    help="don't show the typing face while you type")
+    ap.add_argument("--type-windows",
+                    default="claude,antigravity,powershell,command prompt,terminal,cmd",
+                    help="comma-separated window-title words that count as 'typing to Claude'")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -86,6 +126,9 @@ def main():
     sticky = {}          # last U:/X: line per kind, replayed after a reconnect
     last_event = ("", 0.0)
     ser = None
+    keys = None if a.no_typing else KeyWatcher(a.type_windows)
+    typing, last_key, last_typing_send = False, 0.0, 0.0
+    last_hook = "E:idle"     # what to show again when you stop typing
     print(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}")
 
     while True:
@@ -119,7 +162,12 @@ def main():
                     continue
                 if line[0] in "UX":
                     sticky[line[0]] = line
-                if line[0] == "E":     # drop identical events fired back-to-back
+                if line[0] == "E":
+                    ev = line[2:]
+                    last_hook = "E:idle" if ev in ("done", "need", "idle") else line
+                    if typing and ev not in ("done", "need"):
+                        continue       # the typing face wins while you type
+                    # drop identical events fired back-to-back
                     now = time.time()
                     if line == last_event[0] and now - last_event[1] < 0.4:
                         continue
@@ -127,9 +175,26 @@ def main():
                 if a.verbose:
                     print(">", line)
                 ser.write((line + "\n").encode())
+            if keys is not None:
+                now = time.time()
+                if keys.active():
+                    last_key = now
+                    if not typing or now - last_typing_send > 1.0:
+                        if a.verbose and not typing:
+                            print("> typing")
+                        typing, last_typing_send = True, now
+                        ser.write(b"E:key\n")
+                elif typing and now - last_key > 2.0:
+                    typing = False
+                    ser.write((last_hook + "\n").encode())
             ser.read(ser.in_waiting or 1)   # drain the board's debug prints
-        except (serial.SerialException, OSError):
-            print("serial lost - reconnecting...")
+        except (serial.SerialException, OSError) as e:
+            if isinstance(e, serial.SerialTimeoutException):
+                print("board is not reading the port (write timed out).\n"
+                      "  -> Arduino IDE: Tools > USB CDC On Boot > Enabled, re-upload the sketch,\n"
+                      "     and close the Arduino Serial Monitor.")
+            else:
+                print(f"serial lost ({e}) - reconnecting...")
             try:
                 ser.close()
             except Exception:

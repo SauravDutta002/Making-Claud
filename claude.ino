@@ -9,30 +9,47 @@
              OLED  SDA -> GPIO5   OLED  SCL -> GPIO4
              TTP223 VCC -> 3V3    TTP223 GND -> GND
              TTP223 OUT -> GPIO3
+             BUZZER  +  -> GPIO6  BUZZER  -  -> GND   (passive buzzer)
 
    Libraries: Adafruit GFX + Adafruit SH110X
 
    TOUCH
      single tap  -> next face
-     double tap  -> open brightness menu
+     double tap  -> SETTINGS  (brightness, volume, sound mode)
      triple tap  -> bug-jump game  (tap = jump)
-     hold        -> petted face (while held)
-     in menu: tap = change level, hold = exit & save (auto-closes in 8s)
+     4 taps      -> sound on / off  (quick mute)
+     hold        -> pet Claude (while held)
+
+   SETTINGS  (everything is saved; closes itself after 10 s)
+     tap  = next item           hold = choose
+     on Brightness / Volume:    tap = step up (live preview), hold = done
+     on Sound:                  hold cycles  ALL -> VOICE -> OFF
+       ALL   = voice + scene sound effects
+       VOICE = only Claude's reactions (done, needs you, petting ...)
      in game over: tap = retry, hold = exit
 
    Serial @115200 (single keys):
      n/p = next/prev scene   r = random   c = auto-cycle
      +/- = brightness up/down   b = brightness menu
-     g = start game   q = quit game
+     ] / [ = volume up/down     g = start game   q = quit game
+     s = sound on/off           m = cycle sound mode
 
    Serial @115200 (lines from claude_bridge.py on the laptop):
      E:<event>      think read type search web bash git test need
-                    done fail merge wait bug plane compact idle
+                    done fail merge wait bug plane compact pkg idle
+                    key = you are typing (keyboard scene)
      U:<5h>,<wk>,<min>   usage % (5-hour, weekly), minutes to 5h reset
      X:<pct>        context window % used
      C:<hash>       new git commit (shown in the git graph)
      G:1 / G:0      start / stop the game
    ============================================================= */
+
+/* The laptop bridge talks to this board over the C3's built-in USB port.
+   Without "USB CDC On Boot" the Serial output goes to the UART pins instead
+   and the bridge sees a silent, unresponsive port. */
+#if defined(CONFIG_IDF_TARGET_ESP32C3) && !ARDUINO_USB_CDC_ON_BOOT
+#error "Arduino IDE: Tools > USB CDC On Boot > Enabled, then upload again."
+#endif
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -118,14 +135,33 @@ Obst     obs[3];
 #define  G_PH      14
 
 /* ============================================================
-   BRIGHTNESS
+   SETTINGS  (brightness, volume, sound mode)
    ============================================================ */
 const uint8_t BRI_LEVELS[] = { 1, 10, 25, 50, 90, 150, 207, 255 };
 const uint8_t BRI_COUNT    = sizeof(BRI_LEVELS) / sizeof(BRI_LEVELS[0]);
 uint8_t  briIndex   = 5;          // default level, overwritten from flash
+
+const uint16_t VOL_LEVELS[] = { 8, 16, 28, 48, 80, 130, 220 };   // PWM duty of 1023
+const uint8_t  VOL_COUNT    = sizeof(VOL_LEVELS) / sizeof(VOL_LEVELS[0]);
+uint8_t  volIndex   = 3;
+
+#define  SND_OFF    0
+#define  SND_VOICE  1
+#define  SND_ALL    2
+uint8_t  soundMode  = SND_ALL;
+uint8_t  lastMode   = SND_ALL;    // restored by the 4-tap quick mute
+
+#define  MI_BRIGHT  0
+#define  MI_VOLUME  1
+#define  MI_SOUND   2
+#define  MI_EXIT    3
+#define  MENU_ITEMS 4
 bool     menuOpen   = false;
+bool     menuAdjust = false;      // editing a level instead of browsing
+uint8_t  menuCursor = 0;
 uint32_t menuSince  = 0;
-#define  MENU_TIMEOUT_MS  8000
+#define  MENU_TIMEOUT_MS  10000
+#define  MENU_HOLD_MS     450     // a bit longer than a pet, so it's deliberate
 
 /* ============================================================
    TOUCH SENSOR STATE
@@ -167,12 +203,6 @@ void setBrightness(uint8_t level) {
   display.oled_command(level);
 }
 void applyBrightness() { setBrightness(BRI_LEVELS[briIndex]); }
-
-void saveBrightness() {
-  prefs.begin("face", false);
-  prefs.putUChar("bri", briIndex);
-  prefs.end();
-}
 
 void sparkle(int cx, int cy, uint32_t f, int base) {
   for (uint8_t i = 0; i < 4; i++) {
@@ -219,6 +249,311 @@ void steam(int x, int y, uint32_t f, int cols) {
       int xx = x + i * 6 + (int)(sinf(k * 0.55f + f * 0.15f + i * 1.7f) * 2.2f);
       display.drawPixel(xx, y - k, C_WHITE);
     }
+}
+
+/* ============================================================
+   VOICE  — soft gliding babble on a passive buzzer (GPIO6)
+   Each phrase is a queue of syllables; soundUpdate() plays them
+   without blocking, with a gentle attack/release and vibrato.
+   ============================================================ */
+#define BUZZER_PIN  6
+#define BUZZ_BITS   10        // loudness = VOL_LEVELS[volIndex], set in SETTINGS
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define BZ_ID BUZZER_PIN    // core 3.x addresses LEDC by pin
+#else
+  #define BZ_ID 0             // core 2.x addresses LEDC by channel
+#endif
+
+struct Syl { uint16_t f0, f1, dur, gap; uint8_t v; };   // Hz, Hz, ms, ms, volume %
+Syl      sq[24];
+uint8_t  sqHead = 0, sqLen = 0;
+uint32_t sylStart = 0;
+bool     soundOn = true;                     // soundMode != SND_OFF
+uint16_t bzF = 0, bzD = 0;                   // what the PWM is set to now
+
+uint32_t toastUntil = 0;                     // "sound on/off" popup
+const char* MODE_NAMES[] = { "OFF", "VOICE", "ALL" };
+
+const float SCALE[] = { 1.0f, 1.125f, 1.25f, 1.5f, 1.667f };   // major pentatonic
+
+/* Sound runs in its own FreeRTOS task, updated every 1 ms, so glides
+   stay smooth while the main loop is busy pushing frames over I2C. */
+SemaphoreHandle_t sndLock = NULL;
+void soundUpdate();
+
+void soundTask(void* arg) {
+  for (;;) { soundUpdate(); vTaskDelay(1); }
+}
+
+void buzzInit() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(BUZZER_PIN, 1000, BUZZ_BITS);
+#else
+  ledcSetup(BZ_ID, 1000, BUZZ_BITS);
+  ledcAttachPin(BUZZER_PIN, BZ_ID);
+#endif
+  ledcWrite(BZ_ID, 0);
+  sndLock = xSemaphoreCreateMutex();
+  xTaskCreate(soundTask, "sound", 3072, NULL, 2, NULL);
+}
+
+void buzzOut(uint16_t f, uint16_t d) {
+  if (f == 0 || d == 0) {
+    if (bzD) { ledcWrite(BZ_ID, 0); bzD = 0; }
+    return;
+  }
+  if (f > bzF + 3 || f + 3 < bzF) { ledcChangeFrequency(BZ_ID, f, BUZZ_BITS); bzF = f; bzD = 0; }
+  if (d != bzD) { ledcWrite(BZ_ID, d); bzD = d; }
+}
+
+void sndClear() {
+  if (!sndLock) return;
+  xSemaphoreTake(sndLock, portMAX_DELAY);
+  sqHead = 0; sqLen = 0; sylStart = millis();
+  xSemaphoreGive(sndLock);
+}
+
+void sndPushV(uint16_t f0, uint16_t f1, uint16_t dur, uint16_t gap, uint8_t v) {
+  if (!sndLock) return;
+  xSemaphoreTake(sndLock, portMAX_DELAY);
+  if (sqHead + sqLen < 24) {
+    if (sqLen == 0) sylStart = millis();
+    sq[sqHead + sqLen] = { f0, f1, dur, gap, v };
+    sqLen++;
+  }
+  xSemaphoreGive(sndLock);
+}
+void sndPush(uint16_t f0, uint16_t f1, uint16_t dur, uint16_t gap) {
+  sndPushV(f0, f1, dur, gap, 100);
+}
+
+void soundUpdate() {
+  xSemaphoreTake(sndLock, portMAX_DELAY);
+  if (!sqLen) { buzzOut(0, 0); xSemaphoreGive(sndLock); return; }
+  uint32_t now = millis(), t = now - sylStart;
+  const Syl& s = sq[sqHead];
+
+  if (t < s.dur) {
+    float k = (float)t / s.dur;
+    float f = s.f0 + ((float)s.f1 - s.f0) * k;
+    f *= 1.0f + 0.012f * sinf(t * 0.07f);              // little vibrato
+    // soft attack / release, shortened for tiny clicks
+    uint16_t att = s.dur / 4 < 8  ? s.dur / 4 : 8;
+    uint16_t rel = s.dur / 3 < 14 ? s.dur / 3 : 14;
+    uint32_t rem = s.dur - t;
+    float env = 1.0f;
+    if (att && t < att) env = (float)t / att;
+    if (rel && rem < rel && (float)rem / rel < env) env = (float)rem / rel;
+    buzzOut((uint16_t)f, (uint16_t)(VOL_LEVELS[volIndex] * env * s.v / 100.0f) + 1);
+  } else if (t < (uint32_t)s.dur + s.gap) {
+    buzzOut(0, 0);
+  } else {
+    sqHead++; sqLen--;
+    sylStart = now;
+  }
+  xSemaphoreGive(sndLock);
+}
+
+/* Claude "talking": n syllables around base Hz; the last one
+   rises (+1, happy / question) or falls (-1, sad). */
+void say(uint8_t n, uint16_t base, int8_t ending) {
+  if (!soundOn) return;
+  sndClear();
+  for (uint8_t i = 0; i < n; i++) {
+    uint16_t f0 = (uint16_t)(base * SCALE[random(5)]);
+    int16_t  g  = random(-70, 71);
+    if (i == n - 1) g = ending * (int16_t)(base * 0.4f);
+    sndPush(f0, f0 + g, random(50, 95), i == n - 1 ? 0 : random(25, 60));
+  }
+}
+
+void sndNotes(const uint16_t* notes, uint8_t n, uint16_t dur, uint16_t gap) {
+  if (!soundOn) return;
+  sndClear();
+  for (uint8_t i = 0; i < n; i++) sndPush(notes[i], notes[i], dur, gap);
+}
+
+void sndHello()   { static const uint16_t n[] = { 660, 880, 1320 }; sndNotes(n, 3, 70, 30); }
+void sndHm()      { if (soundOn) { sndClear(); sndPush(700, 840, 70, 0); } }
+void sndNeed()    { say(3, 850, +1); }                  // a little question
+void sndDone()    { say(4, 950, +1); }                  // happy chatter
+void sndFail()    { if (soundOn) { sndClear(); sndPush(700, 600, 110, 50); sndPush(560, 400, 180, 0); } }
+void sndCommit()  { if (soundOn) { sndClear(); sndPush(1320, 1320, 60, 25); sndPush(1760, 1760, 130, 0); } }
+void sndGoal()    { static const uint16_t n[] = { 1047, 1319, 1568, 1319, 1568, 2093 }; sndNotes(n, 6, 55, 15); }
+void sndYay()     { static const uint16_t n[] = { 1047, 1319, 1568 }; sndNotes(n, 3, 60, 20); }
+void sndJump()    { if (soundOn) { sndClear(); sndPush(700, 1100, 40, 0); } }
+void sndOver()    { static const uint16_t n[] = { 784, 659, 523 }; sndNotes(n, 3, 100, 30); }
+void sndHiScore() { static const uint16_t n[] = { 523, 659, 784, 1047 }; sndNotes(n, 4, 80, 20); }
+
+/* --- petting voice ------------------------------------------
+   hold starts -> "oo-h!"   while held -> coos / purr-trills
+   after 3 s   -> giggle    let go     -> contented "mm~"      */
+uint32_t petStart = 0, nextCoo = 0;
+bool     giggled  = false;
+
+void sndPetStart() {
+  petStart = millis(); nextCoo = petStart + 1100; giggled = false;
+  if (!soundOn) return;
+  sndClear();
+  sndPushV(900, 1300, 90, 25, 90);                       // "oo-
+  sndPushV(1300, 1550, 70, 0, 100);                      //    -h!"
+}
+
+void sndCoo() {                                          // two soft falling notes
+  uint16_t f = (uint16_t)(1000 * SCALE[random(5)]);
+  sndClear();
+  sndPushV(f, (uint16_t)(f * 0.86f), 120, 70, 70);
+  sndPushV((uint16_t)(f * 1.12f), (uint16_t)(f * 0.94f), 170, 0, 55);
+}
+
+void sndChirr() {                                        // happy purr-trill
+  sndClear();
+  for (uint8_t i = 0; i < 8; i++)
+    sndPushV(i % 2 ? 1180 : 1080, i % 2 ? 1120 : 1140, 34, 0, 45 + i * 5);
+}
+
+void sndGiggle() {
+  static const uint16_t n[] = { 1175, 1319, 1480, 1760 };
+  sndClear();
+  for (uint8_t i = 0; i < 4; i++) sndPushV(n[i], n[i] + 60, 45, 35, 80);
+}
+
+void sndPetEnd() {                                       // contented sigh
+  if (!soundOn) return;
+  sndClear();
+  sndPushV(1250, 1350, 60, 0, 70);
+  sndPushV(1350, 820, 260, 0, 50);
+}
+
+void petUpdate() {
+  if (!petting || !soundOn || sqLen) return;
+  uint32_t now = millis();
+  if (now < nextCoo) return;
+  if (!giggled && now - petStart > 3000) { sndGiggle(); giggled = true; }
+  else if (random(3) == 0)               sndChirr();
+  else                                   sndCoo();
+  nextCoo = now + random(1300, 2100);
+}
+
+/* --- settings persistence + sound mode ---------------------- */
+void setSoundMode(uint8_t m) {
+  soundMode = m;
+  soundOn   = (m != SND_OFF);
+  if (m != SND_OFF) lastMode = m;
+}
+
+void saveSettings() {
+  prefs.begin("face", false);
+  prefs.putUChar("bri",  briIndex);
+  prefs.putUChar("vol",  volIndex);
+  prefs.putUChar("sndm", soundMode);
+  prefs.end();
+}
+
+/* --- UI sounds (quiet, short) -------------------------------- */
+void sndUiTick()   { if (soundOn) { sndClear(); sndPushV(1600, 1600, 12, 0, 45); } }
+void sndUiSelect() { if (soundOn) { sndClear(); sndPushV(1200, 1800, 50, 0, 60); } }
+void sndUiOpen()   { if (soundOn) { sndClear(); sndPushV(880, 880, 45, 20, 55); sndPushV(1320, 1320, 70, 0, 60); } }
+void sndUiClose()  { if (soundOn) { sndClear(); sndPushV(1320, 1320, 45, 20, 55); sndPushV(880, 880, 70, 0, 50); } }
+void sndPreview()  {          // always plays, so you hear the new volume
+  sndClear(); sndPushV(1320, 1320, 50, 30, 100); sndPushV(1760, 1760, 90, 0, 100);
+}
+
+/* 4-tap quick mute: off <-> whatever mode you had before */
+void toggleSound() {
+  setSoundMode(soundOn ? SND_OFF : lastMode);
+  sndClear();                                           // confirmation plays even when turning off
+  if (soundOn) { sndPush(660, 660, 70, 30); sndPush(990, 990, 110, 0); }
+  else         { sndPush(990, 990, 70, 30); sndPush(660, 660, 110, 0); }
+  saveSettings();
+  toastUntil = millis() + 1500;
+  Serial.printf("sound %s\n", MODE_NAMES[soundMode]);
+}
+
+/* small speaker glyph, 12x11, drawn in colour c */
+void iconSpeaker(int x, int y, bool on, uint16_t c) {
+  display.fillRect(x, y + 3, 3, 5, c);
+  display.fillTriangle(x + 2, y + 5, x + 6, y + 1, x + 6, y + 9, c);
+  if (on) {
+    display.drawLine(x + 8, y + 3, x + 9, y + 5, c);  display.drawLine(x + 9, y + 5, x + 8, y + 7, c);
+    display.drawLine(x + 10, y + 1, x + 11, y + 5, c); display.drawLine(x + 11, y + 5, x + 10, y + 9, c);
+  } else {
+    display.drawLine(x + 8, y + 3, x + 11, y + 7, c); display.drawLine(x + 11, y + 3, x + 8, y + 7, c);
+  }
+}
+
+void drawToast() {
+  if (millis() > toastUntil) return;
+  display.fillRect(22, 18, 84, 26, C_BLACK);
+  display.drawRect(22, 18, 84, 26, C_WHITE);
+  iconSpeaker(30, 25, soundOn, C_WHITE);
+  txt(50, 23, 1, "sound");
+  txt(50, 33, 1, soundMode == SND_OFF ? "off" : soundMode == SND_VOICE ? "voice" : "on");
+}
+
+/* --- scene sound effects (only in ALL mode) ------------------
+   Quiet, synced to each scene's animation, and they never cut
+   into Claude's voice: they only play when the queue is empty. */
+const uint16_t MELODY[] = { 1047, 1175, 1319, 1568, 1760 };
+
+bool ambOk() { return soundMode == SND_ALL && sqLen == 0; }
+void amb(uint16_t f0, uint16_t f1, uint16_t dur, uint8_t v) { if (ambOk()) sndPushV(f0, f1, dur, 0, v); }
+
+void sceneSfx(uint8_t sc, uint32_t f) {
+  if (soundMode != SND_ALL) return;
+  switch (sc) {
+    case 1: case 2:                                       // thinking: soft twinkle
+      if (f % 120 == 0 && ambOk()) { sndPushV(1568, 1568, 40, 30, 30); sndPushV(2093, 2093, 70, 0, 22); }
+      break;
+    case 3:  if (f % 80 == 0) amb(2093, 2093, 120, 28); break;          // lightbulb ding
+    case 4:  if (f % 160 == 0) amb(900, 1400, 30, 18); break;           // page turn
+    case 5:  if (f % 3 == 0 && random(10) < 4) amb(2400, 2100, 8, 28); break;   // typing
+    case 6:  if (f % 6 == 0) amb(2300, 2000, 8, 28); break;             // key peek
+    case 44: if (f % 4 == 0 && random(10) < 7) amb(2400, 2000, 8, 28); break;   // typing along
+    case 8: case 31:                                      // searching: sonar ping
+      if (f % 80 == 0 && ambOk()) { sndPushV(1400, 1300, 60, 120, 26); sndPushV(1400, 1300, 40, 0, 12); }
+      break;
+    case 9:  if (f % 16 == 0) { uint16_t b = random(700, 1100); amb(b, b + 300, 25, 18); } break;   // bubbles
+    case 13: case 14: case 15: case 16: case 17:          // music: soft melody
+      if (f % 10 == 0 && random(4)) { uint16_t n = MELODY[random(5)]; amb(n, n, 120, 22); }
+      break;
+    case 18:                                              // love: heartbeat
+      if (f % 40 == 0 && ambOk()) { sndPushV(520, 520, 25, 90, 40); sndPushV(480, 480, 35, 0, 30); }
+      break;
+    case 20: if (f % 36 == 0) amb(1200, 1500, 30, 28); break;           // juggling catch
+    case 21: if (f % 50 == 0) { uint16_t n = 2093 + random(3) * 250; amb(n, n, 50, 18); } break;   // stars
+    case 22: case 23: if (f % 84 == 0) amb(520, 430, 500, 16); break;   // snore
+    case 30:                                              // terminal: test dots, then a bonk
+      if (f % 7 == 0) {
+        uint8_t n = (f / 7) % 9;
+        if (n >= 1 && n < 8) amb(2000, 2000, 6, 20);
+        else if (n == 8)     amb(420, 300, 120, 35);
+      }
+      break;
+    case 32: if (f % 14 == 0) amb(1760, 1760, 15, 20); break;           // git commit hop
+    case 36:                                              // old goal: kick + net
+      if (f % 32 == 0)       amb(600, 350, 30, 50);
+      else if (f % 32 == 28) amb(1800, 900, 80, 22);
+      break;
+    case 42: if (f % 75 == 0) amb(1500, 700, 300, 14); break;           // paper plane whoosh
+    case 43: if (f % 60 == 31) amb(900, 200, 90, 40); break;            // squash
+    case 45:                                              // GOAL! little cheer
+      if (f % 40 == 0 && ambOk()) {
+        sndPushV(1047, 1047, 50, 15, 32); sndPushV(1319, 1319, 50, 15, 32); sndPushV(1568, 1568, 80, 0, 32);
+      }
+      break;
+    case 46: {                                            // bicycle kick, synced to the animation
+      uint8_t t = f % 90;
+      if      (t == 32) amb(700, 1400, 110, 22);          // flip
+      else if (t == 37) amb(520, 260, 45, 60);            // kick
+      else if (t == 66) amb(1800, 800, 120, 28);          // net swish
+      else if (t == 71 && ambOk()) {
+        sndPushV(1319, 1319, 45, 15, 30); sndPushV(1568, 1568, 45, 15, 30); sndPushV(2093, 2093, 90, 0, 30);
+      }
+      break;
+    }
+  }
 }
 
 /* ============================================================
@@ -307,31 +642,108 @@ void xEyes(int cx, int cy, int s) {
 }
 
 /* ============================================================
-   BRIGHTNESS MENU SCREEN
+   SETTINGS SCREENS
    ============================================================ */
-void drawBrightnessMenu(uint32_t f) {
-  display.drawRect(0, 0, 128, 64, C_WHITE);
-  txtC(5, 1, "BRIGHTNESS");
+void txtCol(int x, int y, const char* t, uint16_t c) {
+  display.setTextSize(1);
+  display.setTextColor(c);
+  display.setCursor(x, y);
+  display.print(t);
+  display.setTextColor(C_WHITE);
+}
 
-  // segmented level bar
-  int segW = 13, gap = 2;
-  int total = BRI_COUNT * segW + (BRI_COUNT - 1) * gap;
+void iconSun(int x, int y, uint16_t c) {               // 11x11
+  display.fillCircle(x + 5, y + 5, 2, c);
+  display.drawFastHLine(x, y + 5, 2, c);  display.drawFastHLine(x + 9, y + 5, 2, c);
+  display.drawFastVLine(x + 5, y, 2, c);  display.drawFastVLine(x + 5, y + 9, 2, c);
+  display.drawPixel(x + 2, y + 2, c); display.drawPixel(x + 8, y + 2, c);
+  display.drawPixel(x + 2, y + 8, c); display.drawPixel(x + 8, y + 8, c);
+}
+
+void iconNote(int x, int y, uint16_t c) {              // 9x11
+  display.fillCircle(x + 2, y + 8, 2, c);
+  display.drawFastVLine(x + 4, y + 1, 8, c);
+  display.drawLine(x + 4, y + 1, x + 8, y + 3, c);
+}
+
+void iconBack(int x, int y, uint16_t c) {              // 9x9 arrow
+  display.drawLine(x, y + 4, x + 4, y, c);
+  display.drawLine(x, y + 4, x + 4, y + 8, c);
+  display.drawFastHLine(x, y + 4, 9, c);
+}
+
+/* mini level bar used in the list */
+void miniBar(int x, int y, uint8_t idx, uint8_t count, uint16_t c) {
+  for (uint8_t i = 0; i < count; i++) {
+    int h = 3 + i * 5 / count;
+    if (i <= idx) display.fillRect(x + i * 5, y + 7 - h, 4, h, c);
+    else          display.drawPixel(x + i * 5 + 1, y + 6, c);
+  }
+}
+
+/* the list: SETTINGS title bar + 4 rows, selected row inverted */
+void drawSettingsList(uint32_t f) {
+  display.fillRect(0, 0, 128, 11, C_WHITE);
+  txtCol(4, 2, "SETTINGS", C_BLACK);
+  iconSpeaker(112, 0, soundOn, C_BLACK);
+
+  for (uint8_t i = 0; i < MENU_ITEMS; i++) {
+    int y = 14 + i * 12;
+    bool sel = (i == menuCursor);
+    uint16_t c = sel ? C_BLACK : C_WHITE;
+    if (sel) display.fillRoundRect(0, y - 1, 128, 12, 2, C_WHITE);
+
+    switch (i) {
+      case MI_BRIGHT:
+        iconSun(3, y, c);              txtCol(18, y + 2, "Brightness", c);
+        miniBar(86, y + 1, briIndex, BRI_COUNT, c);
+        break;
+      case MI_VOLUME:
+        iconSpeaker(2, y, soundOn, c); txtCol(18, y + 2, "Volume", c);
+        miniBar(91, y + 1, volIndex, VOL_COUNT, c);
+        break;
+      case MI_SOUND: {
+        iconNote(4, y, c);             txtCol(18, y + 2, "Sound", c);
+        const char* m = MODE_NAMES[soundMode];
+        txtCol(124 - (int)strlen(m) * 6, y + 2, m, c);
+        break;
+      }
+      case MI_EXIT:
+        iconBack(4, y + 1, c);         txtCol(18, y + 2, "Done", c);
+        break;
+    }
+  }
+  // gentle pulse on the cursor's right edge so the selection reads as "live"
+  if ((f / 10) % 2) display.fillRect(126, 14 + menuCursor * 12 + 3, 2, 4, C_BLACK);
+}
+
+/* full-screen level editor for brightness / volume */
+void drawLevelEdit(const char* title, uint8_t idx, uint8_t count, uint32_t f) {
+  display.fillRect(0, 0, 128, 11, C_WHITE);
+  txtCol(4, 2, title, C_BLACK);
+
+  int gap = 2;
+  int segW = (112 - (count - 1) * gap) / count;
+  int total = count * segW + (count - 1) * gap;
   int x0 = (SCREEN_WIDTH - total) / 2;
-  for (uint8_t i = 0; i < BRI_COUNT; i++) {
+  for (uint8_t i = 0; i < count; i++) {
     int x = x0 + i * (segW + gap);
-    int h = 6 + i * 2;                       // staircase shape
-    int y = 36 - h;
-    if (i <= briIndex) display.fillRect(x, y, segW, h, C_WHITE);
-    else               display.drawRect(x, y, segW, h, C_WHITE);
+    int h = 5 + i * 22 / count;                    // staircase
+    int y = 40 - h;
+    if (i <= idx) display.fillRect(x, y, segW, h, C_WHITE);
+    else          display.drawRect(x, y, segW, h, C_WHITE);
   }
 
-  // numeric readout
   char b[12];
-  snprintf(b, sizeof(b), "%u / %u", briIndex + 1, BRI_COUNT);
-  txtC(42, 1, b);
+  snprintf(b, sizeof(b), "%u / %u", idx + 1, count);
+  txtC(44, 1, b);
+  if ((f / 16) % 2) txtC(55, 1, "tap = +   hold = ok");
+}
 
-  // hint, blinking slowly so it reads as a prompt
-  if ((f / 16) % 2) txtC(53, 1, "tap=change hold=ok");
+void drawSettings(uint32_t f) {
+  if (!menuAdjust)                    drawSettingsList(f);
+  else if (menuCursor == MI_BRIGHT)   drawLevelEdit("BRIGHTNESS", briIndex, BRI_COUNT, f);
+  else                                drawLevelEdit("VOLUME", volIndex, VOL_COUNT, f);
 }
 
 /* ============================================================
@@ -422,6 +834,7 @@ void sc_keyboard(uint32_t f) {
     display.drawRect(x, 50, 12, 9, C_WHITE);
   }
 }
+
 
 /* --- letters fly -------------------------------------------- */
 void sc_letters(uint32_t f) {
@@ -558,7 +971,26 @@ void sc_love(uint32_t f) {
 
 /* --- petted (> <) ------------------------------------------- */
 void sc_petted(uint32_t f) {
-  chevronEyes(64, 28 + (int)wobble(f, 0.15f, 2), 22, true);
+  int dy = (int)wobble(f, 0.15f, 2);
+  chevronEyes(64, 26 + dy, 22, true);
+
+  // blush
+  for (uint8_t i = 0; i < 3; i++) {
+    display.drawLine(30 + i * 4, 45 + dy, 32 + i * 4, 42 + dy, C_WHITE);
+    display.drawLine(88 + i * 4, 45 + dy, 90 + i * 4, 42 + dy, C_WHITE);
+  }
+  // little "w" mouth
+  display.drawLine(58, 42 + dy, 61, 46 + dy, C_WHITE);
+  display.drawLine(61, 46 + dy, 64, 43 + dy, C_WHITE);
+  display.drawLine(64, 43 + dy, 67, 46 + dy, C_WHITE);
+  display.drawLine(67, 46 + dy, 70, 42 + dy, C_WHITE);
+
+  // hearts drifting up both sides
+  for (uint8_t i = 0; i < 2; i++) {
+    int p = (int)((f + i * 22) % 44);
+    int x = i ? 116 : 12;
+    heart(x + (int)wobble(f + i * 9, 0.2f, 2), 52 - p, p < 30 ? 4 : 3);
+  }
 }
 
 /* --- juggling ----------------------------------------------- */
@@ -827,6 +1259,114 @@ void sc_bugSquashed(uint32_t f) {
   eyes(104, 26, 10, 14, 10, dead ? EY_HAPPY : EY_NORMAL, 3);
 }
 
+/* --- typing along (shown while YOU type) -------------------- */
+void sc_typingAlong(uint32_t f) {
+  int bob = (int)wobble(f, 0.2f, 1);
+  int step = (f / 4) % 2;                       // which paw is pressing
+
+  // head + arms
+  display.fillRect(46, 11 + bob, 39, 23, C_WHITE);
+  display.fillRect(40, 22 + bob, 51, 7, C_WHITE);
+  int eh = (int)(8 * gBlink); if (eh < 1) eh = 1;
+  display.fillRect(53, 15 + bob, 3, eh, C_BLACK);
+  display.fillRect(76, 15 + bob, 3, eh, C_BLACK);
+
+  // paws (the pressing one drops onto the keys)
+  display.fillRect(33, step == 0 ? 34 : 31, 6, 5, C_WHITE);
+  display.fillRect(77, step == 1 ? 34 : 31, 6, 5, C_WHITE);
+
+  // keyboard in perspective
+  display.drawFastHLine(26, 37, 76, C_WHITE);
+  display.drawLine(26, 37, 17, 50, C_WHITE);
+  display.drawLine(101, 37, 110, 50, C_WHITE);
+  display.drawFastHLine(17, 50, 94, C_WHITE);
+  for (uint8_t r = 0; r < 2; r++) {
+    int   y  = 40 + r * 5;
+    float t  = (y - 37) / 13.0f;
+    float L  = 26 - 9 * t + 3, R = 101 + 9 * t - 3;
+    float kw = (R - L) / 9.0f;
+    uint8_t hit = ((f / 4) * 7 + r * 4) % 9;
+    for (uint8_t i = 0; i < 9; i++) {
+      int x = (int)(L + i * kw);
+      if (r == step && i == hit) display.fillRect(x, y, (int)kw - 1, 3, C_WHITE);
+      else                       display.drawRect(x, y, (int)kw - 1, 3, C_WHITE);
+    }
+  }
+
+  display.drawFastHLine(4, 53, 120, C_WHITE);
+
+  char b[20];
+  snprintf(b, sizeof(b), "typing along%.*s", (int)((f / 8) % 4), "...");
+  txt(2, 56, 1, b);
+}
+
+/* --- football helpers --------------------------------------- */
+/* Claude's body: x,y = top-left of the 26x12 body, ground at y+19.
+   flip draws the legs on top (bicycle kick); arm lifts the arm band. */
+void claudeFB(int x, int y, bool flip, int arm) {
+  display.fillRect(x, y, 26, 12, C_WHITE);
+  display.fillRect(x - 4, y + 4 + arm, 34, 5, C_WHITE);
+  display.fillRect(x + 6,  y + 3, 2, 4, C_BLACK);
+  display.fillRect(x + 18, y + 3, 2, 4, C_BLACK);
+  int ly = flip ? y - 7 : y + 12;
+  display.fillRect(x + 1,  ly, 2, 7, C_WHITE);
+  display.fillRect(x + 5,  ly, 2, 7, C_WHITE);
+  display.fillRect(x + 19, ly, 2, 7, C_WHITE);
+  display.fillRect(x + 23, ly, 2, 7, C_WHITE);
+}
+
+void ballFB(int x, int y) {            // black fill so it shows over white
+  display.fillCircle(x, y, 3, C_BLACK);
+  display.drawCircle(x, y, 3, C_WHITE);
+  display.drawPixel(x, y, C_WHITE);
+}
+
+void goalNet(int shake) {
+  display.drawRect(104 + shake, 24, 24, 30, C_WHITE);
+  for (int y = 27; y < 54; y += 4)
+    for (int x = 107; x < 126; x += 4) display.drawPixel(x + shake, y, C_WHITE);
+}
+
+/* --- goal! -------------------------------------------------- */
+void sc_goalCheer(uint32_t f) {
+  int dy  = -(int)(fabsf(sinf(f * 0.25f)) * 5);        // jumping for joy
+  int arm = ((f / 6) % 2) ? -3 : 0;
+  goalNet((f / 3) % 2 ? 1 : 0);
+  ballFB(118, 50 - (int)(fabsf(sinf(f * 0.3f)) * 1.5f));
+  claudeFB(30, 34 + dy, false, arm);
+  if ((f / 10) % 4 != 3) txt(34, 1, 2, "GOAL!");
+  sparkle(14, 18, f, 3);
+  sparkle(98, 14, f + 7, 3);
+  display.drawFastHLine(4, 54, 120, C_WHITE);
+}
+
+/* --- bicycle kick ------------------------------------------- */
+void sc_bicycleKick(uint32_t f) {
+  uint8_t t = f % 90;
+  int   dy = 0, bx = 58, by = 4;
+  bool  flip = false;
+
+  if (t >= 28 && t <= 46) {                              // the jump
+    float u = (t - 28) / 18.0f;
+    dy   = -(int)(sinf(u * PI) * 12);
+    flip = (u > 0.2f && u < 0.8f);                       // legs go overhead
+  }
+  if (t < 37) {                                          // ball drops
+    by = 4 + (int)(t * 10 / 37);
+  } else if (t < 70) {                                   // ball flies to the net
+    float k = (t - 37) / 33.0f;
+    bx = 58 + (int)(k * 60);
+    by = 14 + (int)(k * 36 - sinf(k * PI) * 10);
+  } else {                                               // ball in the net
+    bx = 118; by = 50;
+  }
+
+  goalNet(t >= 65 && t < 78 && (t / 2) % 2 ? 1 : 0);
+  claudeFB(46, 34 + dy, flip, flip ? -2 : 0);
+  ballFB(bx, by);
+  display.drawFastHLine(4, 54, 120, C_WHITE);
+}
+
 /* ============================================================
    SCENE TABLE
    capStyle: 0 = none, 1 = sparkle + animated dots, 2 = plain centred
@@ -878,6 +1418,9 @@ const Scene SCENES[] = {
   { NULL,              0, sc_wait        },   // 41
   { "paper plane",     2, sc_paperPlane  },   // 42
   { "bug squashed",    2, sc_bugSquashed },   // 43
+  { NULL,              0, sc_typingAlong },   // 44
+  { "goal",            2, sc_goalCheer   },   // 45
+  { "bicycle kick",    2, sc_bicycleKick },   // 46
 };
 const uint8_t SCENE_COUNT = sizeof(SCENES) / sizeof(SCENES[0]);
 
@@ -959,6 +1502,7 @@ void endGame() {
     prefs.putUShort("hi", gHi);
     prefs.end();
   }
+  if (gNewHi) sndHiScore(); else sndOver();
   Serial.printf("game over: %u\n", gScore);
 }
 
@@ -972,7 +1516,7 @@ void gameStep() {
     return;
   }
 
-  if (touchPressed && gY < 0.5f) gVy = 6.4f;           // jump
+  if (touchPressed && gY < 0.5f) { gVy = 6.4f; sndJump(); }   // jump
   gY += gVy;
   gVy -= 0.55f;
   if (gY <= 0) { gY = 0; gVy = 0; }
@@ -1056,18 +1600,30 @@ const Ev EVENTS[] = {
   { "search", 31 }, { "web", 8 },  { "bash", 30 },  { "git", 32 },
   { "test", 9 },  { "need", 10 },  { "done", 35 },  { "fail", 39 },
   { "merge", 33 }, { "wait", 41 }, { "bug", 43 },   { "plane", 42 },
-  { "compact", 11 }, { "pkg", 34 },
+  { "compact", 11 }, { "pkg", 34 }, { "key", 44 },
+  { "goal", 45 }, { "kick", 46 },
 };
 const uint8_t EVENT_COUNT = sizeof(EVENTS) / sizeof(EVENTS[0]);
 
 void onEvent(const char* name) {
   uint32_t now = millis();
+  static uint32_t lastNeed = 0, lastHm = 0, lastDone = 0;
   live = true; lastEvent = now; autoCycle = false; followStage = 0;
 
-  if (!strcmp(name, "need")) gameMode = false;     // Claude needs you: leave the game
+  if (!strcmp(name, "need")) {                     // Claude needs you: leave the game
+    gameMode = false;
+    if (now - lastNeed > 10000) { sndNeed(); lastNeed = now; }
+  }
   if (gameMode) return;                            // don't interrupt a game otherwise
 
+  // the voice only speaks up for the moments that matter
+  if (!strcmp(name, "think") && now - lastHm > 8000) { sndHm(); lastHm = now; }
+  else if (!strcmp(name, "fail"))                    sndFail();
+  else if (!strcmp(name, "bug"))                     sndYay();
+  else if (!strcmp(name, "goal"))                    sndGoal();
+
   if (!strcmp(name, "done")) {
+    if (now - lastDone > 5000) { sndDone(); lastDone = now; }
     setScene(usage5h >= 100 ? 38 : 35);
     followStage = 1; followAt = now;
     return;
@@ -1094,21 +1650,69 @@ void handleLine(char* line) {
     case 'U': {
       int a = -1, w = -1, m = -1;
       sscanf(v, "%d,%d,%d", &a, &w, &m);
-      usage5h = a; usageWk = w; resetMin = m; resetStamp = millis();
+      usage5h = constrain(a, -1, 100); usageWk = constrain(w, -1, 100);
+      resetMin = constrain(m, -1, 32000); resetStamp = millis();
       if (a >= 100 && !gameMode && live) setScene(38);
       break;
     }
     case 'X': ctxPct = constrain(atoi(v), 0, 100); break;
-    case 'C': pushCommit(v); onEvent("git"); break;
+    case 'C': pushCommit(v); onEvent("git"); if (!gameMode) sndCommit(); break;
     case 'G': if (atoi(v)) startGame(); else if (gameMode) exitGame(); break;
   }
 }
 
+/* ============================================================
+   SETTINGS MENU  (one button: tap = next / step, hold = choose / done)
+   ============================================================ */
+void openMenu() {
+  menuOpen = true; menuAdjust = false; menuCursor = 0;
+  menuSince = millis();
+  petting = false;
+  sndUiOpen();
+}
+
 void closeMenu() {
-  menuOpen = false;
-  saveBrightness();
+  menuOpen = false; menuAdjust = false;
+  saveSettings();
   sceneSince = millis();
-  Serial.printf("brightness saved: level %u (%u)\n", briIndex + 1, BRI_LEVELS[briIndex]);
+  sndUiClose();
+  Serial.printf("settings saved: bri %u/%u  vol %u/%u  sound %s\n",
+                briIndex + 1, BRI_COUNT, volIndex + 1, VOL_COUNT, MODE_NAMES[soundMode]);
+}
+
+void menuTap() {
+  menuSince = millis();
+  if (!menuAdjust) {
+    menuCursor = (menuCursor + 1) % MENU_ITEMS;
+    sndUiTick();
+  } else if (menuCursor == MI_BRIGHT) {
+    briIndex = (briIndex + 1) % BRI_COUNT;
+    applyBrightness();
+    sndUiTick();
+  } else {
+    volIndex = (volIndex + 1) % VOL_COUNT;
+    sndPreview();                                   // hear the new level
+  }
+}
+
+void menuHold() {
+  menuSince = millis();
+  if (menuAdjust) { menuAdjust = false; sndUiSelect(); return; }
+  switch (menuCursor) {
+    case MI_BRIGHT:
+    case MI_VOLUME:
+      menuAdjust = true;
+      sndUiSelect();
+      break;
+    case MI_SOUND:                                  // ALL -> VOICE -> OFF -> ALL
+      setSoundMode(soundMode == SND_ALL ? SND_VOICE : soundMode == SND_VOICE ? SND_OFF : SND_ALL);
+      sndClear();
+      if (soundOn) sndPushV(1200, 1800, 50, 0, 60);
+      break;
+    case MI_EXIT:
+      closeMenu();
+      break;
+  }
 }
 
 void drawFrame() {
@@ -1116,7 +1720,7 @@ void drawFrame() {
   display.clearDisplay();
 
   if (menuOpen) {
-    drawBrightnessMenu(tick);
+    drawSettings(tick);
   } else if (gameMode) {
     gameStep();
     if (gameMode) gameDraw();          // gameStep may have exited
@@ -1126,17 +1730,21 @@ void drawFrame() {
   } else {
     SCENES[scene].draw(tick);
     drawCaption(SCENES[scene].cap, SCENES[scene].capStyle, tick);
+    sceneSfx(scene, tick);
   }
 
+  drawToast();
   touchPressed = touchReleased = false;
   display.display();
 }
 
 /* ============================================================
    TOUCH HANDLING
-     tap        -> next face   (in menu: change level)
-     double tap -> open brightness menu
-     hold       -> petted face (in menu: exit & save)
+     tap        -> next face        (in settings: next item / step up)
+     double tap -> open settings
+     triple tap -> game     4 taps -> quick mute
+     hold       -> petted face      (in settings: choose / done)
+   Inside settings taps act instantly (no multi-tap wait).
    ============================================================ */
 void handleTouch() {
   uint32_t now = millis();
@@ -1153,32 +1761,31 @@ void handleTouch() {
     } else {                           // finger up
       touchReleased = true;
       if (gameMode)          { }       // the game reads the edges itself
-      else if (petting)      { petting = false; sceneSince = now; }
+      else if (petting)      { petting = false; sceneSince = now; sndPetEnd(); }
       else if (holdConsumed) { holdConsumed = false; }
+      else if (menuOpen)     { menuTap(); }
       else                   { tapCount++; lastTap = now; }
     }
   }
 
   // hold threshold passed
-  if (touchState && !gameMode && !petting && !holdConsumed && now - touchDown > PET_HOLD_MS) {
-    if (menuOpen) { closeMenu(); holdConsumed = true; }
-    else          { petting = true; }
+  uint32_t holdMs = menuOpen ? MENU_HOLD_MS : PET_HOLD_MS;
+  if (touchState && !gameMode && !petting && !holdConsumed && now - touchDown > holdMs) {
+    if (menuOpen) { menuHold(); holdConsumed = true; }
+    else          { petting = true; tapCount = 0; sndPetStart(); }
   }
 
-  // resolve taps once the double-tap window closes
+  // resolve taps once the multi-tap window closes
   if (tapCount && now - lastTap > TAP_WINDOW_MS) {
-    if (menuOpen) {
-      briIndex = (briIndex + tapCount) % BRI_COUNT;
-      applyBrightness();
-      menuSince = now;                 // keep the menu alive
-    } else if (tapCount == 1) {
+    if (tapCount == 1) {
       setScene(scene + 1);
       autoCycle = false;
     } else if (tapCount == 2) {
-      menuOpen  = true;                // double tap opens the menu
-      menuSince = now;
-    } else {
+      openMenu();                      // double tap opens settings
+    } else if (tapCount == 3) {
       startGame();                     // triple tap
+    } else {
+      toggleSound();                   // 4 taps
     }
     tapCount = 0;
   }
@@ -1192,11 +1799,18 @@ void handleKey(char c) {
   else if (c == 'p') { setScene(scene + SCENE_COUNT - 1); autoCycle = false; live = false; }
   else if (c == 'r') { setScene(random(SCENE_COUNT));     autoCycle = false; live = false; }
   else if (c == 'c') { autoCycle = !autoCycle; sceneSince = millis(); }
-  else if (c == '+') { if (briIndex < BRI_COUNT - 1) briIndex++; applyBrightness(); saveBrightness(); }
-  else if (c == '-') { if (briIndex > 0)             briIndex--; applyBrightness(); saveBrightness(); }
-  else if (c == 'b') { menuOpen = true; menuSince = millis(); }
+  else if (c == '+') { if (briIndex < BRI_COUNT - 1) briIndex++; applyBrightness(); saveSettings(); }
+  else if (c == '-') { if (briIndex > 0)             briIndex--; applyBrightness(); saveSettings(); }
+  else if (c == ']') { if (volIndex < VOL_COUNT - 1) volIndex++; sndPreview(); saveSettings(); }
+  else if (c == '[') { if (volIndex > 0)             volIndex--; sndPreview(); saveSettings(); }
+  else if (c == 'b') { if (!menuOpen) openMenu(); }
   else if (c == 'g') { startGame(); }
   else if (c == 'q') { if (gameMode) exitGame(); }
+  else if (c == 's') { toggleSound(); }
+  else if (c == 'm') {
+    setSoundMode(soundMode == SND_ALL ? SND_VOICE : soundMode == SND_VOICE ? SND_OFF : SND_ALL);
+    saveSettings(); toastUntil = millis() + 1500;
+  }
 }
 
 /* Upper-case first char starts a protocol line ("E:think\n");
@@ -1270,12 +1884,15 @@ void setup() {
 
   prefs.begin("face", true);              // read-only
   briIndex = prefs.getUChar("bri", 5);
+  volIndex = prefs.getUChar("vol", 3);
+  uint8_t m = prefs.getUChar("sndm", SND_ALL);
+  gHi      = prefs.getUShort("hi", 0);
   prefs.end();
   if (briIndex >= BRI_COUNT) briIndex = 5;
+  if (volIndex >= VOL_COUNT) volIndex = 3;
+  setSoundMode(m > SND_ALL ? SND_ALL : m);
   applyBrightness();
-  prefs.begin("face", true);
-  gHi = prefs.getUShort("hi", 0);
-  prefs.end();
+  buzzInit();
 
   display.clearDisplay();
   display.display();
@@ -1284,7 +1901,8 @@ void setup() {
   bootSplash();
   scheduleBlink();
   setScene(0);
-  Serial.printf("%u scenes. tap=next, 2x=brightness, 3x=game, hold=petted.\n",
+  sndHello();
+  Serial.printf("%u scenes. tap=next, 2x=settings, 3x=game, 4x=mute, hold=pet.\n",
                 SCENE_COUNT);
 }
 
@@ -1292,6 +1910,7 @@ void loop() {
   handleTouch();
   handleSerial();
   updateLive();
+  petUpdate();                            // sound itself plays in soundTask
 
   if (autoCycle && !petting && !menuOpen && !gameMode && millis() - sceneSince > SCENE_MS)
     setScene(scene + 1);
