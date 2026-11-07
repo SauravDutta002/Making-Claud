@@ -5,8 +5,10 @@ Claude Code pipes session JSON in on stdin (rate limits, context usage...).
 We forward the numbers to the OLED bridge and print a short status line.
 """
 import json
+import os
 import socket
 import sys
+import tempfile
 import time
 
 ADDR = ("127.0.0.1", 47800)
@@ -17,13 +19,26 @@ def pct(window):
     return None if v is None else int(round(v))
 
 
+DEBUG_LOG = os.path.join(tempfile.gettempdir(), "claude_oled_debug.log")
+
+
+def debug(msg):
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
 def main():
     try:
         d = json.load(sys.stdin)
     except Exception:
+        debug("statusline: no JSON on stdin")
         return
 
     rl = d.get("rate_limits") or {}
+    debug("statusline: rate_limits=%s keys=%s" % (json.dumps(rl), ",".join(sorted(d))))
     five, week = rl.get("five_hour"), rl.get("seven_day")
     a, w = pct(five), pct(week)
     ctx = pct(d.get("context_window"))
