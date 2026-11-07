@@ -80,6 +80,7 @@
 
 #define FRAME_MS    25       // ~40 fps
 #define RESUME_MS   45000    // no input this long -> Claude goes back to living on its own
+#define ALIVE_AFTER_MS 12000 // bridge connected, Claude idle this long -> plays / reacts on its own
 #define EYE_RADIUS  0        // 0 = hard square corners, 6-9 = rounded
 
 /* eye styles — plain defines so no custom type appears in any
@@ -145,6 +146,9 @@ uint32_t followAt    = 0;
 
 char     ticker[44]  = "";            // what Claude is doing right now (T:)
 uint32_t tickerAt    = 0;
+bool     shellPs     = false;         // shell window: PowerShell or bash
+uint8_t  keyScene    = 255;           // scene shown as a reaction to your typing
+uint32_t lastKeyAt   = 0;
 
 /* a Claude turn in progress: from your prompt until Claude finishes */
 bool     busy        = false;
@@ -455,9 +459,30 @@ void sndNotes(const uint16_t* notes, uint8_t n, uint16_t dur, uint16_t gap) {
 void sndHello()   { static const uint16_t n[] = { 660, 880, 1320 }; sndNotes(n, 3, 70, 30); }
 void sndHm()      { if (soundOn) { sndClear(); sndPush(700, 840, 70, 0); } }
 void sndNeed()    { say(3, 850, +1); }                  // a little question
-void sndDone()    { say(4, 950, +1); }                  // happy chatter
+void sndDone() {                                        // resolving chime + "all done!"
+  if (!soundOn) return;
+  sndClear();
+  sndPushV(784, 784, 60, 15, 70);
+  sndPushV(988, 988, 60, 15, 75);
+  sndPushV(1319, 1319, 140, 70, 85);
+  sndPushV(1047, 1175, 60, 35, 70);
+  sndPushV(1175, 1568, 110, 0, 75);
+}
+void sndPrompt() {                                      // message sent -> "got it!"
+  if (!soundOn) return;
+  sndClear();
+  sndPushV(500, 1500, 70, 40, 40);
+  sndPushV(1319, 1568, 50, 25, 55);
+  sndPushV(1760, 1760, 70, 0, 50);
+}
 void sndFail()    { if (soundOn) { sndClear(); sndPush(700, 600, 110, 50); sndPush(560, 400, 180, 0); } }
-void sndCommit()  { if (soundOn) { sndClear(); sndPush(1320, 1320, 60, 25); sndPush(1760, 1760, 130, 0); } }
+void sndCommit() {                                      // "ka-ching" + sparkle
+  if (!soundOn) return;
+  static const uint16_t n[] = { 1047, 1319, 1568, 2093 };
+  sndClear();
+  for (uint8_t i = 0; i < 4; i++) sndPushV(n[i], n[i], i < 3 ? 40 : 120, 10, 80);
+  for (uint8_t i = 0; i < 4; i++) sndPushV(i % 2 ? 3136 : 2637, i % 2 ? 3136 : 2637, 25, 5, 55);
+}
 void sndGoal()    { static const uint16_t n[] = { 1047, 1319, 1568, 1319, 1568, 2093 }; sndNotes(n, 6, 55, 15); }
 void sndYay()     { static const uint16_t n[] = { 1047, 1319, 1568 }; sndNotes(n, 3, 60, 20); }
 void sndJump()    { if (soundOn) { sndClear(); sndPush(700, 1100, 40, 0); } }
@@ -646,7 +671,26 @@ void sceneSfx(uint8_t sc, uint32_t f) {
     case 38: if (f % 120 == 0) amb(800, 500, 200, 25); break;          // limit hit
     case 39: if (f % 16 == 0) amb(500, 420, 80, 28); break;            // test failed
     case 40: case 41: if (f % 8 == 0) amb(1300, 1300, 8, 14); break;   // checking / waiting dots
-    case 1: case 2: case 54:                              // thinking: soft twinkle
+    case 54: {                                            // Claude thinking: generative melody
+      static const uint16_t TUNE[] = { 523, 587, 659, 784, 880, 1047, 1175, 1319, 1568, 1760 };
+      static int8_t note = 4;
+      if (f % 168 == 0 && ambOk()) { sndPushV(392, 392, 90, 0, 35); break; }   // low pulse
+      if (f % 21 == 0 && random(4)) {                    // in time with the ✻ breathing
+        note += random(-2, 3);
+        if (note < 0) note = 1;
+        if (note > 9) note = 8;
+        amb(TUNE[note], TUNE[note], 140, 26);
+      }
+      break;
+    }
+    case 55: if (f % 50 == 0) amb(2093 + random(3) * 250, 2637, 40, 20); break;   // finished: sparkles
+    case 56: {                                            // shell: key clicks, then "enter"
+      uint32_t lt = f - sceneTick0, len = strlen(ticker) + 6;
+      if (lt < len && f % 2 == 0)  amb(2400, 2000, 6, 24);
+      else if (lt == len + 2)      amb(1200, 900, 35, 40);
+      break;
+    }
+    case 1: case 2:                                       // thinking: soft twinkle
       if (f % 120 == 0 && ambOk()) { sndPushV(1568, 1568, 40, 30, 30); sndPushV(2093, 2093, 70, 0, 22); }
       break;
     case 3:  if (f % 80 == 0) amb(2093, 2093, 120, 28); break;          // lightbulb ding
@@ -1719,15 +1763,22 @@ void sc_flappy(uint32_t f) {
   if (lives > 0) {
     // aim for the nearest pipe that's still ahead
     uint8_t nx = (px[0] + PW < BX || (px[1] < px[0] && px[1] + PW >= BX)) ? 1 : 0;
+    // Skilled AI: a flap (-2.0) rises ~9 px, so flap the moment the bird's
+    // feet get within 3 px of the lower pipe — it then peaks just under the top.
     if (lazy) lazy--;
-    else if (random(1000) < 5) lazy = 22;          // daydreams now and then...
-    if (!lazy && y > gy[nx] + 9 && vy > -0.5f) { vy = -2.3f; amb(900, 1300, 18, 18); }
+    else if (random(10000) < 4) lazy = 14;         // a very rare daydream
+    int gapBottom = gy[nx] + GAP;
+    if (!lazy && vy >= 0 && y + 10 >= gapBottom - 3) { vy = -2.0f; amb(900, 1300, 18, 18); }
     vy += 0.2f; if (vy > 2.8f) vy = 2.8f;
     y += vy;    if (y < 9) { y = 9; vy = 0; }
 
     for (uint8_t i = 0; i < 2; i++) {
       px[i] -= 1.3f;
-      if (px[i] < -PW - 2) { px[i] += 140; gy[i] = random(12, 34); scored[i] = false; }
+      if (px[i] < -PW - 2) {                        // next gap always reachable from the last
+        px[i] += 140;
+        gy[i] = constrain(gy[1 - i] + (int)random(-12, 13), 12, 34);
+        scored[i] = false;
+      }
       if (!scored[i] && px[i] + PW < BX) { scored[i] = true; score++; fx2(1760, 2093, 40, 30); }
       bool overX = px[i] < BX + 16 && px[i] + PW > BX + 2;
       if (!hurt && overX && (y + 1 < gy[i] || y + 9 > gy[i] + GAP)) {
@@ -2068,6 +2119,35 @@ void sc_finished(uint32_t f) {
   sparkle(114, 46, f + 6, 3);
 }
 
+/* --- real shell: types out the command Claude is running ----- */
+void sc_shell(uint32_t f) {
+  uint32_t lt = f - sceneTick0;
+  winBox(0, 0, 128, 64, shellPs ? "PowerShell" : "bash");
+
+  const char* cmd = ticker;
+  if (cmd[0] == '$' && cmd[1] == ' ') cmd += 2;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%s %s", shellPs ? "PS C:\\>" : "$", cmd);
+
+  size_t len = strlen(buf), shown = lt < len ? lt : len;
+  const int COLS = 20;
+  int row = 0, col = 0;
+  char c[2] = { 0, 0 };
+  for (size_t i = 0; i < shown && row < 4; i++) {
+    c[0] = buf[i];
+    txt(3 + col * 6, 13 + row * 10, 1, c);
+    if (++col >= COLS) { col = 0; row++; }
+  }
+  if (row < 4 && (shown < len || (f / 8) % 2))           // cursor: solid while typing
+    display.fillRect(3 + col * 6, 13 + row * 10, 5, 8, C_WHITE);
+  if (shown >= len) {
+    static const char SPIN[] = "|/-\\";
+    char b[16];
+    snprintf(b, sizeof(b), "%c running", SPIN[(f / 4) % 4]);
+    txt(3, 53, 1, b);
+  }
+}
+
 /* ============================================================
    SCENE TABLE
    capStyle: 0 = none, 1 = sparkle + animated dots, 2 = plain centred
@@ -2131,6 +2211,7 @@ const Scene SCENES[] = {
   { NULL,              0, sc_profile     },   // 53  level / xp / hat
   { NULL,              0, sc_working     },   // 54  ✻ Enchanting... (27s)
   { NULL,              0, sc_finished    },   // 55  Worked for 1m 23s
+  { NULL,              0, sc_shell       },   // 56  PowerShell / bash window
 };
 const uint8_t SCENE_COUNT = sizeof(SCENES) / sizeof(SCENES[0]);
 
@@ -2200,7 +2281,9 @@ const uint8_t LOSES[] = { 26, 25 };
 bool isGameScene(uint8_t s) { return s >= 48 && s <= 50; }
 bool isLongScene(uint8_t s) { return s >= 47 && s <= 50; }
 
-void director() {
+/* alive = you're working (bridge connected) but Claude is idle: no fake
+   "work" scenes then, only moods, play (football, crane, games...) and naps */
+void director(bool alive) {
   uint32_t now = millis();
   if (now - sceneSince < sceneDur && !playOver) return;
 
@@ -2213,6 +2296,7 @@ void director() {
   }
 
   uint8_t r = random(100), next;
+  if (alive && r >= 30 && r < 58) r = 58 + random(32);   // play instead of fake work
   do {
     if (r < 30)      next = MOODS[random(sizeof(MOODS))];
     else if (r < 58) next = WORKS[random(sizeof(WORKS))];
@@ -2220,7 +2304,7 @@ void director() {
     else             next = RESTS[random(sizeof(RESTS))];
   } while (next == scene);
 
-  if (isLongScene(next))  sceneDur = random(16000, 24000);
+  if (isLongScene(next))  sceneDur = alive ? random(12000, 16000) : random(16000, 24000);
   else if (r < 30)        sceneDur = random(4000, 6500);
   else if (r < 58)        sceneDur = random(5000, 8000);
   else if (r < 90)        sceneDur = random(6000, 9000);
@@ -2361,22 +2445,44 @@ void gameDraw() {
 /* ============================================================
    LIVE EVENTS  (E:<name> lines from the laptop)
    ============================================================ */
-struct Ev { const char* name; uint8_t scene; };
+/* each event has a few fitting scenes; one is picked at random so it feels
+   fresh every time (and kept while the same kind of work continues) */
+struct Ev { const char* name; uint8_t n; uint8_t sc[4]; };
 const Ev EVENTS[] = {
-  { "idle", 0 },  { "think", 2 },  { "read", 4 },   { "type", 5 },
-  { "search", 31 }, { "web", 8 },  { "bash", 30 },  { "git", 32 },
-  { "test", 9 },  { "need", 10 },  { "done", 35 },  { "fail", 39 },
-  { "merge", 33 }, { "wait", 41 }, { "bug", 43 },   { "plane", 42 },
-  { "compact", 11 }, { "pkg", 34 }, { "key", 44 },
-  { "goal", 45 }, { "kick", 46 },
-  { "crane", 47 }, { "flappy", 48 }, { "panic", 49 }, { "whack", 50 },
-  { "stats", 51 }, { "profile", 53 },
+  { "idle",    1, { 0 } },               { "think",   1, { 54 } },
+  { "read",    2, { 4, 40 } },           { "type",    4, { 5, 44, 6, 7 } },
+  { "write",   3, { 47, 7, 44 } },       { "build",   2, { 47, 34 } },     // building -> crane
+  { "search",  2, { 31, 40 } },          { "web",     1, { 8 } },
+  { "bash",    1, { 56 } },              { "ps",      1, { 56 } },         // real shell window
+  { "git",     1, { 32 } },              { "test",    1, { 9 } },
+  { "need",    1, { 10 } },              { "done",    1, { 35 } },
+  { "fail",    2, { 39, 26 } },          { "merge",   1, { 33 } },
+  { "wait",    1, { 41 } },              { "bug",     3, { 43, 45, 46 } }, // tests pass -> celebrate
+  { "plane",   1, { 42 } },              { "compact", 1, { 11 } },
+  { "pkg",     2, { 34, 47 } },          { "key",     1, { 44 } },
+  { "goal",    1, { 45 } },              { "kick",    1, { 46 } },
+  { "crane",   1, { 47 } },              { "flappy",  1, { 48 } },
+  { "panic",   1, { 49 } },              { "whack",   1, { 50 } },
+  { "stats",   1, { 51 } },              { "profile", 1, { 53 } },
 };
 const uint8_t EVENT_COUNT = sizeof(EVENTS) / sizeof(EVENTS[0]);
 
 void onEvent(const char* name) {
   uint32_t now = millis();
   static uint32_t lastNeed = 0, lastHm = 0, lastDone = 0;
+
+  if (!strcmp(name, "key")) {                        // you're typing
+    static uint32_t lastKeyReact = 0;
+    static const uint8_t KEYS[] = { 44, 44, 6, 27 }; // typing along, key peek, watching you
+    live = true; lastEvent = now; autoCycle = false; lastKeyAt = now;
+    bool inKey = (scene == 44 || scene == 6 || scene == 27);
+    // don't copy every keystroke: never while Claude works, at most every 30 s
+    if (busy || gameMode || followStage || inKey || now - lastKeyReact < 30000) return;
+    lastKeyReact = now;
+    setScene(KEYS[random(4)]);
+    keyScene = scene;
+    return;
+  }
   live = true; lastEvent = now; autoCycle = false; followStage = 0;
   if (!strcmp(name, "done"))     addXp(4);
   else if (!strcmp(name, "bug")) addXp(6);
@@ -2388,7 +2494,8 @@ void onEvent(const char* name) {
   if (gameMode) return;                            // don't interrupt a game otherwise
 
   // the voice only speaks up for the moments that matter
-  if (!strcmp(name, "think") && now - lastHm > 8000) { sndHm(); lastHm = now; }
+  if (!strcmp(name, "think") && !busy)               sndPrompt();      // a new turn
+  else if (!strcmp(name, "think") && now - lastHm > 8000) { sndHm(); lastHm = now; }
   else if (!strcmp(name, "fail"))                    sndFail();
   else if (!strcmp(name, "bug"))                     sndYay();
   else if (!strcmp(name, "goal"))                    sndGoal();
@@ -2409,10 +2516,18 @@ void onEvent(const char* name) {
     if (scene != 54) setScene(54);
     return;
   }
-  if (busy && strcmp(name, "need") && strcmp(name, "key")) lastToolAt = now;   // a real tool step
+  if (busy && strcmp(name, "need") && strcmp(name, "key")) {   // a real tool step
+    lastToolAt = now;
+    amb(1760, 2093, 12, 30);                                    // tiny "tick"
+  }
   for (uint8_t i = 0; i < EVENT_COUNT; i++)
     if (!strcmp(name, EVENTS[i].name)) {
-      if (scene != EVENTS[i].scene) setScene(EVENTS[i].scene);
+      const Ev& e = EVENTS[i];
+      if (!strcmp(name, "ps"))   shellPs = true;
+      if (!strcmp(name, "bash")) shellPs = false;
+      bool already = false;
+      for (uint8_t k = 0; k < e.n; k++) if (scene == e.sc[k]) already = true;
+      if (!already || e.sc[0] == 56) setScene(e.sc[random(e.n)]);   // shell: retype each command
       sceneSince = now;
       return;
     }
@@ -2683,6 +2798,12 @@ void updateLive() {
     followStage = 0;
     setScene(0);
   }
+  // you stopped typing: drop the typing reaction
+  if (keyScene != 255) {
+    if (scene != keyScene) keyScene = 255;
+    else if (now - lastKeyAt > 4000 && !gameMode) { keyScene = 255; setScene(0); }
+  }
+
   // mid-turn and no tool running (Claude is thinking / writing): show the spinner
   if (busy && live && !gameMode && !menuOpen && !petting && followStage == 0 &&
       scene != 54 && scene != 10 && scene != 44 && now - lastToolAt > SPIN_AFTER_MS)
@@ -2762,7 +2883,10 @@ void loop() {
   if (!autoCycle && !live && !petting && !menuOpen && !gameMode && millis() - lastInput > RESUME_MS) {
     autoCycle = true; sceneDur = 0;
   }
-  if (autoCycle && !petting && !menuOpen && !gameMode) director();
+  // you're working, Claude is between turns: it lives a little on its own
+  bool aliveIdle = live && !busy && followStage == 0 && scene != 10 &&
+                   millis() - lastEvent > ALIVE_AFTER_MS;
+  if ((autoCycle || aliveIdle) && !petting && !menuOpen && !gameMode) director(!autoCycle);
 
   if (levelPending && !petting && !menuOpen && !gameMode) {   // celebrate a level up
     levelPending = false;

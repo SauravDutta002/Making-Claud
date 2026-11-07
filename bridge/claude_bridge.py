@@ -283,7 +283,6 @@ def main():
     ser = None
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
     typing, last_key, last_typing_send = False, 0.0, 0.0
-    last_hook = "E:idle"     # what to show again when you stop typing
     print(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}")
 
     while True:
@@ -350,9 +349,6 @@ def main():
                     if ev in ("done", "bug"):
                         stats.bump("tasks" if ev == "done" else "tests")
                         stats_changed = True
-                    last_hook = "E:idle" if ev in ("done", "need", "idle") else line
-                    if typing and ev not in ("done", "need"):
-                        continue       # the typing face wins while you type
                 if a.verbose:
                     print(">", line)
                 ser.write((line + "\n").encode())
@@ -379,8 +375,7 @@ def main():
                         typing, last_typing_send = True, now
                         ser.write(b"E:key\n")
                 elif typing and now - last_key > 2.0:
-                    typing = False
-                    ser.write((last_hook + "\n").encode())
+                    typing = False     # the board decides how (and whether) to react
             ser.read(ser.in_waiting or 1)   # drain the board's debug prints
         except (serial.SerialException, OSError) as e:
             if isinstance(e, serial.SerialTimeoutException):

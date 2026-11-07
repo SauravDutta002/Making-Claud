@@ -19,10 +19,14 @@ TEST_RE = re.compile(r"\b(pytest|jest|vitest|mocha|phpunit|rspec|unittest|go tes
 FAIL_RE = re.compile(r"[1-9]\d* (failed|failures?)|\bFAILED\b|failures?:\s*[1-9]|Traceback|✗|✖")
 PKG_RE = re.compile(r"\b(npm (i|install|add)|pnpm (i|install|add)|yarn add|pip3? install|"
                     r"cargo add|go get|brew install|winget install)\b")
+BUILD_RE = re.compile(r"\b((npm|pnpm|yarn)( run)? build|make|cmake|cargo build|go build|gradlew?|mvn|"
+                      r"dotnet (build|publish)|tsc|webpack|vite build|pyinstaller|"
+                      r"arduino-cli(\.exe)?\W+compile|pio run|docker build)\b")
 
 TOOL_EVENT = {
     "Read": "read", "NotebookRead": "read",
-    "Edit": "type", "Write": "type", "MultiEdit": "type", "NotebookEdit": "type",
+    "Edit": "type", "MultiEdit": "type", "NotebookEdit": "type",
+    "Write": "write",                                   # creating a file -> the crane builds it
     "Grep": "search", "Glob": "search", "LS": "search",
     "WebSearch": "web", "WebFetch": "web",
 }
@@ -54,8 +58,8 @@ def git_head(cwd):
         return ""
 
 
-def bash_event(cmd, phase, cwd, resp_text):
-    """phase: 'pre' or 'post'. Returns the lines to send."""
+def bash_event(cmd, phase, cwd, resp_text, shell="bash"):
+    """phase: 'pre' or 'post'; shell: 'bash' or 'ps' (PowerShell). Returns the lines to send."""
     if re.search(r"\bgit\s+commit\b", cmd):
         if phase == "pre":
             try:
@@ -82,7 +86,9 @@ def bash_event(cmd, phase, cwd, resp_text):
         return ["E:fail"] if FAIL_RE.search(resp_text) else ["E:bug"]
     if PKG_RE.search(cmd):
         return ["E:pkg"] if phase == "pre" else []
-    return ["E:bash"] if phase == "pre" else []
+    if BUILD_RE.search(cmd):
+        return ["E:build"] if phase == "pre" else []
+    return ["E:" + shell] if phase == "pre" else []
 
 
 def clean(text, limit=40):
@@ -103,7 +109,7 @@ def ticker(tool, inp):
         return "writing " + name(inp.get("file_path", ""))
     if tool == "NotebookEdit":
         return "editing " + name(inp.get("notebook_path", ""))
-    if tool == "Bash":
+    if tool in ("Bash", "PowerShell"):
         return "$ " + str(inp.get("command", "")).splitlines()[0] if inp.get("command") else "$"
     if tool == "Grep":
         return "grep " + str(inp.get("pattern", ""))
@@ -132,21 +138,20 @@ def main():
 
     if cwd and ev in ("SessionStart", "UserPromptSubmit"):
         send("W:" + cwd)                            # bridge starts watching this repo's commits
-    if ev == "PreToolUse":
+    if ev == "PreToolUse":                          # (your prompt is never sent to the screen)
         send("T:" + clean(ticker(tool, inp)))
-    elif ev == "UserPromptSubmit" and d.get("prompt"):
-        send("T:" + clean("> " + d["prompt"]))
 
     if ev in SIMPLE_EVENT:
         send(f"E:{SIMPLE_EVENT[ev]}")
     elif ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
         phase = "pre" if ev == "PreToolUse" else "post"
-        if tool == "Bash":
+        if tool in ("Bash", "PowerShell"):
             resp = json.dumps(d.get("tool_response", ""), ensure_ascii=False)
             if ev == "PostToolUseFailure" and TEST_RE.search(inp.get("command", "")):
                 send("E:fail")
             elif ev != "PostToolUseFailure":
-                send(*bash_event(inp.get("command", ""), phase, cwd, resp))
+                send(*bash_event(inp.get("command", ""), phase, cwd, resp,
+                                 "ps" if tool == "PowerShell" else "bash"))
         elif phase == "pre":
             send("E:" + TOOL_EVENT.get(tool, "think"))
 
