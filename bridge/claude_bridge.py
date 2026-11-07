@@ -151,6 +151,8 @@ class CommitWatcher:
 
     def __init__(self, extra):
         self.repos = {}                       # repo root -> {"head": sha, "since": time}
+        self.current = None                   # repo shown on the board's git graph
+        self.changed = True                   # history moved -> resend it to the board
         self.next_poll = 0.0
         try:
             with open(REPOS_FILE) as f:
@@ -166,6 +168,8 @@ class CommitWatcher:
         if not root:
             return False
         root = os.path.normpath(root)
+        if root != self.current:              # the repo you're working in now
+            self.current, self.changed = root, True
         if root in self.repos:
             return False
         self.repos[root] = {"head": git(root, "rev-parse", "HEAD"), "since": time.time()}
@@ -173,6 +177,23 @@ class CommitWatcher:
         if save:
             self.save()
         return True
+
+    def snapshot(self):
+        """R:/L: lines: branch, repo name and the last 5 commits of the current repo."""
+        root = self.current or next(iter(self.repos), None)
+        if not root:
+            return []
+        branch = git(root, "rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
+        rows = git(root, "log", "--format=%h%x09%s", "-n", "5").splitlines()
+        lines = ["R:%s,%s" % (oled_text(branch, 11).replace(",", " "),
+                              oled_text(os.path.basename(root), 19))]
+        for i in range(5):
+            if i < len(rows):
+                h, _, subj = rows[i].partition("\t")
+                lines.append("L:%d,%s,%s" % (i, h[:7], oled_text(subj, 19)))
+            else:
+                lines.append("L:%d,," % i)   # clear unused rows
+        return lines
 
     def save(self):
         try:
@@ -192,6 +213,8 @@ class CommitWatcher:
             head = git(root, "rev-parse", "HEAD")
             if not head or head == st["head"]:
                 continue
+            if root == self.current:              # commit, pull, reset, branch switch...
+                self.changed = True
             rng = f"{st['head']}..{head}" if st["head"] else head
             out = git(root, "log", "--format=%h%x09%ct%x09%s", "-n", "5", rng)
             for ln in reversed(out.splitlines()):
@@ -199,6 +222,8 @@ class CommitWatcher:
                 # only freshly made commits: a branch switch or pull brings in old ones
                 if ct.isdigit() and int(ct) >= st["since"] - 120:
                     found.append((h[:7], subj, os.path.basename(root)))
+                    if root != self.current:      # show the repo that just got a commit
+                        self.current, self.changed = root, True
             st["head"], st["since"] = head, now
         return found
 
@@ -253,6 +278,7 @@ def main():
     sticky = {"S": stats.line()}   # last U:/X:/S: line per kind, replayed after a reconnect
     watcher = CommitWatcher(a.repo)
     seen_commits = []              # short hashes already sent (hook + watcher both report)
+    git_lines = []                 # last R:/L: history sent, replayed after a reconnect
     last_event = ("", 0.0)
     ser = None
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
@@ -271,7 +297,7 @@ def main():
                 ser = open_serial(port, a.baud)
                 print(f"connected on {port}")
                 time.sleep(0.3)
-                for line in sticky.values():
+                for line in list(sticky.values()) + git_lines:
                     ser.write((line + "\n").encode())
             except (serial.SerialException, OSError) as e:
                 print(f"cannot open {port}: {e}")
@@ -334,6 +360,15 @@ def main():
                     sticky["S"] = stats.line()
                     if line != sticky["S"]:
                         ser.write((sticky["S"] + "\n").encode())
+                if line[0] == "C":
+                    watcher.changed = True         # resend the history with this commit
+            if watcher.changed:                    # board's git graph = your real history
+                watcher.changed = False
+                git_lines = watcher.snapshot()
+                for gl in git_lines:
+                    ser.write((gl + "\n").encode())
+                if a.verbose and git_lines:
+                    print("> git history:", git_lines[0])
             if keys is not None:
                 now = time.time()
                 if keys.active():

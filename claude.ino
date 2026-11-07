@@ -49,6 +49,8 @@
      X:<pct>        context window % used
      C:<hash>       new git commit (shown in the git graph)
      T:<text>       what Claude is doing now ("editing app.py")
+     R:<branch>,<repo>          L:<0-4>,<hash>,<subject>
+                    your repo's branch and last 5 commits (git graph)
      S:<commits>,<tasks>,<tests>,<cents>,<added>,<removed>,<minutes>
                     today's stats + this session's cost/lines/time
      G:1 / G:0      start / stop the game
@@ -130,13 +132,32 @@ int8_t   usageWk     = -1;
 int16_t  resetMin    = -1;            // minutes to 5h reset, at resetStamp
 uint32_t resetStamp  = 0;
 int8_t   ctxPct      = -1;
-char     commits[5][8] = { "1a49713", "5acfded", "0f2d768", "aaad437", "2e5f783" };
+/* your repo's real history (L: / R: lines from the bridge), newest first */
+bool     gitKnown      = false;
+char     gHash[5][8]   = { "", "", "", "", "" };
+char     gSubj[5][20]  = { "", "", "", "", "" };
+char     gitBranch[12] = "";
+char     gitRepo[20]   = "";
+uint32_t commitAt      = 0;           // when the newest commit arrived (row flashes)
 
 uint8_t  followStage = 0;             // after "done": trophy -> usage -> idle
 uint32_t followAt    = 0;
 
 char     ticker[44]  = "";            // what Claude is doing right now (T:)
 uint32_t tickerAt    = 0;
+
+/* a Claude turn in progress: from your prompt until Claude finishes */
+bool     busy        = false;
+uint32_t busyStart   = 0;
+uint32_t busyDur     = 0;             // how long the last turn took
+uint32_t lastToolAt  = 0;             // last real tool event in this turn
+uint8_t  verbIdx     = 0;
+const char* VERBS[] = { "Enchanting", "Pondering", "Brewing", "Cogitating", "Conjuring",
+                        "Musing", "Noodling", "Percolating", "Ruminating", "Tinkering",
+                        "Crafting", "Mulling", "Simmering", "Wrangling", "Manifesting",
+                        "Synthesizing", "Spelunking", "Vibing", "Baking", "Forging" };
+const uint8_t VERB_COUNT = sizeof(VERBS) / sizeof(VERBS[0]);
+#define  SPIN_AFTER_MS  3500          // no tool this long -> back to the spinner
 
 bool     statsKnown  = false;         // today's stats (S:) from the bridge
 uint16_t stCommits = 0, stTasks = 0, stTests = 0, stAdded = 0, stRemoved = 0, stMin = 0;
@@ -625,7 +646,7 @@ void sceneSfx(uint8_t sc, uint32_t f) {
     case 38: if (f % 120 == 0) amb(800, 500, 200, 25); break;          // limit hit
     case 39: if (f % 16 == 0) amb(500, 420, 80, 28); break;            // test failed
     case 40: case 41: if (f % 8 == 0) amb(1300, 1300, 8, 14); break;   // checking / waiting dots
-    case 1: case 2:                                       // thinking: soft twinkle
+    case 1: case 2: case 54:                              // thinking: soft twinkle
       if (f % 120 == 0 && ambOk()) { sndPushV(1568, 1568, 40, 30, 30); sndPushV(2093, 2093, 70, 0, 22); }
       break;
     case 3:  if (f % 80 == 0) amb(2093, 2093, 120, 28); break;          // lightbulb ding
@@ -653,7 +674,7 @@ void sceneSfx(uint8_t sc, uint32_t f) {
         else if (n == 8)     amb(420, 300, 120, 35);
       }
       break;
-    case 32: if (f % 14 == 0) amb(1760, 1760, 15, 20); break;           // git commit hop
+    case 32: if (f % 40 == 0) amb(1760, 1760, 15, 18); break;           // git HEAD pulse
     case 36:                                              // old goal: kick + net
       if (f % 32 == 0)       amb(600, 350, 30, 50);
       else if (f % 32 == 28) amb(1800, 900, 80, 22);
@@ -1206,18 +1227,49 @@ void sc_searching(uint32_t f) {
 }
 
 /* --- git graph ---------------------------------------------- */
+/* like the editor's Graph panel: branch + repo, then the last 5 commits */
 void sc_gitGraph(uint32_t f) {
-  const char* h[5] = { commits[0], commits[1], commits[2], commits[3], commits[4] };
-  for (uint8_t i = 0; i < 5; i++) {
-    int y = 6 + i * 11;
-    display.drawFastVLine(10, y, 11, C_WHITE);
-    bool live = (i == (f / 14) % 5);
-    if (live) display.fillCircle(10, y, 3, C_WHITE);
-    else      display.drawCircle(10, y, 3, C_WHITE);
-    txt(20, y - 3, 1, h[i]);
-    display.drawFastHLine(70, y, 24, C_WHITE);
+  if (!gitKnown) {
+    for (uint8_t i = 0; i < 4; i++) {                    // empty, gently pulsing graph
+      int y = 8 + i * 12;
+      if (i < 3) display.drawFastVLine(6, y, 12, C_WHITE);
+      if (i == (f / 20) % 4) display.fillCircle(6, y, 2, C_WHITE);
+      else                   display.drawCircle(6, y, 2, C_WHITE);
+    }
+    txt(18, 14, 1, "no git repo yet");
+    txt(18, 28, 1, "start the bridge");
+    txt(18, 40, 1, "& commit away!");
+    return;
   }
-  txt(96, 26, 1, "commit");
+
+  // branch pill + repo name
+  const char* br = gitBranch[0] ? gitBranch : "HEAD";
+  int bw = (int)strlen(br) * 6 + 13;
+  display.fillRoundRect(0, 0, bw, 10, 4, C_WHITE);
+  display.drawCircle(5, 4, 2, C_BLACK);
+  txtCol(10, 1, br, C_BLACK);
+  txt(bw + 4, 1, 1, gitRepo);
+
+  bool fresh = millis() - commitAt < 4000;
+  for (uint8_t i = 0; i < 5; i++) {
+    if (!gHash[i][0]) continue;
+    int y = 17 + i * 10;
+    if (i < 4 && gHash[i + 1][0]) display.drawFastVLine(4, y, 10, C_WHITE);
+    if (i == 0) {                                        // HEAD: hollow ring, pulsing
+      display.fillCircle(4, y, 3, C_BLACK);
+      display.drawCircle(4, y, 3, C_WHITE);
+      if ((f / 20) % 2) display.fillCircle(4, y, 1, C_WHITE);
+    } else {
+      display.fillCircle(4, y, 2, C_WHITE);
+    }
+    const char* s = gSubj[i][0] ? gSubj[i] : gHash[i];
+    if (i == 0 && fresh && (f / 4) % 2) {                // brand-new commit flashes
+      display.fillRect(10, y - 4, (int)strlen(s) * 6 + 3, 9, C_WHITE);
+      txtCol(12, y - 3, s, C_BLACK);
+    } else {
+      txt(12, y - 3, 1, s);
+    }
+  }
 }
 
 /* --- branch merge ------------------------------------------- */
@@ -1949,7 +2001,7 @@ void sc_profile(uint32_t f) {
 
 /* the live "what Claude is doing" strip at the bottom of work scenes */
 bool tickerScene(uint8_t s) {
-  static const uint8_t L[] = { 1, 2, 4, 5, 7, 8, 9, 10, 32, 33, 34, 41, 42 };
+  static const uint8_t L[] = { 1, 2, 4, 5, 7, 8, 9, 10, 33, 34, 41, 42, 54 };
   for (uint8_t i = 0; i < sizeof(L); i++) if (L[i] == s) return true;
   return false;
 }
@@ -1966,6 +2018,54 @@ void drawTicker() {
     txt(2 - off, 56, 1, ticker);
     txt(2 - off + span, 56, 1, ticker);
   }
+}
+
+/* ============================================================
+   WORKING / FINISHED  — synced to a real Claude turn
+   ============================================================ */
+/* Claude's ✻ : six thick arms, rotating and breathing */
+void claudeStar(int cx, int cy, float r, float rot) {
+  for (uint8_t k = 0; k < 3; k++) {
+    float a = rot + k * PI / 3;
+    int dx = (int)(cosf(a) * r), dy = (int)(sinf(a) * r);
+    for (int o = -1; o <= 1; o++) {
+      display.drawLine(cx - dx + o, cy - dy, cx + dx + o, cy + dy, C_WHITE);
+      display.drawLine(cx - dx, cy - dy + o, cx + dx, cy + dy + o, C_WHITE);
+    }
+  }
+  display.fillCircle(cx, cy, 2, C_WHITE);
+}
+
+void fmtDur(char* b, size_t n, uint32_t ms) {
+  uint32_t s = ms / 1000;
+  if (s < 60) snprintf(b, n, "%lus", (unsigned long)s);
+  else        snprintf(b, n, "%lum %02lus", (unsigned long)(s / 60), (unsigned long)(s % 60));
+}
+
+void sc_working(uint32_t f) {
+  claudeStar(18, 22, 9 + sinf(f * 0.15f) * 3, f * 0.06f);
+
+  char b[24], d[12];
+  snprintf(b, sizeof(b), "%s%.*s", VERBS[verbIdx], (int)((f / 8) % 4), "...");
+  txt(36, 10, 1, b);
+  fmtDur(d, sizeof(d), busy ? millis() - busyStart : 0);
+  snprintf(b, sizeof(b), "(%s)", d);
+  txt(36, 22, 1, b);
+
+  // eyes glance around while it works, with the usual blinks
+  int dx = (int)wobble(f, 0.04f, 6);
+  eyes(84 + dx, 42, 12, 16, 12, EY_NORMAL, 3);
+}
+
+void sc_finished(uint32_t f) {
+  claudeStar(18, 22, 10, 0.3f);
+  char d[12];
+  fmtDur(d, sizeof(d), busyDur);
+  txt(36, 10, 1, "Worked for");
+  txt(36, 22, 2, d);
+  eyes(64, 48, 14, 14, 14, EY_HAPPY, 3);
+  sparkle(14, 50, f, 3);
+  sparkle(114, 46, f + 6, 3);
 }
 
 /* ============================================================
@@ -2029,6 +2129,8 @@ const Scene SCENES[] = {
   { NULL,              0, sc_stats       },   // 51  today's stats
   { NULL,              0, sc_levelUp     },   // 52  level up!
   { NULL,              0, sc_profile     },   // 53  level / xp / hat
+  { NULL,              0, sc_working     },   // 54  ✻ Enchanting... (27s)
+  { NULL,              0, sc_finished    },   // 55  Worked for 1m 23s
 };
 const uint8_t SCENE_COUNT = sizeof(SCENES) / sizeof(SCENES[0]);
 
@@ -2291,12 +2393,23 @@ void onEvent(const char* name) {
   else if (!strcmp(name, "bug"))                     sndYay();
   else if (!strcmp(name, "goal"))                    sndGoal();
 
-  if (!strcmp(name, "done")) {
+  if (!strcmp(name, "done")) {                       // turn finished: "Worked for 1m 23s"
     if (now - lastDone > 5000) { sndDone(); lastDone = now; }
-    setScene(usage5h >= 100 ? 38 : 35);
+    busyDur = busy ? now - busyStart : 0;
+    busy = false;
+    setScene(usage5h >= 100 ? 38 : busyDur ? 55 : 35);
     followStage = 1; followAt = now;
     return;
   }
+  if (!strcmp(name, "idle")) busy = false;            // session started / ended
+
+  if (!strcmp(name, "think")) {                      // you sent a prompt: Claude is working
+    if (!busy) { busy = true; busyStart = now; verbIdx = random(VERB_COUNT); }
+    lastToolAt = 0;
+    if (scene != 54) setScene(54);
+    return;
+  }
+  if (busy && strcmp(name, "need") && strcmp(name, "key")) lastToolAt = now;   // a real tool step
   for (uint8_t i = 0; i < EVENT_COUNT; i++)
     if (!strcmp(name, EVENTS[i].name)) {
       if (scene != EVENTS[i].scene) setScene(EVENTS[i].scene);
@@ -2305,10 +2418,40 @@ void onEvent(const char* name) {
     }
 }
 
+/* a new commit: shift it in now; the bridge follows up with the real list */
 void pushCommit(const char* h) {
-  for (uint8_t i = 4; i > 0; i--) memcpy(commits[i], commits[i - 1], 8);
-  strncpy(commits[0], h, 7);
-  commits[0][7] = 0;
+  for (uint8_t i = 4; i > 0; i--) {
+    memcpy(gHash[i], gHash[i - 1], sizeof(gHash[i]));
+    memcpy(gSubj[i], gSubj[i - 1], sizeof(gSubj[i]));
+  }
+  strncpy(gHash[0], h, 7); gHash[0][7] = 0;
+  strcpy(gSubj[0], "new commit");
+  commitAt = millis();
+}
+
+/* L:<i>,<hash>,<subject>  — one row of the history (empty hash clears it) */
+void setGitRow(const char* v) {
+  int i = v[0] - '0';
+  const char* p = strchr(v, ',');
+  if (i < 0 || i > 4 || !p) return;
+  const char* q = strchr(p + 1, ',');
+  size_t hl = q ? (size_t)(q - p - 1) : strlen(p + 1);
+  if (hl > 7) hl = 7;
+  memcpy(gHash[i], p + 1, hl); gHash[i][hl] = 0;
+  strncpy(gSubj[i], q ? q + 1 : "", sizeof(gSubj[i]) - 1);
+  gSubj[i][sizeof(gSubj[i]) - 1] = 0;
+  gitKnown = true;
+}
+
+/* R:<branch>,<repo name> */
+void setGitRepo(const char* v) {
+  const char* p = strchr(v, ',');
+  size_t bl = p ? (size_t)(p - v) : strlen(v);
+  if (bl > sizeof(gitBranch) - 1) bl = sizeof(gitBranch) - 1;
+  memcpy(gitBranch, v, bl); gitBranch[bl] = 0;
+  strncpy(gitRepo, p ? p + 1 : "", sizeof(gitRepo) - 1);
+  gitRepo[sizeof(gitRepo) - 1] = 0;
+  gitKnown = true;
 }
 
 void handleLine(char* line) {
@@ -2326,6 +2469,8 @@ void handleLine(char* line) {
     }
     case 'X': ctxPct = constrain(atoi(v), 0, 100); break;
     case 'C': pushCommit(v); onEvent("git"); addXp(10); if (!gameMode) sndCommit(); break;
+    case 'L': setGitRow(v); break;
+    case 'R': setGitRepo(v); break;
     case 'T':
       strncpy(ticker, v, sizeof(ticker) - 1);
       ticker[sizeof(ticker) - 1] = 0;
@@ -2538,7 +2683,15 @@ void updateLive() {
     followStage = 0;
     setScene(0);
   }
-  if (live && now - lastEvent > LIVE_TIMEOUT_MS) {
+  // mid-turn and no tool running (Claude is thinking / writing): show the spinner
+  if (busy && live && !gameMode && !menuOpen && !petting && followStage == 0 &&
+      scene != 54 && scene != 10 && scene != 44 && now - lastToolAt > SPIN_AFTER_MS)
+    setScene(54);
+
+  // while a turn is running, stay synced (no random faces) — up to 15 min of silence
+  bool turnAlive = busy && now - lastEvent < 900000UL;
+  if (busy && !turnAlive) busy = false;
+  if (live && !turnAlive && now - lastEvent > LIVE_TIMEOUT_MS) {
     live = false; autoCycle = true; sceneSince = now;
   }
 }
