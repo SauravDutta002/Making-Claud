@@ -12,11 +12,18 @@ board. Run it once and leave it open:
     python claude_bridge.py --port COM5    # or pick the port yourself
     python claude_bridge.py --send E:think # inject a line (testing)
     python claude_bridge.py --list         # show serial ports
+    python claude_bridge.py --repo D:\code\myproject   # also watch this repo's commits
+
+Commits are picked up from ANY tool (Antigravity / VS Code source control, a
+terminal, GitHub Desktop...): the bridge watches each repo's HEAD. Repos you
+use Claude Code in are added automatically and remembered in repos.json.
 """
 import argparse
 import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import time
 
@@ -118,6 +125,84 @@ class Stats:
         return "S:%d,%d,%d,%d,%d,%d,%d" % (d["commits"], d["tasks"], d["tests"], *self.session)
 
 
+REPOS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repos.json")
+
+
+def git(repo, *args):
+    try:
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                           timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def oled_text(text, limit=40):
+    """One short ASCII line the OLED font can draw."""
+    text = re.sub(r"\s+", " ", text).strip()
+    text = "".join(c if 32 <= ord(c) < 127 else "?" for c in text)
+    return text[:limit - 2] + ".." if len(text) > limit else text
+
+
+class CommitWatcher:
+    """Notices new commits in watched repos, whoever made them."""
+
+    POLL_S = 4
+
+    def __init__(self, extra):
+        self.repos = {}                       # repo root -> {"head": sha, "since": time}
+        self.next_poll = 0.0
+        try:
+            with open(REPOS_FILE) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            saved = []
+        for path in list(saved) + list(extra):
+            self.add(path, save=False)
+        self.save()
+
+    def add(self, path, save=True):
+        root = git(path, "rev-parse", "--show-toplevel")
+        if not root:
+            return False
+        root = os.path.normpath(root)
+        if root in self.repos:
+            return False
+        self.repos[root] = {"head": git(root, "rev-parse", "HEAD"), "since": time.time()}
+        print(f"watching commits in {root}")
+        if save:
+            self.save()
+        return True
+
+    def save(self):
+        try:
+            with open(REPOS_FILE, "w") as f:
+                json.dump(sorted(self.repos), f, indent=1)
+        except OSError:
+            pass
+
+    def poll(self):
+        """Returns [(short hash, subject, repo name)] for commits made since the last poll."""
+        now = time.time()
+        if now < self.next_poll:
+            return []
+        self.next_poll = now + self.POLL_S
+        found = []
+        for root, st in self.repos.items():
+            head = git(root, "rev-parse", "HEAD")
+            if not head or head == st["head"]:
+                continue
+            rng = f"{st['head']}..{head}" if st["head"] else head
+            out = git(root, "log", "--format=%h%x09%ct%x09%s", "-n", "5", rng)
+            for ln in reversed(out.splitlines()):
+                h, ct, subj = (ln.split("\t", 2) + ["", ""])[:3]
+                # only freshly made commits: a branch switch or pull brings in old ones
+                if ct.isdigit() and int(ct) >= st["since"] - 120:
+                    found.append((h[:7], subj, os.path.basename(root)))
+            st["head"], st["since"] = head, now
+        return found
+
+
 def send_one(line):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(line.encode(), (UDP_HOST, UDP_PORT))
@@ -139,6 +224,8 @@ def main():
     ap.add_argument("--port")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--send", metavar="LINE")
+    ap.add_argument("--repo", action="append", default=[], metavar="PATH",
+                    help="also watch this git repo for commits (repeatable; remembered)")
     ap.add_argument("--no-typing", action="store_true",
                     help="don't show the typing face while you type")
     ap.add_argument("--type-windows",
@@ -164,6 +251,8 @@ def main():
 
     stats = Stats()
     sticky = {"S": stats.line()}   # last U:/X:/S: line per kind, replayed after a reconnect
+    watcher = CommitWatcher(a.repo)
+    seen_commits = []              # short hashes already sent (hook + watcher both report)
     last_event = ("", 0.0)
     ser = None
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
@@ -196,9 +285,17 @@ def main():
             data = ""
 
         try:
-            for line in data.splitlines():
+            incoming = data.splitlines()
+            for h, subj, repo in watcher.poll():   # commits from any editor or tool
+                if a.verbose:
+                    print(f"commit {h} in {repo}: {subj}")
+                incoming += ["T:" + oled_text("commit: " + subj), "C:" + h]
+            for line in incoming:
                 line = line.strip()
                 if len(line) < 3 or line[1] != ":":
+                    continue
+                if line[0] == "W":                 # a folder Claude Code works in
+                    watcher.add(line[2:])
                     continue
                 if line[0] in "UX":
                     sticky[line[0]] = line
@@ -210,6 +307,11 @@ def main():
                         continue
                     line, stats_changed = stats.line(), True
                 elif line[0] == "C":
+                    h = line[2:9]
+                    if h in seen_commits:          # already counted (hook + watcher)
+                        continue
+                    seen_commits = (seen_commits + [h])[-50:]
+                    line = "C:" + h
                     stats.bump("commits")
                     stats_changed = True
                 elif line[0] == "E":

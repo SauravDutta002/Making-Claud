@@ -130,6 +130,8 @@ def main():
     inp = d.get("tool_input") or {}
     cwd = d.get("cwd") or None
 
+    if cwd and ev in ("SessionStart", "UserPromptSubmit"):
+        send("W:" + cwd)                            # bridge starts watching this repo's commits
     if ev == "PreToolUse":
         send("T:" + clean(ticker(tool, inp)))
     elif ev == "UserPromptSubmit" and d.get("prompt"):
