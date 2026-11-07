@@ -63,10 +63,19 @@
 #error "Arduino IDE: Tools > USB CDC On Boot > Enabled, then upload again."
 #endif
 
+/* WIRELESS: the laptop bridge can also reach the board over Bluetooth LE
+   ("Claude Buddy", Nordic UART service), so it only needs USB for power.
+   0 = USB cable only. */
+#define USE_BLE 1
+
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include <Preferences.h>
+#if USE_BLE
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#endif
 
 #define SCREEN_WIDTH   128
 #define SCREEN_HEIGHT  64
@@ -245,6 +254,47 @@ uint8_t  tapCount     = 0;
 uint32_t lastTap      = 0;
 bool     touchPressed  = false;   // finger-down edge, consumed by the game
 bool     touchReleased = false;   // finger-up edge, consumed by the game
+
+/* ============================================================
+   BLUETOOTH LE  — a wireless "serial cable" (Nordic UART service)
+   Bytes arrive on the BLE task; a queue hands them to loop().
+   ============================================================ */
+#if USE_BLE
+#define BLE_NAME     "Claude Buddy"
+#define NUS_SERVICE  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_RX       "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+QueueHandle_t bleQ = NULL;
+volatile bool bleConnected = false;
+
+class BleRx : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* ch) override {
+    auto v = ch->getValue();
+    for (size_t i = 0; i < v.length(); i++) { char c = v[i]; xQueueSend(bleQ, &c, 0); }
+  }
+};
+
+class BleConn : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override    { bleConnected = true; }
+  void onDisconnect(BLEServer* s) override { bleConnected = false; BLEDevice::startAdvertising(); }
+};
+
+void bleInit() {
+  bleQ = xQueueCreate(1024, 1);
+  BLEDevice::init(BLE_NAME);
+  BLEServer* srv = BLEDevice::createServer();
+  srv->setCallbacks(new BleConn());
+  BLEService* svc = srv->createService(NUS_SERVICE);
+  BLECharacteristic* rx = svc->createCharacteristic(
+      NUS_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rx->setCallbacks(new BleRx());
+  svc->start();
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+}
+#endif
 
 /* ============================================================
    TINY HELPERS
@@ -2765,27 +2815,33 @@ void handleKey(char c) {
 
 /* Upper-case first char starts a protocol line ("E:think\n");
    anything else is a single-key command, as before. */
-char    lineBuf[72];
-uint8_t lineLen = 0;
-bool    inLine  = false;
+/* one parser per link (0 = USB, 1 = Bluetooth) so they never mix lines */
+char    lineBuf[2][72];
+uint8_t lineLen[2] = { 0, 0 };
+bool    inLine[2]  = { false, false };
+
+void feedChar(uint8_t src, char c) {
+  if (inLine[src]) {
+    if (c == '\n' || c == '\r') {
+      lineBuf[src][lineLen[src]] = 0;
+      if (lineLen[src] > 2) handleLine(lineBuf[src]);
+      inLine[src] = false; lineLen[src] = 0;
+    } else if (lineLen[src] < sizeof(lineBuf[src]) - 1) {
+      lineBuf[src][lineLen[src]++] = c;
+    }
+  } else if (c >= 'A' && c <= 'Z') {
+    inLine[src] = true; lineLen[src] = 0; lineBuf[src][lineLen[src]++] = c;
+  } else {
+    handleKey(c);
+  }
+}
 
 void handleSerial() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (inLine) {
-      if (c == '\n' || c == '\r') {
-        lineBuf[lineLen] = 0;
-        if (lineLen > 2) handleLine(lineBuf);
-        inLine = false; lineLen = 0;
-      } else if (lineLen < sizeof(lineBuf) - 1) {
-        lineBuf[lineLen++] = c;
-      }
-    } else if (c >= 'A' && c <= 'Z') {
-      inLine = true; lineLen = 0; lineBuf[lineLen++] = c;
-    } else {
-      handleKey(c);
-    }
-  }
+  while (Serial.available()) feedChar(0, Serial.read());
+#if USE_BLE
+  char c;
+  while (bleQ && xQueueReceive(bleQ, &c, 0) == pdTRUE) feedChar(1, c);
+#endif
 }
 
 /* live mode follow-ups and timeout */
@@ -2860,6 +2916,9 @@ void setup() {
   setSoundMode(m > SND_ALL ? SND_ALL : m);
   applyBrightness();
   buzzInit();
+#if USE_BLE
+  bleInit();                              // wireless link to the laptop bridge
+#endif
 
   display.clearDisplay();
   display.display();

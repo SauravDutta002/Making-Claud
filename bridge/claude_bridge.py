@@ -12,6 +12,10 @@ board. Run it once and leave it open:
     python claude_bridge.py --port COM5    # or pick the port yourself
     python claude_bridge.py --send E:think # inject a line (testing)
     python claude_bridge.py --list         # show serial ports
+    python claude_bridge.py --ble          # wireless only (board just needs power)
+
+WIRELESS: if the board isn't plugged into this laptop, the bridge finds it over
+Bluetooth LE ("Claude Buddy") and reconnects by itself if the link drops.
     python claude_bridge.py --repo D:\code\myproject   # also watch this repo's commits
 
 Commits are picked up from ANY tool (Antigravity / VS Code source control, a
@@ -228,6 +232,68 @@ class CommitWatcher:
         return found
 
 
+class BleLink:
+    """Bluetooth LE link to the board ("Claude Buddy", Nordic UART service).
+
+    Looks like the serial port to the rest of the bridge: write(), read(),
+    in_waiting, close(). bleak runs on its own asyncio thread.
+    """
+
+    NAME = "Claude Buddy"
+    NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+    in_waiting = 0
+
+    def __init__(self):
+        import asyncio
+        import threading
+        self.asyncio = asyncio
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        self.client = None
+        self.lost = False
+
+    def _run(self, coro, timeout):
+        return self.asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    def connect(self):
+        from bleak import BleakClient, BleakScanner
+
+        async def go():
+            dev = await BleakScanner.find_device_by_name(self.NAME, timeout=6)
+            if dev is None:
+                return None
+            client = BleakClient(dev, disconnected_callback=lambda _: setattr(self, "lost", True))
+            await client.connect()
+            return client
+
+        self.lost = False
+        try:
+            self.client = self._run(go(), 25)
+        except Exception as e:                      # bluetooth off, no adapter, timeout...
+            print(f"bluetooth: {e or type(e).__name__}")
+            self.client = None
+        return self.client is not None
+
+    def write(self, data):
+        if self.lost or self.client is None:
+            raise OSError("bluetooth disconnected")
+        try:
+            for i in range(0, len(data), 180):
+                self._run(self.client.write_gatt_char(self.NUS_RX, data[i:i + 180], response=False), 5)
+        except Exception as e:
+            raise OSError(f"bluetooth write failed: {e}") from e
+
+    def read(self, n):
+        return b""
+
+    def close(self):
+        try:
+            if self.client is not None:
+                self._run(self.client.disconnect(), 5)
+        except Exception:
+            pass
+
+
 def send_one(line):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(line.encode(), (UDP_HOST, UDP_PORT))
@@ -256,6 +322,8 @@ def main():
     ap.add_argument("--type-windows",
                     default="claude,antigravity,powershell,command prompt,terminal,cmd",
                     help="comma-separated window-title words that count as 'typing to Claude'")
+    ap.add_argument("--ble", action="store_true", help="always use Bluetooth, even if USB is plugged in")
+    ap.add_argument("--usb", action="store_true", help="USB cable only, never Bluetooth")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -281,27 +349,40 @@ def main():
     git_lines = []                 # last R:/L: history sent, replayed after a reconnect
     last_event = ("", 0.0)
     ser = None
+    ble = None                     # BleLink, created the first time USB isn't there
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
     typing, last_key, last_typing_send = False, 0.0, 0.0
     print(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}")
 
     while True:
         if ser is None:
-            port = a.port or find_port()
-            if not port:
-                print("no ESP32 found - plug it in (or pass --port). retrying...")
+            # USB if the board is plugged into this laptop, else Bluetooth
+            port = None if a.ble else (a.port or find_port())
+            if port:
+                try:
+                    ser = open_serial(port, a.baud)
+                    print(f"connected on {port} (USB)")
+                except (serial.SerialException, OSError) as e:
+                    print(f"cannot open {port}: {e}")
+                    ser = None
+            elif not a.usb:
+                print("looking for 'Claude Buddy' over Bluetooth...")
+                if ble is None:
+                    ble = BleLink()                # one bluetooth thread, reused
+                if ble.connect():
+                    ser = ble
+                    print("connected over Bluetooth")
+            if ser is None:
+                print("no board found - plug it in or switch it on. retrying...")
                 time.sleep(2)
                 continue
             try:
-                ser = open_serial(port, a.baud)
-                print(f"connected on {port}")
                 time.sleep(0.3)
                 for line in list(sticky.values()) + git_lines:
                     ser.write((line + "\n").encode())
             except (serial.SerialException, OSError) as e:
-                print(f"cannot open {port}: {e}")
+                print(f"link lost while syncing: {e}")
                 ser = None
-                time.sleep(2)
                 continue
 
         try:
