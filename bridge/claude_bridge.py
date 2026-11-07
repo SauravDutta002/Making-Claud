@@ -29,6 +29,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
@@ -183,15 +184,15 @@ class CommitWatcher:
         return True
 
     def snapshot(self):
-        """R:/L: lines: branch, repo name and the last 5 commits of the current repo."""
+        """R:/L: lines: branch, repo name and the last 7 commits of the current repo."""
         root = self.current or next(iter(self.repos), None)
         if not root:
             return []
         branch = git(root, "rev-parse", "--abbrev-ref", "HEAD") or "HEAD"
-        rows = git(root, "log", "--format=%h%x09%s", "-n", "5").splitlines()
+        rows = git(root, "log", "--format=%h%x09%s", "-n", "7").splitlines()
         lines = ["R:%s,%s" % (oled_text(branch, 11).replace(",", " "),
                               oled_text(os.path.basename(root), 19))]
-        for i in range(5):
+        for i in range(7):
             if i < len(rows):
                 h, _, subj = rows[i].partition("\t")
                 lines.append("L:%d,%s,%s" % (i, h[:7], oled_text(subj, 19)))
@@ -240,8 +241,8 @@ class BleLink:
     """
 
     NAME = "Claude Buddy"
-    NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
-    in_waiting = 0
+    NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   # laptop -> board
+    NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   # board -> laptop (music buttons)
 
     def __init__(self):
         import asyncio
@@ -251,6 +252,16 @@ class BleLink:
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.client = None
         self.lost = False
+        self.rx = bytearray()
+        self.rx_lock = threading.Lock()
+
+    @property
+    def in_waiting(self):
+        return len(self.rx)
+
+    def _on_rx(self, _char, data):
+        with self.rx_lock:
+            self.rx += data
 
     def _run(self, coro, timeout):
         return self.asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
@@ -264,6 +275,10 @@ class BleLink:
                 return None
             client = BleakClient(dev, disconnected_callback=lambda _: setattr(self, "lost", True))
             await client.connect()
+            try:
+                await client.start_notify(self.NUS_TX, self._on_rx)   # hear the board's buttons
+            except Exception as e:
+                print(f"bluetooth: board buttons unavailable ({e}) - reflash the board")
             return client
 
         self.lost = False
@@ -284,7 +299,9 @@ class BleLink:
             raise OSError(f"bluetooth write failed: {e}") from e
 
     def read(self, n):
-        return b""
+        with self.rx_lock:
+            data, self.rx = bytes(self.rx), bytearray()
+        return data
 
     def close(self):
         try:
@@ -292,6 +309,195 @@ class BleLink:
                 self._run(self.client.disconnect(), 5)
         except Exception:
             pass
+
+
+class MusicWatcher:
+    """What's playing on this laptop via Windows media controls - Spotify,
+    YouTube / YouTube Music in any browser, Apple Music, VLC, Media Player... -
+    plus the live output level from the audio meter (just the volume needle,
+    nothing is recorded). Apps that don't report to Windows still count:
+    steady sound from the speakers for a few seconds = music."""
+
+    PLAYING, PAUSED = 4, 5         # GlobalSystemMediaTransportControlsSessionPlaybackStatus
+    SOUND_LEVEL = 8                # meter level that counts as "sound playing"
+    SOUND_SECONDS = 4              # ...for this long, when no app reports a song
+    PAUSE_KEEP_S = 120             # a paused song stays on the record player this long
+
+    def __init__(self):
+        import asyncio
+        import threading
+        self.playing, self.title = False, ""
+        self.state = 0                 # 0 nothing, 1 playing, 2 paused (recently played)
+        self.session_state, self.session_title = 0, ""
+        self.last_app, self.last_play_t = None, 0.0
+        self.pos, self.dur = 0, 0      # song position / length in seconds
+        self.mgr = None
+        self.sound_since, self.last_loud = None, 0.0
+        self.meter = None
+        try:
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
+            dev = AudioUtilities.GetSpeakers()
+            imm = getattr(dev, "_dev", dev)
+            self.meter = imm.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None) \
+                            .QueryInterface(IAudioMeterInformation)
+        except Exception as e:
+            print(f"music: no audio meter ({e}) - the equalizer will dance without it")
+        self.asyncio = asyncio
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        self.asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._poll())
+
+    @staticmethod
+    async def _title(s):
+        info = await s.try_get_media_properties_async()
+        return " - ".join(x for x in (info.title, info.artist) if x)
+
+    async def _poll(self):
+        try:
+            from winrt.windows.media.control import \
+                GlobalSystemMediaTransportControlsSessionManager as Manager
+        except ImportError:
+            print("music: pip install winrt-Windows.Media.Control  (to see what's playing)")
+            return
+        while True:
+            try:
+                if self.mgr is None:
+                    self.mgr = await Manager.request_async()
+                sessions = list(self.mgr.get_sessions())
+                state, title = 0, ""
+                # every app's session, not just the "current" one: a paused
+                # Spotify mustn't hide YouTube playing in the browser
+                playing = next((s for s in sessions
+                                if int(s.get_playback_info().playback_status) == self.PLAYING), None)
+                active = None
+                if playing is not None:
+                    state, title, active = 1, await self._title(playing), playing
+                    self.last_app, self.last_play_t = playing.source_app_user_model_id, time.time()
+                else:                          # the song you just paused stays on the player
+                    last = next((s for s in sessions if s.source_app_user_model_id == self.last_app), None)
+                    if (last is not None and time.time() - self.last_play_t < self.PAUSE_KEEP_S
+                            and int(last.get_playback_info().playback_status) == self.PAUSED):
+                        state, title, active = 2, await self._title(last), last
+                self.pos, self.dur = self._timeline(active, state == 1)
+                self.session_state, self.session_title = state, title
+            except Exception:
+                self.mgr = None
+            await self.asyncio.sleep(1)
+
+    @staticmethod
+    def _timeline(s, playing):
+        """(position, length) in whole seconds, or (0, 0) if the player doesn't share it."""
+        import datetime
+        try:
+            if s is None:
+                return 0, 0
+            tl = s.get_timeline_properties()
+            dur = (tl.end_time - tl.start_time).total_seconds()
+            pos = (tl.position - tl.start_time).total_seconds()
+            upd = tl.last_updated_time                     # position was sampled at this time
+            if playing and upd and upd.year > 2000:
+                pos += (datetime.datetime.now(datetime.timezone.utc) - upd).total_seconds()
+            if dur <= 0:
+                return 0, 0
+            return int(max(0, min(pos, dur))), int(dur)
+        except Exception:
+            return 0, 0
+
+    def control(self, cmd):
+        """The board's buttons: 'toggle', 'next' or 'prev' on the song in play."""
+        async def go():
+            if self.mgr is None:
+                return
+            sessions = list(self.mgr.get_sessions())
+            s = (next((x for x in sessions if int(x.get_playback_info().playback_status) == self.PLAYING), None)
+                 or next((x for x in sessions if x.source_app_user_model_id == self.last_app), None)
+                 or self.mgr.get_current_session())
+            if s is None:
+                return
+            if cmd == "toggle":
+                await s.try_toggle_play_pause_async()
+            elif cmd == "next":
+                await s.try_skip_next_async()
+            elif cmd == "prev":
+                await s.try_skip_previous_async()
+        self.asyncio.run_coroutine_threadsafe(go(), self.loop)
+
+    def tick(self):
+        """Call often from the main thread (the audio meter lives there).
+        An app reporting a song wins; otherwise steady sound counts as music."""
+        now = time.time()
+        if self.level() >= self.SOUND_LEVEL:
+            self.last_loud = now
+            if self.sound_since is None:
+                self.sound_since = now
+        elif self.sound_since is not None and now - self.last_loud > 3:   # real silence, not a gap
+            self.sound_since = None
+        if self.session_state:
+            self.state, self.title = self.session_state, self.session_title
+        else:
+            loud = self.sound_since is not None and now - self.sound_since >= self.SOUND_SECONDS
+            self.state, self.title = (1, "music") if loud else (0, "")
+        self.playing = self.state == 1
+
+    def level(self):
+        """0-99, perceptual (square root of the peak amplitude)."""
+        try:
+            return min(99, int((self.meter.GetPeakValue() ** 0.5) * 100)) if self.meter else 0
+        except Exception:
+            return 0
+
+
+class UsageFetcher:
+    """Your 5-hour and weekly Claude usage, fetched the way /usage does it, so
+    the board's usage screen works even from the IDE chat panel (which never
+    runs the status line). Reads Claude Code's login token from
+    ~/.claude/.credentials.json each time (Claude Code keeps it fresh); the
+    token is only ever sent to Anthropic and never printed. Uses an
+    undocumented endpoint, so it may stop working after an update."""
+
+    URL = "https://api.anthropic.com/api/oauth/usage"
+    EVERY_S = 120
+
+    def __init__(self):
+        self.line, self.err = None, None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            try:
+                self.line, self.err = self._fetch(), None
+            except Exception as e:                 # offline, logged out, endpoint changed...
+                if str(e) != self.err:
+                    print(f"usage: couldn't fetch ({e})")
+                    self.err = str(e)
+            time.sleep(self.EVERY_S)
+
+    def _fetch(self):
+        import datetime
+        import urllib.request
+        with open(os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")) as f:
+            token = json.load(f)["claudeAiOauth"]["accessToken"]
+        req = urllib.request.Request(self.URL, headers={
+            "Authorization": "Bearer " + token,
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-buddy-bridge"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.load(r)
+
+        def pct(key):
+            v = (d.get(key) or {}).get("utilization")
+            return -1 if v is None else int(round(v))
+
+        mins = -1
+        resets = (d.get("five_hour") or {}).get("resets_at")
+        if resets:
+            t = datetime.datetime.fromisoformat(resets.replace("Z", "+00:00"))
+            mins = max(0, int((t - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 60))
+        return f"U:{pct('five_hour')},{pct('seven_day')},{mins}"
 
 
 def send_one(line):
@@ -322,6 +528,9 @@ def main():
     ap.add_argument("--type-windows",
                     default="claude,antigravity,powershell,command prompt,terminal,cmd",
                     help="comma-separated window-title words that count as 'typing to Claude'")
+    ap.add_argument("--no-music", action="store_true", help="don't react to music playing on this laptop")
+    ap.add_argument("--no-usage", action="store_true",
+                    help="don't fetch your Claude usage (the usage screen then relies on the status line)")
     ap.add_argument("--ble", action="store_true", help="always use Bluetooth, even if USB is plugged in")
     ap.add_argument("--usb", action="store_true", help="USB cable only, never Bluetooth")
     ap.add_argument("--list", action="store_true")
@@ -350,6 +559,12 @@ def main():
     last_event = ("", 0.0)
     ser = None
     ble = None                     # BleLink, created the first time USB isn't there
+    music = None if a.no_music else MusicWatcher()
+    usage = None if a.no_usage else UsageFetcher()
+    music_state, music_sent = (0, ""), 0.0
+    rx_buf = b""                   # partial line from the board
+    date_sent = 0.0                # last time the board got the date & time
+    level_sent, level_at = -1, 0.0
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
     typing, last_key, last_typing_send = False, 0.0, 0.0
     print(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}")
@@ -378,6 +593,7 @@ def main():
                 continue
             try:
                 time.sleep(0.3)
+                date_sent = 0.0                    # fresh time right after (re)connecting
                 for line in list(sticky.values()) + git_lines:
                     ser.write((line + "\n").encode())
             except (serial.SerialException, OSError) as e:
@@ -439,6 +655,31 @@ def main():
                         ser.write((sticky["S"] + "\n").encode())
                 if line[0] == "C":
                     watcher.changed = True         # resend the history with this commit
+            if time.time() - date_sent > 60:       # the board's clock: local time every minute
+                date_sent = time.time()
+                ser.write(("D:%d\n" % (int(date_sent) + time.localtime().tm_gmtoff)).encode())
+            if usage is not None and usage.line and usage.line != sticky.get("U"):
+                sticky["U"] = usage.line           # your 5-hour / weekly limits -> usage screen
+                ser.write((usage.line + "\n").encode())
+                if a.verbose:
+                    print(">", usage.line)
+            if music is not None:                  # music on this laptop -> music faces
+                music.tick()
+                now = time.time()
+                state = (music.state, music.title)
+                if state != music_state or (state[0] and now - music_sent > 2):
+                    if a.verbose and state != music_state:
+                        print("> music:", ("", "playing ", "paused ")[state[0]] + state[1] if state[0] else "stopped")
+                    music_state, music_sent = state, now
+                    ser.write(("M:%d,%s\n" % (state[0], oled_text(state[1], 40))).encode())
+                    if state[0] and music.dur:     # song position for the progress bar
+                        ser.write(("Q:%d,%d\n" % (music.pos, music.dur)).encode())
+                if state[0] == 1 and now - level_at >= 0.08:
+                    lvl = music.level()
+                    if abs(lvl - level_sent) >= 2 or now - level_at > 0.5:
+                        ser.write(f"A:{lvl}\n".encode())
+                        level_sent, level_at = lvl, now
+                sock.settimeout(0.03 if state[0] == 1 else 0.1)   # faster loop while music plays
             if watcher.changed:                    # board's git graph = your real history
                 watcher.changed = False
                 git_lines = watcher.snapshot()
@@ -457,7 +698,16 @@ def main():
                         ser.write(b"E:key\n")
                 elif typing and now - last_key > 2.0:
                     typing = False     # the board decides how (and whether) to react
-            ser.read(ser.in_waiting or 1)   # drain the board's debug prints
+            # lines from the board: its debug prints, and P:<cmd> from the music buttons
+            rx_buf += ser.read(ser.in_waiting or 1)
+            while b"\n" in rx_buf:
+                raw, rx_buf = rx_buf.split(b"\n", 1)
+                msg = raw.decode(errors="ignore").strip()
+                if msg.startswith("P:") and music is not None:
+                    if a.verbose:
+                        print("< board button:", msg[2:])
+                    music.control(msg[2:])
+            rx_buf = rx_buf[-200:]
         except (serial.SerialException, OSError) as e:
             if isinstance(e, serial.SerialTimeoutException):
                 print("board is not reading the port (write timed out).\n"
