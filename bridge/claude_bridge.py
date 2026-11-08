@@ -1,13 +1,13 @@
-"""
+r"""
 claude_bridge.py - owns the USB serial port to the OLED face and forwards
 events from Claude Code (hooks + status line) to it.
 
     Claude Code hook / statusline --UDP 127.0.0.1:47800--> this bridge --USB serial--> ESP32
 
-Only this process opens the COM port, so hooks stay fast and never reset the
-board. Run it once and leave it open:
+Only this process opens the serial port, so hooks stay fast and never reset the
+board. Installed with install.ps1 (Windows) / install.sh (macOS) it runs as
+`claude-buddy`; from a checkout:
 
-    pip install pyserial
     python claude_bridge.py                # auto-detects the ESP32
     python claude_bridge.py --port COM5    # or pick the port yourself
     python claude_bridge.py --send E:think # inject a line (testing)
@@ -26,6 +26,7 @@ use Claude Code in are added automatically and remembered in repos.json.
 import argparse
 import atexit
 import json
+import math
 import os
 import re
 import shutil
@@ -97,7 +98,34 @@ class KeyWatcher:
         return any(t in title for t in self.titles)
 
 
-STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def data_dir():
+    """Your stats, streaks and settings live here, so updates never touch them:
+    Windows %LOCALAPPDATA%\\ClaudeBuddy, macOS ~/Library/Application Support/ClaudeBuddy."""
+    d = os.environ.get("CLAUDE_BUDDY_HOME")
+    if not d:
+        if sys.platform == "win32":
+            d = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ClaudeBuddy")
+        elif sys.platform == "darwin":
+            d = os.path.expanduser("~/Library/Application Support/ClaudeBuddy")
+        else:
+            d = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                             "claude-buddy")
+    os.makedirs(d, exist_ok=True)
+    for name in ("stats.json", "repos.json", "config.json", "progress.json"):
+        old, new = os.path.join(HERE, name), os.path.join(d, name)   # older versions kept them here
+        if os.path.exists(old) and not os.path.exists(new):
+            try:
+                shutil.copy2(old, new)
+            except OSError:
+                pass
+    return d
+
+
+DATA = data_dir()
+STATS_FILE = os.path.join(DATA, "stats.json")
 
 
 class Stats:
@@ -134,7 +162,7 @@ class Stats:
         return "S:%d,%d,%d,%d,%d,%d,%d" % (d["commits"], d["tasks"], d["tests"], *self.session)
 
 
-REPOS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repos.json")
+REPOS_FILE = os.path.join(DATA, "repos.json")
 
 
 def git(repo, *args):
@@ -241,23 +269,28 @@ class BleLink:
     """Bluetooth LE link to the board ("Claude Buddy", Nordic UART service).
 
     Looks like the serial port to the rest of the bridge: write(), read(),
-    in_waiting, close(). bleak runs on its own asyncio thread.
+    in_waiting, close(). bleak runs on its own asyncio thread. write() never
+    blocks: lines are queued and a sender on the bluetooth thread packs them
+    into MTU-sized packets, so a burst of lines goes out as a few packets.
     """
 
     NAME = "Claude Buddy"
+    NUS = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"      # advertised service: found even without a name
     NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   # laptop -> board
     NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   # board -> laptop (music buttons)
+    MAX_BACKLOG = 8192                                # unsent bytes before we call the link stalled
 
     def __init__(self):
         import asyncio
-        import threading
         self.asyncio = asyncio
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.client = None
-        self.lost = False
-        self.rx = bytearray()
-        self.rx_lock = threading.Lock()
+        self.lost, self.error = False, ""
+        self.rssi, self.chunk, self.buttons = None, 20, False
+        self.rx, self.rx_lock = bytearray(), threading.Lock()
+        self.tx, self.tx_lock = bytearray(), threading.Lock()
+        self.fails = 0
 
     @property
     def in_waiting(self):
@@ -270,37 +303,75 @@ class BleLink:
     def _run(self, coro, timeout):
         return self.asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
 
+    def _dropped(self, client):
+        if client is self.client:                   # not a late callback from an older link
+            self.lost = True
+
+    def _match(self, dev, adv):
+        if (adv.local_name or dev.name) == self.NAME or self.NUS in (adv.service_uuids or []):
+            self.rssi = adv.rssi
+            return True
+        return False
+
     def connect(self):
         from bleak import BleakClient, BleakScanner
 
         async def go():
-            dev = await BleakScanner.find_device_by_name(self.NAME, timeout=6)
+            dev = await BleakScanner.find_device_by_filter(self._match, timeout=8)
             if dev is None:
                 return None
-            client = BleakClient(dev, disconnected_callback=lambda _: setattr(self, "lost", True))
+            client = BleakClient(dev, disconnected_callback=self._dropped, timeout=15)
             await client.connect()
+            self.buttons = False
             try:
                 await client.start_notify(self.NUS_TX, self._on_rx)   # hear the board's buttons
+                self.buttons = True
             except Exception as e:
-                say(f"bluetooth: board buttons unavailable ({e}) - reflash the board")
+                say(f"bluetooth: board buttons unavailable ({e}) - reflash the board", "warn")
+            self.chunk = max(20, min(244, (client.mtu_size or 23) - 3))
             return client
 
-        self.lost = False
+        self.lost, self.error, self.rssi = False, "", None
+        with self.tx_lock:
+            self.tx.clear()
         try:
-            self.client = self._run(go(), 25)
+            self.client = self._run(go(), 30)
         except Exception as e:                      # bluetooth off, no adapter, timeout...
-            say(f"bluetooth: {e or type(e).__name__}")
+            say(f"bluetooth: {e or type(e).__name__}", "warn")
             self.client = None
-        return self.client is not None
+        if self.client is None:
+            self.fails += 1
+            if self.fails == 3:
+                say("bluetooth tips: is Bluetooth on and the board powered? If 'Claude Buddy' "
+                    "is paired in Windows Settings > Bluetooth, remove it there - Windows then "
+                    "keeps it connected and the board stops advertising.", "warn")
+            return False
+        self.fails = 0
+        self.asyncio.run_coroutine_threadsafe(self._sender(self.client), self.loop)
+        return True
+
+    async def _sender(self, client):
+        """Drains the queue onto the link, one MTU-sized packet at a time."""
+        while client is self.client and not self.lost:
+            with self.tx_lock:
+                data = bytes(self.tx[:self.chunk])
+                del self.tx[:len(data)]
+            if not data:
+                await self.asyncio.sleep(0.008)
+                continue
+            try:
+                await client.write_gatt_char(self.NUS_RX, data, response=False)
+            except Exception as e:
+                self.error = str(e) or type(e).__name__
+                self.lost = True
 
     def write(self, data):
         if self.lost or self.client is None:
-            raise OSError("bluetooth disconnected")
-        try:
-            for i in range(0, len(data), 180):
-                self._run(self.client.write_gatt_char(self.NUS_RX, data[i:i + 180], response=False), 5)
-        except Exception as e:
-            raise OSError(f"bluetooth write failed: {e}") from e
+            raise OSError("bluetooth disconnected" + (f" ({self.error})" if self.error else ""))
+        with self.tx_lock:
+            if len(self.tx) > self.MAX_BACKLOG:
+                raise OSError("bluetooth link stalled")
+            self.tx += data
 
     def read(self, n):
         with self.rx_lock:
@@ -308,9 +379,10 @@ class BleLink:
         return data
 
     def close(self):
+        client, self.client = self.client, None     # stops the sender
         try:
-            if self.client is not None:
-                self._run(self.client.disconnect(), 5)
+            if client is not None:
+                self._run(client.disconnect(), 5)
         except Exception:
             pass
 
@@ -335,6 +407,9 @@ class MusicWatcher:
         self.session_state, self.session_title = 0, ""
         self.last_app, self.last_play_t = None, 0.0
         self.pos, self.dur = 0, 0      # song position / length in seconds
+        self.pos_at = 0.0              # when pos was sampled
+        self.track, self.artist = "", ""
+        self._meta = ("", "")
         self.mgr = None
         self.sound_since, self.last_loud = None, 0.0
         self.meter = None
@@ -355,9 +430,9 @@ class MusicWatcher:
         self.asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self._poll())
 
-    @staticmethod
-    async def _title(s):
+    async def _title(self, s):
         info = await s.try_get_media_properties_async()
+        self._meta = (info.title or "", info.artist or "")
         return " - ".join(x for x in (info.title, info.artist) if x)
 
     async def _poll(self):
@@ -387,6 +462,8 @@ class MusicWatcher:
                             and int(last.get_playback_info().playback_status) == self.PAUSED):
                         state, title, active = 2, await self._title(last), last
                 self.pos, self.dur = self._timeline(active, state == 1)
+                self.pos_at = time.time()
+                self.track, self.artist = self._meta if state else ("", "")
                 self.session_state, self.session_title = state, title
             except Exception:
                 self.mgr = None
@@ -447,12 +524,233 @@ class MusicWatcher:
             self.state, self.title = (1, "music") if loud else (0, "")
         self.playing = self.state == 1
 
+    def position(self):
+        """Where the song is right now, in seconds (between the 1 s samples too)."""
+        p = self.pos + (time.time() - self.pos_at if self.state == 1 else 0)
+        return min(p, self.dur) if self.dur else p
+
     def level(self):
         """0-99, perceptual (square root of the peak amplitude)."""
         try:
             return min(99, int((self.meter.GetPeakValue() ** 0.5) * 100)) if self.meter else 0
         except Exception:
             return 0
+
+
+def song_names(track, artist):
+    """Clean up what players report: YouTube gives 'Artist - Song (Official
+    Video)' with the channel as artist; Spotify adds ' - Remastered 2011'."""
+    t = re.sub(r"[\(\[][^\)\]]*[\)\]]", "", track or "")       # (Official Video) [Lyrics]
+    t = t.split("|")[0]
+    a = re.sub(r"(?i)\s*-\s*topic$|vevo$|\s*official$", "", artist or "").strip()
+    if " - " in t:
+        left, right = [x.strip() for x in t.split(" - ", 1)]
+        if re.search(r"(?i)remaster|live|version|edit|mix|mono|stereo|from", right):
+            t = left                                         # 'Song - Remastered 2011'
+        else:
+            a, t = left, right                               # 'Artist - Song'
+    t = re.sub(r"(?i)\s+(ft\.?|feat\.?|featuring)\s.*$", "", t)
+    t = re.sub(r"(?i)\b(official|lyrics?|video|audio|full song|hd|4k)\b", "", t)
+    return re.sub(r"\s+", " ", t).strip(" -"), a
+
+
+class Lyrics:
+    """Time-synced lyrics for the song that's playing, from lrclib.net (free,
+    no key). Only the song name, artist and length are sent."""
+
+    API = "https://lrclib.net/api/"
+
+    def __init__(self):
+        self.key, self.times, self.texts = None, [], []
+        self.status = ""                                     # "", "searching", "found", "none"
+
+    def want(self, track, artist, dur):
+        key = (track, artist)
+        if key == self.key:
+            return
+        self.key, self.times, self.texts = key, [], []
+        self.status = "searching" if track else ""
+        if track:
+            threading.Thread(target=self._fetch, args=(key, dur), daemon=True).start()
+
+    def _fetch(self, key, dur):
+        from urllib.parse import urlencode
+        track, artist = song_names(*key)
+        hits = []
+        first = re.split(r"\s*(?:,|&| and | x | feat\.? | ft\.? )\s*", artist or "", flags=re.I)[0]
+        tries = []                                            # most exact first
+        if artist:
+            tries.append({"track_name": track, "artist_name": artist})
+        if first and first != artist:
+            tries.append({"track_name": track, "artist_name": first})   # 'Noor, Khan and X' -> 'Noor'
+        tries.append({"q": f"{first} {track}".strip()})
+        tries.append({"track_name": track})                   # song name only: matched by length below
+        for params in tries:
+            try:
+                found = http_json(self.API + "search?" + urlencode(params))
+            except Exception as e:
+                say(f"lyrics: couldn't search ({e})", "warn")
+                break
+            found = [h for h in found or [] if h.get("syncedLyrics")]
+            if "artist_name" not in params and "q" not in params and dur:
+                found = [h for h in found if abs((h.get("duration") or 0) - dur) < 4]   # same song?
+            if found:
+                hits = found
+                break
+        hits = [h for h in hits or [] if h.get("syncedLyrics")]
+        if dur:                                              # the right version: closest length
+            hits.sort(key=lambda h: abs((h.get("duration") or 0) - dur))
+            hits = [h for h in hits if abs((h.get("duration") or 0) - dur) < 15] or hits[:1]
+        if self.key != key:                                  # the song changed meanwhile
+            return
+        if not hits:
+            self.status = "none"
+            say(f"lyrics: none found for {track}" + (f" - {artist}" if artist else ""))
+            return
+        times, texts = [], []
+        for ln in hits[0]["syncedLyrics"].splitlines():
+            stamps = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", ln)
+            text = re.sub(r"\[[^\]]*\]", "", ln).strip()
+            for m, sec in stamps:
+                times.append(int(m) * 60 + float(sec))
+                texts.append(text)
+        order = sorted(range(len(times)), key=times.__getitem__)
+        self.times, self.texts = [times[i] for i in order], [texts[i] for i in order]
+        self.status = "found"
+        say(f"♪ lyrics found: {hits[0].get('trackName', track)} - {hits[0].get('artistName', artist)}", "music")
+
+    def at(self, pos):
+        """(index, text, seconds until the next line) at song position pos, or None."""
+        import bisect
+        i = bisect.bisect_right(self.times, pos + 0.25) - 1   # a hair early: time to read
+        if i < 0:
+            return None
+        nxt = self.times[i + 1] if i + 1 < len(self.times) else self.times[i] + 6
+        return i, self.texts[i], max(0.5, min(nxt - self.times[i], 12))
+
+
+# common words the letter-by-letter spelling gets wrong -> how people write them
+HINGLISH = {
+    "nheen": "nahin", "nhin": "nahin", "nhi": "nahi", "too": "tu", "men": "mein", "mai": "main",
+    "hain": "hain", "kyon": "kyun", "kyaa": "kya", "yh": "yeh", "vh": "woh", "vo": "woh",
+    "jb": "jab", "tb": "tab", "kb": "kab", "sb": "sab", "pr": "par", "dil": "dil", "mn": "man",
+    "gliyon": "galiyon", "khoon": "khoon", "pyaar": "pyaar", "jaan": "jaan", "rh": "reh",
+    "khn": "kahan", "khaan": "kahan", "yhaan": "yahan", "vhaan": "wahan", "kuchh": "kuch",
+}
+
+
+def lyric_text(text):
+    """Lyrics in any script -> something the OLED's ASCII font can draw."""
+    if any(ord(c) > 127 for c in text):
+        hindi = any("ऀ" <= c <= "ॿ" for c in text)
+        try:
+            from unidecode import unidecode                  # Hindi, accents... -> Latin letters
+            text = unidecode(text)
+        except ImportError:
+            pass
+        if hindi:                                            # ...spelled the way people text it
+            text = text.replace("N", "n")                    # nasal: maaNgaa -> maangaa
+            text = re.sub(r"([tdTD])\1+", r"\1", text)       # ttuuttte -> tuute
+            text = text.replace("uu", "oo").replace("ii", "ee")
+            text = re.sub(r"aa\b", "a", text)                # thaa -> tha
+            text = re.sub(r"ee\b", "i", text).replace("'", "")   # meree -> meri
+            text = re.sub(r"\b\w+\b", lambda m: HINGLISH.get(m.group(0).lower(), m.group(0)), text)
+    return oled_text(text, 60)
+
+
+def claude_token():
+    """Claude Code's login token: ~/.claude/.credentials.json, or the macOS Keychain."""
+    path = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)["claudeAiOauth"]["accessToken"]
+    if sys.platform == "darwin":
+        r = subprocess.run(["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout)["claudeAiOauth"]["accessToken"]
+    raise RuntimeError("not logged in to Claude Code")
+
+
+class MacMusicWatcher:
+    """What's playing in Spotify or Apple Music on a Mac (AppleScript). Same
+    interface as MusicWatcher; there's no output meter, so level() is 0 and
+    the board's equalizer dances on its own."""
+
+    APPS = ("Spotify", "Music")
+    SCRIPT = """
+if application "%(app)s" is running then
+  tell application "%(app)s"
+    set st to player state as string
+    if st is "playing" or st is "paused" then
+      set d to duration of current track
+      return st & "|" & (name of current track) & "|" & (artist of current track) & "|" & (player position as string) & "|" & (d as string)
+    end if
+  end tell
+end if
+return ""
+"""
+
+    def __init__(self):
+        self.playing, self.title, self.state = False, "", 0
+        self.track, self.artist = "", ""
+        self.pos, self.dur, self.pos_at = 0, 0, 0.0
+        self.app = None
+        self._found = (0, "", "", "", 0.0, 0.0)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _ask(self, app):
+        r = subprocess.run(["osascript", "-e", self.SCRIPT % {"app": app}],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+
+    def _run(self):
+        while True:
+            found = (0, "", "", "", 0.0, 0.0)
+            for app in self.APPS:
+                try:
+                    out = self._ask(app)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                parts = out.split("|")
+                if len(parts) < 5:
+                    continue
+                st, name, artist = parts[0], parts[1], parts[2]
+                num = lambda x: float(x.replace(",", ".") or 0)   # some locales write 12,5
+                pos, dur = num(parts[3]), num(parts[4])
+                if app == "Spotify":
+                    dur /= 1000                                    # Spotify says milliseconds
+                state = 1 if st == "playing" else 2
+                if state == 1 or not found[0]:
+                    found = (state, name, artist, app, pos, dur)
+                if state == 1:
+                    break
+            self._found = found
+            self.pos_at = time.time()
+            time.sleep(1)
+
+    def tick(self):
+        state, name, artist, app, pos, dur = self._found
+        self.state, self.app = state, app or None
+        self.track, self.artist = (name, artist) if state else ("", "")
+        self.title = " - ".join(x for x in (name, artist) if x)
+        self.pos, self.dur = int(pos), int(dur)
+        self.playing = state == 1
+
+    def position(self):
+        state, _, _, _, pos, dur = self._found
+        p = pos + (time.time() - self.pos_at if state == 1 else 0)
+        return min(p, dur) if dur else p
+
+    def level(self):
+        return 0
+
+    def control(self, cmd):
+        if not self.app:
+            return
+        verb = {"toggle": "playpause", "next": "next track", "prev": "previous track"}.get(cmd)
+        if verb:
+            subprocess.Popen(["osascript", "-e", f'tell application "{self.app}" to {verb}'])
 
 
 class UsageFetcher:
@@ -483,8 +781,7 @@ class UsageFetcher:
     def _fetch(self):
         import datetime
         import urllib.request
-        with open(os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")) as f:
-            token = json.load(f)["claudeAiOauth"]["accessToken"]
+        token = claude_token()
         req = urllib.request.Request(self.URL, headers={
             "Authorization": "Bearer " + token,
             "anthropic-beta": "oauth-2025-04-20",
@@ -502,6 +799,460 @@ class UsageFetcher:
             t = datetime.datetime.fromisoformat(resets.replace("Z", "+00:00"))
             mins = max(0, int((t - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 60))
         return f"U:{pct('five_hour')},{pct('seven_day')},{mins}"
+
+
+# ------------------------------------------------------------- life around you
+# Welcome back, meetings, notifications, to-dos, streaks & badges.
+
+CONFIG_FILE = os.path.join(DATA, "config.json")      # --ics links, remembered
+PROGRESS_FILE = os.path.join(DATA, "progress.json")  # streak days + unlocked badges
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except OSError:
+        pass
+
+
+def http_json(url, timeout=15):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "claude-buddy-bridge"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+class AwayWatcher:
+    """'Oh, you're back!' - no keyboard or mouse for AWAY_S, then input again.
+    Reads the system's own idle timer (Windows GetLastInputInfo, macOS
+    IOHIDSystem); nothing is recorded."""
+
+    AWAY_S = 600
+
+    def __init__(self):
+        self.ok = sys.platform == "win32"
+        self.away_since = None
+        self.next_check = 0.0
+        if self.ok:
+            import ctypes
+
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+            self.ct, self.info = ctypes, LASTINPUTINFO()
+            self.info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+
+    def idle(self):
+        if sys.platform == "darwin":
+            try:
+                out = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True,
+                                     text=True, timeout=5).stdout
+                m = re.search(r'"HIDIdleTime" = (\d+)', out)
+                return int(m.group(1)) / 1e9 if m else 0.0
+            except (OSError, subprocess.SubprocessError):
+                return 0.0
+        if not self.ok or not self.ct.windll.user32.GetLastInputInfo(self.ct.byref(self.info)):
+            return 0.0
+        return ((self.ct.windll.kernel32.GetTickCount() - self.info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+    def poll(self):
+        """Minutes you were away - once, the moment you're back. Else None."""
+        now = time.time()
+        if now < self.next_check:
+            return None
+        self.next_check = now + 1
+        idle = self.idle()
+        if idle >= self.AWAY_S:
+            if self.away_since is None:
+                self.away_since = now - idle
+            return None
+        if self.away_since is not None and idle < 5:
+            mins, self.away_since = int((now - self.away_since) // 60), None
+            return max(1, mins)
+        return None
+
+
+class CalendarWatcher:
+    """Your next meetings, from the Windows calendar (accounts added to Windows'
+    Calendar/Outlook app) and any iCal links (--ics: Google Calendar > settings >
+    'Secret address in iCal format', or Outlook > publish calendar)."""
+
+    EVERY_S = 120
+    ALERTS = (10, 5, 1, 0)                               # minutes before: alert the board
+
+    def __init__(self, ics_urls):
+        self.ics = list(ics_urls)
+        self.events = []                                 # [(start epoch, title, key)]
+        self.alerted = {}                                # key -> last alert threshold
+        self.err = {}
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        while True:
+            evs = []
+            if sys.platform == "win32":
+                try:
+                    evs += loop.run_until_complete(self._windows())
+                except Exception as e:
+                    self._warn("Windows calendar", e)
+            for url in self.ics:
+                try:
+                    evs += self._ics(url)
+                except Exception as e:
+                    self._warn("iCal link", e)
+            self.events = sorted(evs)
+            time.sleep(self.EVERY_S)
+
+    def _warn(self, src, e):
+        msg = str(e) or type(e).__name__
+        if self.err.get(src) != msg:
+            self.err[src] = msg
+            say(f"calendar: {src} unavailable ({msg})", "warn")
+
+    async def _windows(self):
+        import datetime
+        from winrt.windows.applicationmodel.appointments import (
+            AppointmentManager, AppointmentStoreAccessType)
+        st = await AppointmentManager.request_store_async(AppointmentStoreAccessType.ALL_CALENDARS_READ_ONLY)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        out = []
+        for a in await st.find_appointments_async(now - datetime.timedelta(minutes=5),
+                                                   datetime.timedelta(hours=12)):
+            if a.all_day:
+                continue
+            start = a.start_time.timestamp()
+            out.append((start, a.subject or "meeting", f"w:{a.local_id}:{int(start)}"))
+        return out
+
+    def _ics(self, url):
+        import datetime
+        import urllib.request
+        try:
+            import icalendar
+            import recurring_ical_events
+        except ImportError:
+            raise RuntimeError("pip install icalendar recurring-ical-events")
+        url = url.replace("webcal://", "https://", 1)
+        req = urllib.request.Request(url, headers={"User-Agent": "claude-buddy-bridge"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            cal = icalendar.Calendar.from_ical(r.read())
+        now = datetime.datetime.now().astimezone()
+        out = []
+        for ev in recurring_ical_events.of(cal).between(now - datetime.timedelta(minutes=5),
+                                                        now + datetime.timedelta(hours=12)):
+            s = ev.get("DTSTART").dt
+            if not isinstance(s, datetime.datetime) or str(ev.get("STATUS", "")).upper() == "CANCELLED":
+                continue                                 # all-day or cancelled
+            if s.tzinfo is None:
+                s = s.astimezone()
+            out.append((s.timestamp(), str(ev.get("SUMMARY", "meeting")),
+                        f"i:{ev.get('UID', '')}:{int(s.timestamp())}"))
+        return out
+
+    def due(self):
+        """[(minutes, title)] for meetings crossing 10 / 5 / 1 / 0 minutes away."""
+        now, out = time.time(), []
+        for start, title, key in self.events:
+            left = start - now
+            if left < -60 or left > 10 * 60 + 30:
+                continue
+            mins = max(0, math.ceil(left / 60))
+            stage = min(t for t in self.ALERTS if mins <= t) if mins <= self.ALERTS[0] else None
+            if stage is not None and stage < self.alerted.get(key, 99):
+                self.alerted[key] = stage
+                out.append((mins, title))
+        return out
+
+    def next(self):
+        now = time.time()
+        return next(((s, t) for s, t, _ in self.events if s > now - 60), None)
+
+
+class NotifyWatcher:
+    """New GitHub notifications and your PRs' reviews (gh CLI), plus messages
+    from chat apps (Slack, Teams, Discord...) via Windows' notification
+    listener. Queued for the board's banner, one at a time."""
+
+    GH_EVERY_S = 90
+    REASONS = {"review_requested": "review requested", "mention": "mentioned you",
+               "team_mention": "team mentioned", "assign": "assigned to you",
+               "comment": "new comment", "ci_activity": "CI finished", "author": "update",
+               "state_change": "state changed", "approval_requested": "approval requested",
+               "security_alert": "security alert", "subscribed": "update", "manual": "update"}
+    TYPES = {"PullRequest": "PR", "Issue": "issue", "Release": "release",
+             "CheckSuite": "CI", "Discussion": "discussion"}
+    PR_QUERY = ("query={viewer{pullRequests(states:OPEN,first:30,orderBy:{field:UPDATED_AT,direction:DESC})"
+                "{nodes{number title reviewDecision repository{name}}}}}")
+
+    def __init__(self, apps, github=True, toasts=True):
+        self.queue = deque(maxlen=12)
+        self.apps = [x.strip().lower() for x in apps.split(",") if x.strip()]
+        self.err = {}
+        if github:
+            threading.Thread(target=self._github, daemon=True).start()
+        if toasts and sys.platform == "win32" and self.apps:
+            threading.Thread(target=self._toasts, daemon=True).start()
+
+    def _push(self, icon, text):
+        self.queue.append((icon, text))
+        say("◆ " + text, "notify")
+
+    def _warn(self, src, e):
+        msg = str(e) or type(e).__name__
+        if self.err.get(src) != msg:
+            self.err[src] = msg
+            say(f"notify: {src} unavailable ({msg})", "warn")
+
+    @staticmethod
+    def _gh(*args):
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, encoding="utf-8", timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode:
+            raise RuntimeError(((r.stderr or "").strip().splitlines() or ["gh failed"])[-1])
+        return json.loads(r.stdout or "null")
+
+    def _github(self):
+        seen, reviews, first = set(), {}, True
+        while True:
+            try:
+                for n in self._gh("api", "notifications") or []:
+                    nid = n["id"] + n.get("updated_at", "")
+                    if nid in seen:
+                        continue
+                    seen.add(nid)
+                    if first:                               # what's already there isn't news
+                        continue
+                    subj = n.get("subject") or {}
+                    url = subj.get("url") or ""
+                    num = " #" + url.rsplit("/", 1)[-1] if ("/pulls/" in url or "/issues/" in url) else ""
+                    what = (self.TYPES.get(subj.get("type"), "") + num).strip()
+                    reason = self.REASONS.get(n.get("reason"), n.get("reason", ""))
+                    self._push(1, f"{n['repository']['name']}: {what} {reason} - {subj.get('title', '')}")
+                data = self._gh("api", "graphql", "-f", self.PR_QUERY)
+                for pr in data["data"]["viewer"]["pullRequests"]["nodes"]:
+                    key, dec = f"{pr['repository']['name']}#{pr['number']}", pr.get("reviewDecision")
+                    if key in reviews and dec != reviews[key]:
+                        if dec == "APPROVED":
+                            self._push(3, f"PR #{pr['number']} approved! {pr['title']}")
+                        elif dec == "CHANGES_REQUESTED":
+                            self._push(1, f"PR #{pr['number']}: changes requested - {pr['title']}")
+                    reviews[key] = dec
+                first = False
+                if len(seen) > 3000:
+                    seen = set(list(seen)[-1000:])
+                self.err.pop("GitHub", None)
+            except FileNotFoundError:
+                say("notify: GitHub CLI (gh) not installed - GitHub alerts off", "warn")
+                return
+            except Exception as e:
+                self._warn("GitHub", e)
+            time.sleep(self.GH_EVERY_S)
+
+    def _toasts(self):
+        import asyncio
+        try:
+            from winrt.windows.ui.notifications import KnownNotificationBindings, NotificationKinds
+            from winrt.windows.ui.notifications.management import UserNotificationListener
+        except ImportError:
+            say("notify: pip install winrt-Windows.UI.Notifications.Management "
+                "winrt-Windows.UI.Notifications  (for Slack / Teams messages)", "warn")
+            return
+
+        async def go():
+            lst = UserNotificationListener.current
+            if int(await lst.request_access_async()) != 1:
+                say("notify: allow notification access in Windows Settings > Privacy > Notifications", "warn")
+                return
+            seen, first = set(), True
+            while True:
+                try:
+                    for n in await lst.get_notifications_async(NotificationKinds.TOAST):
+                        if n.id in seen:
+                            continue
+                        seen.add(n.id)
+                        if first:
+                            continue
+                        try:
+                            app = n.app_info.display_info.display_name
+                        except Exception:
+                            continue
+                        if not any(x in app.lower() for x in self.apps):
+                            continue
+                        texts = []
+                        b = n.notification.visual.get_binding(KnownNotificationBindings.toast_generic)
+                        if b is not None:
+                            texts = [t.text for t in b.get_text_elements() if t.text]
+                        self._push(2, f"{app}: " + " - ".join(texts[:2]))
+                    first = False
+                except Exception as e:
+                    self._warn("Windows notifications", e)
+                await asyncio.sleep(3)
+
+        asyncio.new_event_loop().run_until_complete(go())
+
+
+class Todos:
+    """Claude's to-do list (from the hook) -> Y:<done>,<total>,<current item>."""
+
+    def __init__(self):
+        self.items, self.session, self.next_id = [], None, 1
+
+    def apply(self, msg):
+        """Returns how many items just got ticked off, or None if nothing changed."""
+        before, done_before = self.line(), self.done()
+        if msg.get("s") and msg["s"] != self.session:   # a new Claude session: a new list
+            self.items, self.session, self.next_id = [], msg["s"], 1
+        op = msg.get("op")
+        if op == "write":
+            self.items = [{"id": str(i + 1), "text": t, "status": s}
+                          for i, (s, t) in enumerate(msg.get("todos") or [])]
+        elif op == "create":
+            self.items.append({"id": str(self.next_id), "text": msg.get("text", ""), "status": "pending"})
+            self.next_id += 1
+        elif op == "update":
+            it = next((x for x in self.items if x["id"] == msg.get("id")), None)
+            if it is not None:
+                if msg.get("status") == "deleted":
+                    self.items.remove(it)
+                elif msg.get("status"):
+                    it["status"] = msg["status"]
+                if msg.get("text"):
+                    it["text"] = msg["text"]
+        if self.line() == before:
+            return None
+        return max(0, self.done() - done_before)
+
+    def done(self):
+        return sum(x["status"] == "completed" for x in self.items)
+
+    def current(self):
+        it = (next((x for x in self.items if x["status"] == "in_progress"), None)
+              or next((x for x in self.items if x["status"] == "pending"), None))
+        return it["text"] if it else ""
+
+    def line(self):
+        return "Y:%d,%d,%s" % (self.done(), len(self.items), oled_text(self.current(), 30))
+
+
+class Progress:
+    """Streaks and achievements: which days you shipped something and which
+    badges you've unlocked, kept in progress.json. record() returns V: lines."""
+
+    # id, title, icon (0 trophy, 1 flame, 2 star)
+    BADGES = [
+        ("first_commit", "First commit!", 0),
+        ("commits_10", "10 commits in a day", 0),
+        ("commits_100", "100 commits!", 0),
+        ("tasks_5", "5 tasks in a day", 2),
+        ("tasks_50", "50 tasks done", 0),
+        ("tests_10", "Bug hunter: 10 passes", 2),
+        ("todos_25", "Checklist hero", 2),
+        ("lines_1000", "1000 lines session", 2),
+        ("night_owl", "Night owl", 2),
+        ("early_bird", "Early bird", 2),
+        ("weekend", "Weekend warrior", 0),
+        ("streak_3", "3 day streak", 1),
+        ("streak_7", "7 day streak", 1),
+        ("streak_30", "30 day streak!", 1),
+    ]
+
+    def __init__(self):
+        d = load_json(PROGRESS_FILE, {})
+        self.days = d.get("days", {})
+        self.unlocked = d.get("unlocked", {})
+        self.totals = {"commits": 0, "tasks": 0, "tests": 0, "todos": 0, **d.get("totals", {})}
+        self.streak_shown = d.get("streak_shown", "")
+
+    def save(self):
+        save_json(PROGRESS_FILE, {"days": self.days, "unlocked": self.unlocked,
+                                  "totals": self.totals, "streak_shown": self.streak_shown})
+
+    def _active(self, day):
+        x = self.days.get(day) or {}
+        return bool(x.get("commits") or x.get("tasks"))
+
+    def streak(self):
+        import datetime
+        d = datetime.date.today()
+        if not self._active(d.isoformat()):             # today hasn't started: still alive
+            d -= datetime.timedelta(days=1)
+        n = 0
+        while self._active(d.isoformat()):
+            n += 1
+            d -= datetime.timedelta(days=1)
+        return n
+
+    def _unlock(self, checks):
+        out, day = [], time.strftime("%Y-%m-%d")
+        for bid, title, icon in self.BADGES:
+            if checks.get(bid) and bid not in self.unlocked:
+                self.unlocked[bid] = day
+                out.append(f"V:{icon},{title}")
+        return out
+
+    def record(self, key, n=1):
+        if n <= 0:
+            return []
+        day = time.strftime("%Y-%m-%d")
+        rec = self.days.setdefault(day, {"commits": 0, "tasks": 0, "tests": 0, "todos": 0})
+        rec[key] = rec.get(key, 0) + n
+        self.totals[key] = self.totals.get(key, 0) + n
+        lt, s = time.localtime(), self.streak()
+        out = self._unlock({
+            "first_commit": self.totals["commits"] >= 1,
+            "commits_10": rec["commits"] >= 10,
+            "commits_100": self.totals["commits"] >= 100,
+            "tasks_5": rec["tasks"] >= 5,
+            "tasks_50": self.totals["tasks"] >= 50,
+            "tests_10": rec["tests"] >= 10,
+            "todos_25": self.totals["todos"] >= 25,
+            "night_owl": key == "commits" and lt.tm_hour < 4,
+            "early_bird": key == "commits" and 5 <= lt.tm_hour < 7,
+            "weekend": key == "commits" and lt.tm_wday >= 5,
+            "streak_3": s >= 3, "streak_7": s >= 7, "streak_30": s >= 30,
+        })
+        if s >= 2 and self.streak_shown != day and self._active(day):
+            self.streak_shown = day                     # first work of the day: keep it going!
+            if not any(v.startswith("V:1,") for v in out):   # (a streak badge already says it)
+                out.insert(0, f"V:1,{s} day streak!")
+        if len(self.days) > 400:                        # keep about a year
+            for k in sorted(self.days)[:-400]:
+                del self.days[k]
+        self.save()
+        return out
+
+    def seed(self, day_stats):
+        """Count today's work from before the streak tracker ran (stats.json);
+        badges that earns unlock quietly."""
+        day = time.strftime("%Y-%m-%d")
+        if day_stats.get("date") != day:
+            return
+        rec = self.days.setdefault(day, {"commits": 0, "tasks": 0, "tests": 0, "todos": 0})
+        for k in ("commits", "tasks", "tests"):
+            extra = day_stats.get(k, 0) - rec.get(k, 0)
+            if extra > 0:
+                rec[k] = rec.get(k, 0) + extra
+                self.totals[k] = self.totals.get(k, 0) + extra
+        self._unlock({"first_commit": self.totals["commits"] >= 1, "commits_10": rec["commits"] >= 10,
+                      "tasks_5": rec["tasks"] >= 5, "tests_10": rec["tests"] >= 10,
+                      "tasks_50": self.totals["tasks"] >= 50, "commits_100": self.totals["commits"] >= 100})
+        self.save()
+
+    def session_lines(self, added):
+        out = self._unlock({"lines_1000": added >= 1000})
+        if out:
+            self.save()
+        return out
 
 
 # ------------------------------------------------------------------ dashboard
@@ -585,12 +1336,13 @@ def bar(pct, w):
 class Dashboard:
     SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     KIND = {"info": GREY, "ok": GREEN, "warn": YELLOW, "err": RED,
-            "tx": FAINT, "commit": GREEN, "music": PEACH}
+            "tx": FAINT, "commit": GREEN, "music": PEACH, "notify": CYAN, "ach": YELLOW}
 
     def __init__(self, live):
         self.live = bool(live and sys.stdout.isatty() and self._vt())
         self.events = deque(maxlen=80)
         self.link, self.port = "search", ""
+        self.rssi = None
         self.started = time.time()
         self.tx = 0
         self.ev, self.ev_at = "idle", time.time()
@@ -598,6 +1350,8 @@ class Dashboard:
         self.typing = False
         self.levels = deque([0] * 20, maxlen=20)
         self.stats, self.music = None, None
+        self.lyric = ""
+        self.calendar = self.todos = self.progress = None
         self.sticky, self.git_lines = {}, []
         self.next_draw = 0.0
         if self.live:
@@ -687,7 +1441,10 @@ class Dashboard:
         if self.link == "usb":
             link = paint(GREEN, "● USB ") + paint(GREY, self.port)
         elif self.link == "ble":
-            link = paint(CYAN, "● Bluetooth")
+            r = self.rssi
+            n = 0 if r is None else 4 if r > -60 else 3 if r > -70 else 2 if r > -80 else 1
+            link = (paint(CYAN, "● Bluetooth ") + paint(CYAN, "▂▄▆█"[:n])
+                    + paint(FAINT, "▂▄▆█"[n:] if n else ""))
         else:
             spin = self.SPIN[int(now * 10) % len(self.SPIN)]
             link = paint(YELLOW, spin + (" scanning bluetooth" if self.link == "scan" else " looking for board"))
@@ -715,10 +1472,34 @@ class Dashboard:
                 return paint("1;" + c, n)
             L.append(lab("today") + f"{num(d['commits'], GREEN)} commits   "
                      f"{num(d['tasks'], CORAL)} tasks   {num(d['tests'], CYAN)} tests passed")
+            if self.progress is not None:
+                st, nb = self.progress.streak(), len(self.progress.unlocked)
+                L.append(lab("streak") + (paint("1;" + CORAL, f"{st} day{'s' if st != 1 else ''}") if st
+                                          else paint(FAINT, "ship something today"))
+                         + paint(GREY, f"   {nb}/{len(Progress.BADGES)} badges"))
             if any(s):
                 L.append(lab("session") + paint("1", f"${s[0] / 100:.2f}") + "   "
                          + paint(GREEN, f"+{s[1]}") + " " + paint(RED, f"-{s[2]}")
                          + paint(GREY, f" lines   {s[3]} min"))
+
+        # Claude's to-do list
+        t = self.todos
+        if t is not None and t.items:
+            n, d = len(t.items), t.done()
+            dots = "".join(paint(GREEN, "●") if x["status"] == "completed" else
+                           paint(CORAL, "◉") if x["status"] == "in_progress" else paint(FAINT, "○")
+                           for x in t.items[:24])
+            L.append(lab("todo") + dots + paint("1", f"  {d}/{n}"))
+            if t.current():
+                L.append(" " * 11 + paint(GREY, clip(t.current(), W - 12)))
+
+        # next meeting
+        if self.calendar is not None:
+            nx = self.calendar.next()
+            if nx:
+                m = max(0, int((nx[0] - now) // 60))
+                when = "now" if m == 0 else f"in {m} min" if m < 60 else time.strftime("at %H:%M", time.localtime(nx[0]))
+                L.append(lab("next") + paint("1", clip(nx[1], W - 30)) + paint(YELLOW if m <= 10 else GREY, "  " + when))
 
         # usage + context meters
         bw = max(10, min(26, W - 38))
@@ -741,6 +1522,8 @@ class Dashboard:
             if m.state:
                 icon = paint(PEACH, "▶ ") if m.state == 1 else paint(GREY, "❚❚ ")
                 L.append(lab("music") + icon + paint("1", clip(m.title, W - 15)))
+                if self.lyric and m.state == 1:
+                    L.append(" " * 11 + paint("3;" + PEACH, "♪ " + clip(self.lyric, W - 14)))
                 spark = "".join("▁▂▃▄▅▆▇█"[min(7, v * 8 // 100)] for v in self.levels)
                 line = " " * 11 + paint(PEACH if m.state == 1 else FAINT, spark)
                 if m.dur:
@@ -807,11 +1590,19 @@ def main():
                     default="claude,antigravity,powershell,command prompt,terminal,cmd",
                     help="comma-separated window-title words that count as 'typing to Claude'")
     ap.add_argument("--no-music", action="store_true", help="don't react to music playing on this laptop")
+    ap.add_argument("--no-lyrics", action="store_true", help="don't show song lyrics on the board")
     ap.add_argument("--no-usage", action="store_true",
                     help="don't fetch your Claude usage (the usage screen then relies on the status line)")
     ap.add_argument("--ble", action="store_true", help="always use Bluetooth, even if USB is plugged in")
     ap.add_argument("--usb", action="store_true", help="USB cable only, never Bluetooth")
     ap.add_argument("--plain", action="store_true", help="plain log lines instead of the live dashboard")
+    ap.add_argument("--ics", action="append", default=[], metavar="URL",
+                    help="an iCal calendar link for meeting alerts (repeatable; remembered)")
+    ap.add_argument("--no-calendar", action="store_true", help="no meeting alerts")
+    ap.add_argument("--no-notify", action="store_true", help="no GitHub / chat notifications")
+    ap.add_argument("--notify-apps", default="slack,teams,discord,whatsapp,telegram,signal,zoom,outlook",
+                    help="comma-separated app names whose Windows notifications go to the board")
+    ap.add_argument("--no-away", action="store_true", help="don't say 'oh, you're back!'")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -827,7 +1618,8 @@ def main():
     try:
         sock.bind((UDP_HOST, UDP_PORT))
     except OSError:
-        sys.exit(f"UDP port {UDP_PORT} is busy - is the bridge already running?")
+        sys.exit("Claude Buddy is already running (it starts at login). "
+                 "Close that one first to see the dashboard here.")
     sock.settimeout(0.1)
 
     ui = UI = Dashboard(live=not a.plain)
@@ -839,24 +1631,44 @@ def main():
     last_event = ("", 0.0)
     ser = None
     ble = None                     # BleLink, created the first time USB isn't there
-    music = None if a.no_music else MusicWatcher()
+    music = None if a.no_music else (MusicWatcher() if sys.platform == "win32" else
+                                     MacMusicWatcher() if sys.platform == "darwin" else None)
     usage = None if a.no_usage else UsageFetcher()
     music_state, music_sent = (0, ""), 0.0
+    lyrics = None if (a.no_music or a.no_lyrics) else Lyrics()
+    lyric_sent = None              # last lyric line sent (index), None = cleared
     rx_buf = b""                   # partial line from the board
     date_sent = 0.0                # last time the board got the date & time
     level_sent, level_at = -1, 0.0
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
     typing, last_key, last_typing_send = False, 0.0, 0.0
     announced = False              # "no board found" said once per outage, not every retry
+    cfg = load_json(CONFIG_FILE, {})
+    for u in a.ics:
+        if u not in cfg.setdefault("ics", []):
+            cfg["ics"].append(u)
+    save_json(CONFIG_FILE, cfg)
+    calendar = None if a.no_calendar else CalendarWatcher(cfg.get("ics", []))
+    notifier = None if a.no_notify else NotifyWatcher(a.notify_apps)
+    away = None if a.no_away else AwayWatcher()
+    todos, progress = Todos(), Progress()
+    progress.seed(stats.day)       # today's commits/tasks from before streaks existed
+    notify_at = 0.0                # next time the board's banner is free
+    badges, fresh = [], []         # V: lines waiting for the board / just earned
     ui.stats, ui.sticky, ui.music = stats, sticky, music
+    ui.calendar, ui.todos, ui.progress = calendar, todos, progress
     say(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}", "ok")
 
     def out(line):
+        if ser is None:                    # board away: state is kept and replayed on reconnect
+            return
         ser.write((line + "\n").encode())
         ui.tx += 1
 
+    next_try = 0.0                 # next attempt to find the board
+    beat_at = 0.0                  # last heartbeat to the board
     while True:
-        if ser is None:
+        if ser is None and time.time() >= next_try:
             ui.link = "search"
             # USB if the board is plugged into this laptop, else Bluetooth
             port = None if a.ble else (a.port or find_port())
@@ -877,31 +1689,35 @@ def main():
                     ble = BleLink()                # one bluetooth thread, reused
                 if ble.connect():
                     ser = ble
-                    ui.link = "ble"
-                    say("connected over Bluetooth", "ok")
+                    ui.link, ui.rssi = "ble", ble.rssi
+                    sig = f", signal {ble.rssi} dBm" if ble.rssi is not None else ""
+                    say(f"connected over Bluetooth{sig}, {ble.chunk}-byte packets"
+                        + ("" if ble.buttons else ", buttons off"), "ok")
             if ser is None:
+                # no board: keep going offline - Claude's events, commits, to-dos and
+                # streaks still count, and the board catches up when it's back
                 ui.link = "search"
                 if not announced:
-                    say("no board found - plug it in or switch it on. retrying...", "warn")
+                    say("no board found - working offline (stats, to-dos and streaks still count). "
+                        "retrying...", "warn")
                     announced = True
-                until = time.time() + 2
-                while time.time() < until:         # keep the dashboard alive while we wait
-                    ui.draw()
-                    time.sleep(0.1)
-                continue
-            announced = False
-            try:
-                time.sleep(0.3)
-                date_sent = 0.0                    # fresh time right after (re)connecting
-                for line in list(sticky.values()) + git_lines:
-                    out(line)
-            except (serial.SerialException, OSError) as e:
-                say(f"link lost while syncing: {e}", "err")
-                ser = None
-                continue
+                next_try = time.time() + 3
+            else:
+                announced = False
+                try:
+                    time.sleep(0.3)
+                    date_sent = beat_at = 0.0          # fresh time + heartbeat right away
+                    lyric_sent = -1                    # resend the current lyric line
+                    out("H:1")                         # board plays its "Build something great" intro
+                    for line in list(sticky.values()) + git_lines:
+                        out(line)
+                except (serial.SerialException, OSError) as e:
+                    say(f"link lost while syncing: {e}", "err")
+                    ser = None
+                    next_try = time.time() + 3
 
         try:
-            data = sock.recvfrom(512)[0].decode(errors="ignore")
+            data = sock.recvfrom(65535)[0].decode(errors="ignore")
         except socket.timeout:
             data = ""
 
@@ -917,6 +1733,18 @@ def main():
                 if line[0] == "W":                 # a folder Claude Code works in
                     watcher.add(line[2:])
                     continue
+                if line[0] == "J":                 # Claude's to-do list changed (hook)
+                    try:
+                        ticked = todos.apply(json.loads(line[2:]))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    if ticked is None:
+                        continue
+                    if ticked:
+                        fresh += progress.record("todos", ticked)
+                        if todos.done() == len(todos.items):
+                            say(f"✓ all {len(todos.items)} to-dos done!", "ok")
+                    line = sticky["Y"] = todos.line()
                 if line[0] in "UX":
                     sticky[line[0]] = line
                 if line[0] == "T":
@@ -928,6 +1756,7 @@ def main():
                     except ValueError:
                         continue
                     line, stats_changed = stats.line(), True
+                    fresh += progress.session_lines(stats.session[1])
                 elif line[0] == "C":
                     h = line[2:9]
                     if h in seen_commits:          # already counted (hook + watcher)
@@ -935,6 +1764,7 @@ def main():
                     seen_commits = (seen_commits + [h])[-50:]
                     line = "C:" + h
                     stats.bump("commits")
+                    fresh += progress.record("commits")
                     stats_changed = True
                 elif line[0] == "E":
                     ev = line[2:]
@@ -946,6 +1776,7 @@ def main():
                     ui.event(ev)
                     if ev in ("done", "bug"):
                         stats.bump("tasks" if ev == "done" else "tests")
+                        fresh += progress.record("tasks" if ev == "done" else "tests")
                         stats_changed = True
                 if a.verbose:
                     say("> " + line, "tx")
@@ -956,6 +1787,30 @@ def main():
                         out(sticky["S"])
                 if line[0] == "C":
                     watcher.changed = True         # resend the history with this commit
+            if ser is not None and time.time() - beat_at > 5:
+                beat_at = time.time()              # "still here": the board knows the bridge is alive
+                out("I:1")
+            for b in fresh:                        # streaks & achievements: say it now...
+                say("★ " + b.split(",", 1)[1], "ach")
+            badges, fresh = badges + fresh, []
+            if ser is not None:                    # ...show the trophy when the board is here
+                for b in badges[-4:]:
+                    out(oled_text(b, 40))
+                badges = []
+            if away is not None and ser is not None:
+                mins = away.poll()
+                if mins is not None:               # you came back to the laptop
+                    say(f"welcome back! (away {mins} min)", "ok")
+                    out(f"B:{mins}")
+            if calendar is not None and ser is not None:
+                for mins, title in calendar.due():  # meeting coming up -> alarm clock panic
+                    say(f"meeting: {title} " + ("starting now" if mins <= 0 else f"in {mins} min"), "warn")
+                    out("N:%d,%s" % (mins, oled_text(title, 33)))
+            if ser is not None and notifier is not None and notifier.queue and time.time() >= notify_at:
+                icon, text = notifier.queue.popleft()
+                text = oled_text(text, 64)
+                out(f"O:{icon},{text}")            # banner across the bottom of the screen
+                notify_at = time.time() + max(6.0, len(text) * 0.14 + 4)
             if time.time() - date_sent > 60:       # the board's clock: local time every minute
                 date_sent = time.time()
                 out("D:%d" % (int(date_sent) + time.localtime().tm_gmtoff))
@@ -981,6 +1836,20 @@ def main():
                     if abs(lvl - level_sent) >= 2 or now - level_at > 0.5:
                         out(f"A:{lvl}")
                         level_sent, level_at = lvl, now
+                if lyrics is not None:             # karaoke: the line under the playhead
+                    if music.state:
+                        lyrics.want(music.track, music.artist, music.dur)
+                    cur = lyrics.at(music.position()) if music.state == 1 and lyrics.texts and music.dur else None
+                    key = cur[0] if cur else None
+                    if key != lyric_sent:
+                        lyric_sent = key
+                        if cur:
+                            text = lyric_text(cur[1])
+                            out(f"Z:{int(cur[2] * 1000)},{text}")
+                            ui.lyric = text
+                        else:
+                            out("Z:0,")
+                            ui.lyric = ""
                 sock.settimeout(0.03 if state[0] == 1 else 0.1)   # faster loop while music plays
             if watcher.changed:                    # board's git graph = your real history
                 watcher.changed = False
@@ -1003,7 +1872,8 @@ def main():
                     typing = False     # the board decides how (and whether) to react
                 ui.typing = typing
             # lines from the board: its debug prints, and P:<cmd> from the music buttons
-            rx_buf += ser.read(ser.in_waiting or 1)
+            if ser is not None:
+                rx_buf += ser.read(ser.in_waiting or 1)
             while b"\n" in rx_buf:
                 raw, rx_buf = rx_buf.split(b"\n", 1)
                 msg = raw.decode(errors="ignore").strip()
@@ -1026,7 +1896,8 @@ def main():
             ser = None
 
 
-if __name__ == "__main__":
+def run():
+    """The claude-buddy command."""
     try:
         main()
     except KeyboardInterrupt:
@@ -1034,3 +1905,7 @@ if __name__ == "__main__":
     finally:
         if UI is not None:
             UI.close()
+
+
+if __name__ == "__main__":
+    run()

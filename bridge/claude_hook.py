@@ -126,6 +126,19 @@ def ticker(tool, inp):
     return tool.split("__")[-1].lower()             # mcp__server__tool -> tool
 
 
+def todo_msg(tool, inp, session):
+    """Claude's to-do list changes, for the board's progress bar (J: line)."""
+    def text(x):
+        return str(x.get("activeForm") or x.get("content") or x.get("subject") or "")[:60]
+    if tool == "TodoWrite":                         # the whole list, every time
+        todos = [[t.get("status", "pending"), text(t)] for t in (inp.get("todos") or [])[:40]]
+        return {"op": "write", "s": session, "todos": todos}
+    if tool == "TaskCreate":                        # one new item
+        return {"op": "create", "s": session, "text": text(inp)}
+    return {"op": "update", "s": session, "id": str(inp.get("taskId", "")),
+            "status": inp.get("status"), "text": text(inp)}
+
+
 def main():
     try:
         d = json.load(sys.stdin)
@@ -135,6 +148,9 @@ def main():
     tool = d.get("tool_name", "") or ""
     inp = d.get("tool_input") or {}
     cwd = d.get("cwd") or None
+
+    if ev == "PreToolUse" and tool in ("TodoWrite", "TaskCreate", "TaskUpdate"):
+        send("J:" + json.dumps(todo_msg(tool, inp, d.get("session_id", "")), separators=(",", ":")))
 
     if cwd and ev in ("SessionStart", "UserPromptSubmit"):
         send("W:" + cwd)                            # bridge starts watching this repo's commits

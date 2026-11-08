@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# your own data (now kept in your user data folder anyway)
+bridge/stats.json
+bridge/repos.json
+bridge/config.json
+bridge/progress.json

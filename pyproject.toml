@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-buddy"
+version = "1.0.0"
+description = "Bridge between Claude Code and the Claude Buddy desk screen (ESP32-C3 + OLED)"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "pyserial>=3.5",                 # USB link to the board
+    "bleak>=0.22",                   # Bluetooth link to the board
+    "esptool>=4.7,<6",               # claude-buddy-flash
+    "unidecode",                     # lyrics in any script -> the OLED's ASCII font
+    "icalendar",                     # meeting alerts from iCal links (--ics)
+    "recurring-ical-events",
+    # Windows only: now playing, audio meter, notifications, calendar
+    "comtypes; sys_platform == 'win32'",
+    "pycaw; sys_platform == 'win32'",
+    "winrt-runtime; sys_platform == 'win32'",
+    "winrt-Windows.Foundation; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections; sys_platform == 'win32'",
+    "winrt-Windows.Media.Control; sys_platform == 'win32'",
+    "winrt-Windows.UI.Notifications; sys_platform == 'win32'",
+    "winrt-Windows.UI.Notifications.Management; sys_platform == 'win32'",
+    "winrt-Windows.ApplicationModel; sys_platform == 'win32'",
+    "winrt-Windows.ApplicationModel.Appointments; sys_platform == 'win32'",
+]
+
+[project.scripts]
+claude-buddy = "claude_buddy.claude_bridge:run"
+claude-buddy-setup = "claude_buddy.setup_claude:main"
+claude-buddy-flash = "claude_buddy.flash:main"
+
+[tool.setuptools]
+package-dir = { "claude_buddy" = "bridge" }
+packages = ["claude_buddy"]
+
+[tool.setuptools.package-data]
+claude_buddy = ["firmware/*.bin"]
