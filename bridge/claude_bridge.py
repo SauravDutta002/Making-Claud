@@ -12,6 +12,7 @@ board. Run it once and leave it open:
     python claude_bridge.py --port COM5    # or pick the port yourself
     python claude_bridge.py --send E:think # inject a line (testing)
     python claude_bridge.py --list         # show serial ports
+    python claude_bridge.py --plain        # plain log lines, no live dashboard
     python claude_bridge.py --ble          # wireless only (board just needs power)
 
 WIRELESS: if the board isn't plugged into this laptop, the bridge finds it over
@@ -23,14 +24,17 @@ terminal, GitHub Desktop...): the bridge watches each repo's HEAD. Repos you
 use Claude Code in are added automatically and remembered in repos.json.
 """
 import argparse
+import atexit
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
 
@@ -178,7 +182,7 @@ class CommitWatcher:
         if root in self.repos:
             return False
         self.repos[root] = {"head": git(root, "rev-parse", "HEAD"), "since": time.time()}
-        print(f"watching commits in {root}")
+        say(f"watching commits in {root}")
         if save:
             self.save()
         return True
@@ -278,14 +282,14 @@ class BleLink:
             try:
                 await client.start_notify(self.NUS_TX, self._on_rx)   # hear the board's buttons
             except Exception as e:
-                print(f"bluetooth: board buttons unavailable ({e}) - reflash the board")
+                say(f"bluetooth: board buttons unavailable ({e}) - reflash the board")
             return client
 
         self.lost = False
         try:
             self.client = self._run(go(), 25)
         except Exception as e:                      # bluetooth off, no adapter, timeout...
-            print(f"bluetooth: {e or type(e).__name__}")
+            say(f"bluetooth: {e or type(e).__name__}")
             self.client = None
         return self.client is not None
 
@@ -342,7 +346,7 @@ class MusicWatcher:
             self.meter = imm.Activate(IAudioMeterInformation._iid_, CLSCTX_ALL, None) \
                             .QueryInterface(IAudioMeterInformation)
         except Exception as e:
-            print(f"music: no audio meter ({e}) - the equalizer will dance without it")
+            say(f"music: no audio meter ({e}) - the equalizer will dance without it")
         self.asyncio = asyncio
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self._run, daemon=True).start()
@@ -361,7 +365,7 @@ class MusicWatcher:
             from winrt.windows.media.control import \
                 GlobalSystemMediaTransportControlsSessionManager as Manager
         except ImportError:
-            print("music: pip install winrt-Windows.Media.Control  (to see what's playing)")
+            say("music: pip install winrt-Windows.Media.Control  (to see what's playing)")
             return
         while True:
             try:
@@ -472,7 +476,7 @@ class UsageFetcher:
                 self.line, self.err = self._fetch(), None
             except Exception as e:                 # offline, logged out, endpoint changed...
                 if str(e) != self.err:
-                    print(f"usage: couldn't fetch ({e})")
+                    say(f"usage: couldn't fetch ({e})", "warn")
                     self.err = str(e)
             time.sleep(self.EVERY_S)
 
@@ -500,6 +504,279 @@ class UsageFetcher:
         return f"U:{pct('five_hour')},{pct('seven_day')},{mins}"
 
 
+# ------------------------------------------------------------------ dashboard
+# A live, full-screen view of what the bridge is doing. Plain ANSI escapes, no
+# extra packages. Falls back to ordinary log lines when the output isn't a
+# terminal (or with --plain).
+
+ESC = "\x1b["
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+CORAL, PEACH = "38;2;217;119;87", "38;2;240;175;145"
+GREEN, YELLOW, RED = "38;2;125;205;135", "38;2;235;195;95", "38;2;240;105;95"
+CYAN, VIOLET = "38;2;110;190;230", "38;2;185;145;240"
+GREY, FAINT = "38;2;140;140;150", "38;2;85;85;95"
+
+# board event -> (what it means, colour, eyes, mouth, extra) for Claude's face
+EVENTS = {
+    "think":   ("thinking",            VIOLET, "o", ".", " ?"),
+    "read":    ("reading files",       CYAN,   "o", "_", ""),
+    "type":    ("editing code",        CORAL,  ">", "_", " ~"),
+    "write":   ("creating a file",     CORAL,  "^", "o", " +"),
+    "search":  ("searching",           CYAN,   "o", "_", " >>"),
+    "web":     ("browsing the web",    CYAN,   "@", "_", ""),
+    "bash":    ("running a command",   YELLOW, "-", "_", " $"),
+    "ps":      ("running a command",   YELLOW, "-", "_", " $"),
+    "build":   ("building",            YELLOW, "-", "_", " #"),
+    "git":     ("committing",          GREEN,  "^", "_", " *"),
+    "plane":   ("pushing to remote",   GREEN,  "^", "o", " >>"),
+    "merge":   ("merging",             YELLOW, "o", "_", " <>"),
+    "test":    ("running tests",       YELLOW, "o", "_", " ..."),
+    "bug":     ("tests passed!",       GREEN,  "^", "v", " !"),
+    "fail":    ("something failed",    RED,    "x", "_", " !"),
+    "pkg":     ("installing packages", YELLOW, "o", "_", " []"),
+    "need":    ("needs you!",          RED,    "O", "o", " !!"),
+    "done":    ("all done",            GREEN,  "^", "v", " *"),
+    "compact": ("compacting memory",   VIOLET, "-", "_", " ..."),
+    "idle":    ("waiting for you",     GREY,   "o", "_", ""),
+    "key":     ("you're typing",       PEACH,  "o", "_", " ..."),
+}
+
+UI = None   # the Dashboard, once main() starts it
+
+
+def say(msg, kind="info"):
+    """Log a line: into the dashboard's activity feed, or plain stdout."""
+    if UI is not None and UI.live:
+        UI.log(msg, kind)
+    else:
+        print(msg)
+
+
+def paint(code, s):
+    return f"{ESC}{code}m{s}{ESC}0m" if code else str(s)
+
+
+def vis(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def clip(s, n):
+    s = str(s)
+    return s if len(s) <= n else s[:max(0, n - 1)] + "…"
+
+
+def mmss(sec):
+    return f"{sec // 60}:{sec % 60:02}"
+
+
+def bar(pct, w):
+    """A smooth meter: green -> yellow -> red as it fills."""
+    if pct is None or pct < 0:
+        return paint(FAINT, "·" * w) + paint(FAINT, "    –")
+    p = max(0, min(100, pct))
+    col = GREEN if p < 50 else YELLOW if p < 80 else RED
+    fill = p * w / 100
+    n, frac = int(fill), int((fill - int(fill)) * 8)
+    s = "█" * n + ("▏▎▍▌▋▊▉"[frac - 1] if frac and n < w else "")
+    return paint(col, s) + paint(FAINT, "░" * (w - len(s))) + paint("1;" + col, f" {p:3d}%")
+
+
+class Dashboard:
+    SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    KIND = {"info": GREY, "ok": GREEN, "warn": YELLOW, "err": RED,
+            "tx": FAINT, "commit": GREEN, "music": PEACH}
+
+    def __init__(self, live):
+        self.live = bool(live and sys.stdout.isatty() and self._vt())
+        self.events = deque(maxlen=80)
+        self.link, self.port = "search", ""
+        self.started = time.time()
+        self.tx = 0
+        self.ev, self.ev_at = "idle", time.time()
+        self.doing, self.doing_at = "", 0.0
+        self.typing = False
+        self.levels = deque([0] * 20, maxlen=20)
+        self.stats, self.music = None, None
+        self.sticky, self.git_lines = {}, []
+        self.next_draw = 0.0
+        if self.live:
+            try:
+                sys.stdout.reconfigure(errors="replace")
+            except Exception:
+                pass
+            # alternate screen, hidden cursor, no line wrap (narrow windows clip)
+            sys.stdout.write(ESC + "?1049h" + ESC + "?25l" + ESC + "?7l" + ESC + "2J")
+            sys.stdout.flush()
+            atexit.register(self.close)
+
+    @staticmethod
+    def _vt():
+        """Turn on ANSI escapes in the Windows console."""
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if not k.GetConsoleMode(h, ctypes.byref(mode)):
+                return False
+            return bool(k.SetConsoleMode(h, mode.value | 0x0004))
+        except Exception:
+            return False
+
+    def close(self):
+        if not self.live:
+            return
+        self.live = False
+        sys.stdout.write(ESC + "?7h" + ESC + "?25h" + ESC + "?1049l")
+        sys.stdout.flush()
+        for t, _kind, msg in list(self.events)[-8:]:    # leave the tail of the log behind
+            print(f"{t}  {msg}")
+        print("bridge stopped.")
+
+    # -- feeding it ------------------------------------------------------
+    def log(self, msg, kind="info"):
+        msg = str(msg)
+        if self.events and self.events[-1][2] == msg:   # don't repeat the same line
+            return
+        self.events.append((time.strftime("%H:%M:%S"), kind, msg))
+        self.next_draw = 0.0
+
+    def event(self, ev):
+        self.ev, self.ev_at = ev, time.time()
+        if ev != "key":
+            label, col = EVENTS.get(ev, (ev, GREY))[:2]
+            say("● " + label, col)
+
+    def activity(self, text):
+        self.doing, self.doing_at = text, time.time()
+
+    # -- drawing ---------------------------------------------------------
+    def face(self, now):
+        ev = "key" if self.typing else self.ev
+        if ev in ("idle", "done") and now - self.ev_at > 300:
+            return "(-_-) zZ", FAINT, "dozing off"
+        label, col, eye, mouth, extra = EVENTS.get(ev, (ev, GREY, "o", "_", ""))
+        if now % 4.0 < 0.2 and eye not in "-x":          # blink
+            eye = "-"
+        return f"({eye}{mouth}{eye}){extra}", col, label
+
+    @staticmethod
+    def _nums(line, n):
+        try:
+            v = [int(x) for x in line[2:].split(",")][:n]
+            return v if len(v) == n else None
+        except (TypeError, ValueError):
+            return None
+
+    def draw(self, force=False):
+        now = time.time()
+        if not self.live or (now < self.next_draw and not force):
+            return
+        self.next_draw = now + 0.2
+        cols, rows = shutil.get_terminal_size((80, 24))
+        W = max(44, min(cols - 2, 78))
+        L = []
+
+        def lab(s):
+            return "  " + paint(FAINT, s.ljust(9))
+
+        # header
+        if self.link == "usb":
+            link = paint(GREEN, "● USB ") + paint(GREY, self.port)
+        elif self.link == "ble":
+            link = paint(CYAN, "● Bluetooth")
+        else:
+            spin = self.SPIN[int(now * 10) % len(self.SPIN)]
+            link = paint(YELLOW, spin + (" scanning bluetooth" if self.link == "scan" else " looking for board"))
+        title = paint("1;" + CORAL, "✻ Claude Buddy") + paint(GREY, "  bridge")
+        L.append(paint(CORAL, "╭" + "─" * (W - 2) + "╮"))
+        L.append(paint(CORAL, "│ ") + title + " " * max(1, W - 4 - vis(title) - vis(link))
+                 + link + paint(CORAL, " │"))
+        L.append(paint(CORAL, "╰" + "─" * (W - 2) + "╯"))
+
+        # Claude's face + what it's doing
+        face, col, label = self.face(now)
+        up = int(now - self.started)
+        right = paint(FAINT, f"up {up // 3600}:{up // 60 % 60:02}:{up % 60:02} · {self.tx} sent")
+        left = "  " + paint("1;" + col, face.ljust(11)) + paint(col, label)
+        L.append(left + " " * max(2, W - vis(left) - vis(right)) + right)
+        doing = self.doing if self.doing and now - self.doing_at < 120 else ""
+        L.append(" " * 13 + paint(GREY, clip(doing, W - 14) if doing else "·"))
+        L.append("")
+
+        # today / session
+        if self.stats is not None:
+            d, s = self.stats.day, self.stats.session
+
+            def num(n, c):
+                return paint("1;" + c, n)
+            L.append(lab("today") + f"{num(d['commits'], GREEN)} commits   "
+                     f"{num(d['tasks'], CORAL)} tasks   {num(d['tests'], CYAN)} tests passed")
+            if any(s):
+                L.append(lab("session") + paint("1", f"${s[0] / 100:.2f}") + "   "
+                         + paint(GREEN, f"+{s[1]}") + " " + paint(RED, f"-{s[2]}")
+                         + paint(GREY, f" lines   {s[3]} min"))
+
+        # usage + context meters
+        bw = max(10, min(26, W - 38))
+        u = self._nums(self.sticky.get("U"), 3)
+        x = self._nums(self.sticky.get("X"), 1)
+        if u or x:
+            L.append("")
+        if u:
+            reset = f"resets in {u[2] // 60}h {u[2] % 60:02}m" if u[2] >= 0 else ""
+            L.append(lab("5-hour") + bar(u[0], bw) + "  " + paint(FAINT, reset))
+            L.append(lab("weekly") + bar(u[1], bw))
+        if x:
+            L.append(lab("context") + bar(x[0], bw))
+
+        # music: visualizer + progress
+        m = self.music
+        if m is not None:
+            self.levels.append(m.level() if m.state == 1 else 0)
+            L.append("")
+            if m.state:
+                icon = paint(PEACH, "▶ ") if m.state == 1 else paint(GREY, "❚❚ ")
+                L.append(lab("music") + icon + paint("1", clip(m.title, W - 15)))
+                spark = "".join("▁▂▃▄▅▆▇█"[min(7, v * 8 // 100)] for v in self.levels)
+                line = " " * 11 + paint(PEACH if m.state == 1 else FAINT, spark)
+                if m.dur:
+                    pw = max(6, W - 11 - len(spark) - 16)
+                    k = min(pw - 1, int(pw * m.pos / m.dur))
+                    line += ("  " + paint(GREY, mmss(m.pos)) + " " + paint(CORAL, "━" * k + "●")
+                             + paint(FAINT, "─" * (pw - k - 1)) + " " + paint(GREY, mmss(m.dur)))
+                L.append(line)
+            else:
+                L.append(lab("music") + paint(FAINT, "nothing playing"))
+
+        # git graph
+        if self.git_lines:
+            L.append("")
+        for gl in self.git_lines:
+            if gl.startswith("R:"):
+                br, _, repo = gl[2:].partition(",")
+                L.append(lab("git") + paint("1;" + GREEN, "⎇ " + br) + paint(GREY, "  " + repo))
+            elif gl.startswith("L:"):
+                p = gl[2:].split(",", 2)
+                if len(p) == 3 and p[1] and p[0].isdigit() and int(p[0]) < 3:
+                    dot = paint(GREEN, "●") if p[0] == "0" else paint(FAINT, "○")
+                    L.append(" " * 11 + dot + " " + paint(YELLOW, p[1]) + " " + paint(GREY, p[2]))
+
+        # activity feed fills the rest of the window
+        L.append("")
+        L.append(paint(FAINT, "  ── activity " + "─" * max(0, W - 15)))
+        room = max(3, rows - len(L) - 1)
+        for t, kind, msg in list(self.events)[-room:]:
+            L.append("  " + paint(FAINT, t) + "  " + paint(self.KIND.get(kind, kind), clip(msg, W - 14)))
+
+        L = L[:max(1, rows - 1)]
+        sys.stdout.write(ESC + "H" + "".join(ln + ESC + "K\n" for ln in L) + ESC + "J")
+        sys.stdout.flush()
+
+
 def send_one(line):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(line.encode(), (UDP_HOST, UDP_PORT))
@@ -517,6 +794,7 @@ def open_serial(port, baud):
 
 
 def main():
+    global UI
     ap = argparse.ArgumentParser()
     ap.add_argument("--port")
     ap.add_argument("--baud", type=int, default=115200)
@@ -533,6 +811,7 @@ def main():
                     help="don't fetch your Claude usage (the usage screen then relies on the status line)")
     ap.add_argument("--ble", action="store_true", help="always use Bluetooth, even if USB is plugged in")
     ap.add_argument("--usb", action="store_true", help="USB cable only, never Bluetooth")
+    ap.add_argument("--plain", action="store_true", help="plain log lines instead of the live dashboard")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
@@ -551,6 +830,7 @@ def main():
         sys.exit(f"UDP port {UDP_PORT} is busy - is the bridge already running?")
     sock.settimeout(0.1)
 
+    ui = UI = Dashboard(live=not a.plain)
     stats = Stats()
     sticky = {"S": stats.line()}   # last U:/X:/S: line per kind, replayed after a reconnect
     watcher = CommitWatcher(a.repo)
@@ -567,37 +847,56 @@ def main():
     level_sent, level_at = -1, 0.0
     keys = None if a.no_typing else KeyWatcher(a.type_windows)
     typing, last_key, last_typing_send = False, 0.0, 0.0
-    print(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}")
+    announced = False              # "no board found" said once per outage, not every retry
+    ui.stats, ui.sticky, ui.music = stats, sticky, music
+    say(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}", "ok")
+
+    def out(line):
+        ser.write((line + "\n").encode())
+        ui.tx += 1
 
     while True:
         if ser is None:
+            ui.link = "search"
             # USB if the board is plugged into this laptop, else Bluetooth
             port = None if a.ble else (a.port or find_port())
             if port:
                 try:
                     ser = open_serial(port, a.baud)
-                    print(f"connected on {port} (USB)")
+                    ui.link, ui.port = "usb", port
+                    say(f"connected on {port} (USB)", "ok")
                 except (serial.SerialException, OSError) as e:
-                    print(f"cannot open {port}: {e}")
+                    say(f"cannot open {port}: {e}", "err")
                     ser = None
             elif not a.usb:
-                print("looking for 'Claude Buddy' over Bluetooth...")
+                if not announced:
+                    say("looking for 'Claude Buddy' over Bluetooth...")
+                ui.link = "scan"
+                ui.draw(force=True)
                 if ble is None:
                     ble = BleLink()                # one bluetooth thread, reused
                 if ble.connect():
                     ser = ble
-                    print("connected over Bluetooth")
+                    ui.link = "ble"
+                    say("connected over Bluetooth", "ok")
             if ser is None:
-                print("no board found - plug it in or switch it on. retrying...")
-                time.sleep(2)
+                ui.link = "search"
+                if not announced:
+                    say("no board found - plug it in or switch it on. retrying...", "warn")
+                    announced = True
+                until = time.time() + 2
+                while time.time() < until:         # keep the dashboard alive while we wait
+                    ui.draw()
+                    time.sleep(0.1)
                 continue
+            announced = False
             try:
                 time.sleep(0.3)
                 date_sent = 0.0                    # fresh time right after (re)connecting
                 for line in list(sticky.values()) + git_lines:
-                    ser.write((line + "\n").encode())
+                    out(line)
             except (serial.SerialException, OSError) as e:
-                print(f"link lost while syncing: {e}")
+                say(f"link lost while syncing: {e}", "err")
                 ser = None
                 continue
 
@@ -609,8 +908,7 @@ def main():
         try:
             incoming = data.splitlines()
             for h, subj, repo in watcher.poll():   # commits from any editor or tool
-                if a.verbose:
-                    print(f"commit {h} in {repo}: {subj}")
+                say(f"✓ commit {h} in {repo}: {subj}", "commit")
                 incoming += ["T:" + oled_text("commit: " + subj), "C:" + h]
             for line in incoming:
                 line = line.strip()
@@ -621,6 +919,8 @@ def main():
                     continue
                 if line[0] in "UX":
                     sticky[line[0]] = line
+                if line[0] == "T":
+                    ui.activity(line[2:])
                 stats_changed = False
                 if line[0] == "K":                 # session cost/lines/time -> S: line
                     try:
@@ -643,78 +943,82 @@ def main():
                     if line == last_event[0] and now - last_event[1] < 0.4:
                         continue
                     last_event = (line, now)
+                    ui.event(ev)
                     if ev in ("done", "bug"):
                         stats.bump("tasks" if ev == "done" else "tests")
                         stats_changed = True
                 if a.verbose:
-                    print(">", line)
-                ser.write((line + "\n").encode())
+                    say("> " + line, "tx")
+                out(line)
                 if stats_changed:
                     sticky["S"] = stats.line()
                     if line != sticky["S"]:
-                        ser.write((sticky["S"] + "\n").encode())
+                        out(sticky["S"])
                 if line[0] == "C":
                     watcher.changed = True         # resend the history with this commit
             if time.time() - date_sent > 60:       # the board's clock: local time every minute
                 date_sent = time.time()
-                ser.write(("D:%d\n" % (int(date_sent) + time.localtime().tm_gmtoff)).encode())
+                out("D:%d" % (int(date_sent) + time.localtime().tm_gmtoff))
             if usage is not None and usage.line and usage.line != sticky.get("U"):
                 sticky["U"] = usage.line           # your 5-hour / weekly limits -> usage screen
-                ser.write((usage.line + "\n").encode())
+                out(usage.line)
                 if a.verbose:
-                    print(">", usage.line)
+                    say("> " + usage.line, "tx")
             if music is not None:                  # music on this laptop -> music faces
                 music.tick()
                 now = time.time()
                 state = (music.state, music.title)
                 if state != music_state or (state[0] and now - music_sent > 2):
-                    if a.verbose and state != music_state:
-                        print("> music:", ("", "playing ", "paused ")[state[0]] + state[1] if state[0] else "stopped")
+                    if state != music_state:
+                        say(("♪ " + ("now playing: ", "paused: ")[state[0] - 1] + state[1])
+                            if state[0] else "♪ music stopped", "music")
                     music_state, music_sent = state, now
-                    ser.write(("M:%d,%s\n" % (state[0], oled_text(state[1], 40))).encode())
+                    out("M:%d,%s" % (state[0], oled_text(state[1], 40)))
                     if state[0] and music.dur:     # song position for the progress bar
-                        ser.write(("Q:%d,%d\n" % (music.pos, music.dur)).encode())
+                        out("Q:%d,%d" % (music.pos, music.dur))
                 if state[0] == 1 and now - level_at >= 0.08:
                     lvl = music.level()
                     if abs(lvl - level_sent) >= 2 or now - level_at > 0.5:
-                        ser.write(f"A:{lvl}\n".encode())
+                        out(f"A:{lvl}")
                         level_sent, level_at = lvl, now
                 sock.settimeout(0.03 if state[0] == 1 else 0.1)   # faster loop while music plays
             if watcher.changed:                    # board's git graph = your real history
                 watcher.changed = False
                 git_lines = watcher.snapshot()
+                ui.git_lines = git_lines
                 for gl in git_lines:
-                    ser.write((gl + "\n").encode())
+                    out(gl)
                 if a.verbose and git_lines:
-                    print("> git history:", git_lines[0])
+                    say("> git history: " + git_lines[0], "tx")
             if keys is not None:
                 now = time.time()
                 if keys.active():
                     last_key = now
                     if not typing or now - last_typing_send > 1.0:
                         if a.verbose and not typing:
-                            print("> typing")
+                            say("> typing", "tx")
                         typing, last_typing_send = True, now
-                        ser.write(b"E:key\n")
+                        out("E:key")
                 elif typing and now - last_key > 2.0:
                     typing = False     # the board decides how (and whether) to react
+                ui.typing = typing
             # lines from the board: its debug prints, and P:<cmd> from the music buttons
             rx_buf += ser.read(ser.in_waiting or 1)
             while b"\n" in rx_buf:
                 raw, rx_buf = rx_buf.split(b"\n", 1)
                 msg = raw.decode(errors="ignore").strip()
                 if msg.startswith("P:") and music is not None:
-                    if a.verbose:
-                        print("< board button:", msg[2:])
+                    say("◆ board button: " + msg[2:], "music")
                     music.control(msg[2:])
             rx_buf = rx_buf[-200:]
+            ui.draw()
         except (serial.SerialException, OSError) as e:
             if isinstance(e, serial.SerialTimeoutException):
-                print("board is not reading the port (write timed out).\n"
-                      "  -> Arduino IDE: Tools > USB CDC On Boot > Enabled, re-upload the sketch,\n"
-                      "     and close the Arduino Serial Monitor.")
+                say("board is not reading the port (write timed out).", "err")
+                say("  -> Arduino IDE: Tools > USB CDC On Boot > Enabled, re-upload the sketch,", "warn")
+                say("     and close the Arduino Serial Monitor.", "warn")
             else:
-                print(f"serial lost ({e}) - reconnecting...")
+                say(f"serial lost ({e}) - reconnecting...", "err")
             try:
                 ser.close()
             except Exception:
@@ -727,3 +1031,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+    finally:
+        if UI is not None:
+            UI.close()
