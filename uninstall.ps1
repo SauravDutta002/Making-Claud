@@ -15,6 +15,7 @@ function Uninstall-ClaudeBuddy {
     }
     foreach ($place in @([Environment]::GetFolderPath("Startup"), [Environment]::GetFolderPath("Programs"))) {
         Remove-Item (Join-Path $place "Claude Buddy.lnk") -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $place "Claude Buddy Settings.url") -Force -ErrorAction SilentlyContinue
     }
     Write-Host "  Claude Buddy removed. The board keeps its firmware and lives on its own." -ForegroundColor DarkYellow
     Write-Host "  (your stats and streaks are still in $env:LOCALAPPDATA\ClaudeBuddy - delete it to forget them)" -ForegroundColor DarkGray

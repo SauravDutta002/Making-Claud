@@ -32,10 +32,11 @@ dependencies = [
 claude-buddy = "claude_buddy.claude_bridge:run"
 claude-buddy-setup = "claude_buddy.setup_claude:main"
 claude-buddy-flash = "claude_buddy.flash:main"
+claude-buddy-settings = "claude_buddy.webapp:open_page"
 
 [tool.setuptools]
 package-dir = { "claude_buddy" = "bridge" }
 packages = ["claude_buddy"]
 
 [tool.setuptools.package-data]
-claude_buddy = ["firmware/*.bin"]
+claude_buddy = ["firmware/*.bin", "web/*.html"]

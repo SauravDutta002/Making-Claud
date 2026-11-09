@@ -38,6 +38,36 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
+VERSION = "1.0.0"
+
+try:
+    from .webapp import WebApp
+except ImportError:
+    from webapp import WebApp
+
+# what the settings page can switch (kept in config.json)
+DEFAULT_SETTINGS = {
+    "music": True, "lyrics": True, "lyrics_offset": 0.0,
+    "notify": True, "notify_apps": "slack,teams,discord,whatsapp,telegram,signal,zoom,outlook",
+    "calendar": True, "ics": [], "away": True, "typing": True, "usage": True,
+}
+# faces the settings page can put on the screen (board scene numbers)
+FACES = [
+    (0, "Idle"), (1, "Thinking words"), (2, "Thinking"), (3, "Bright idea"), (4, "Reading"),
+    (5, "Typing code"), (6, "Keyboard peek"), (7, "Letters fly"), (8, "Web search"), (9, "Test tubes"),
+    (10, "Needs you"), (11, "Context meter"), (12, "Coffee"), (13, "Music"), (14, "Headbang"),
+    (15, "Dance"), (16, "Equalizer"), (17, "Now playing card"), (18, "Love"), (19, "Petted"),
+    (21, "Stargazing"), (22, "Dreaming"), (23, "Low power"), (24, "Feeling great"), (25, "Not amused"),
+    (26, "Oh no"), (27, "Hmmm"), (28, "Got it"), (29, "Whoa"), (30, "Terminal"), (31, "Searching files"),
+    (32, "Git graph"), (33, "Branch merge"), (34, "Packages"), (35, "Trophy"), (36, "Goal"),
+    (37, "Usage"), (38, "Limit hit"), (39, "Test failed"), (40, "Variable check"), (41, "Waiting"),
+    (42, "Paper plane"), (44, "Typing along"), (45, "Goal celebration"), (46, "Bicycle kick"),
+    (47, "Build crane"), (48, "Flappy Clawd"), (49, "Permission panic"), (50, "Whack a bug"),
+    (51, "Today's stats"), (52, "Level up"), (53, "Profile"), (54, "Working"), (55, "Worked for"),
+    (56, "Shell window"), (57, "Commit log"), (58, "Merge log"), (59, "Plane throw"),
+    (60, "Juggling three"), (61, "Nap"), (62, "Hello wave"), (63, "Super Claude"), (64, "Record player"),
+    (65, "Clock"), (66, "Lyrics"), (67, "Fixing the wiring"), (68, "DJ set"),
+]
 
 # USB vendor ids: Espressif (ESP32-C3 native USB), then common USB-UART chips.
 ESPRESSIF = 0x303A
@@ -360,7 +390,9 @@ class BleLink:
                 await self.asyncio.sleep(0.008)
                 continue
             try:
-                await client.write_gatt_char(self.NUS_RX, data, response=False)
+                # acknowledged writes: a dropped packet would leave half a line that
+                # the board could misread (it once opened the settings menu)
+                await client.write_gatt_char(self.NUS_RX, data, response=True)
             except Exception as e:
                 self.error = str(e) or type(e).__name__
                 self.lost = True
@@ -467,11 +499,12 @@ class MusicWatcher:
                 self.session_state, self.session_title = state, title
             except Exception:
                 self.mgr = None
-            await self.asyncio.sleep(1)
+                state = 0
+            await self.asyncio.sleep(0.3 if state == 1 else 1)   # playing: keep the lyrics in step
 
     @staticmethod
     def _timeline(s, playing):
-        """(position, length) in whole seconds, or (0, 0) if the player doesn't share it."""
+        """(position, length) in seconds (with fractions), or (0, 0) if the player doesn't share it."""
         import datetime
         try:
             if s is None:
@@ -484,7 +517,7 @@ class MusicWatcher:
                 pos += (datetime.datetime.now(datetime.timezone.utc) - upd).total_seconds()
             if dur <= 0:
                 return 0, 0
-            return int(max(0, min(pos, dur))), int(dur)
+            return max(0.0, min(pos, dur)), dur
         except Exception:
             return 0, 0
 
@@ -560,15 +593,18 @@ class Lyrics:
 
     API = "https://lrclib.net/api/"
 
-    def __init__(self):
+    def __init__(self, lead=0.3):
         self.key, self.times, self.texts = None, [], []
         self.status = ""                                     # "", "searching", "found", "none"
+        self.lead = lead                                     # show each line this much early (s)
+        self.last_i = -1
 
     def want(self, track, artist, dur):
         key = (track, artist)
         if key == self.key:
             return
         self.key, self.times, self.texts = key, [], []
+        self.last_i = -1
         self.status = "searching" if track else ""
         if track:
             threading.Thread(target=self._fetch, args=(key, dur), daemon=True).start()
@@ -622,7 +658,10 @@ class Lyrics:
     def at(self, pos):
         """(index, text, seconds until the next line) at song position pos, or None."""
         import bisect
-        i = bisect.bisect_right(self.times, pos + 0.25) - 1   # a hair early: time to read
+        i = bisect.bisect_right(self.times, pos + self.lead) - 1   # a hair early: time to read
+        if 0 <= self.last_i < len(self.times) and i < self.last_i and pos + self.lead > self.times[self.last_i] - 1.5:
+            i = self.last_i                                  # a wobble, not a seek: stay on this line
+        self.last_i = i
         if i < 0:
             return None
         nxt = self.times[i + 1] if i + 1 < len(self.times) else self.times[i] + 6
@@ -1318,6 +1357,7 @@ def clip(s, n):
 
 
 def mmss(sec):
+    sec = int(sec)
     return f"{sec // 60}:{sec % 60:02}"
 
 
@@ -1591,6 +1631,8 @@ def main():
                     help="comma-separated window-title words that count as 'typing to Claude'")
     ap.add_argument("--no-music", action="store_true", help="don't react to music playing on this laptop")
     ap.add_argument("--no-lyrics", action="store_true", help="don't show song lyrics on the board")
+    ap.add_argument("--lyrics-offset", type=float, metavar="SEC",
+                    help="show lyric lines this many seconds earlier (negative = later; remembered)")
     ap.add_argument("--no-usage", action="store_true",
                     help="don't fetch your Claude usage (the usage screen then relies on the status line)")
     ap.add_argument("--ble", action="store_true", help="always use Bluetooth, even if USB is plugged in")
@@ -1600,8 +1642,10 @@ def main():
                     help="an iCal calendar link for meeting alerts (repeatable; remembered)")
     ap.add_argument("--no-calendar", action="store_true", help="no meeting alerts")
     ap.add_argument("--no-notify", action="store_true", help="no GitHub / chat notifications")
-    ap.add_argument("--notify-apps", default="slack,teams,discord,whatsapp,telegram,signal,zoom,outlook",
-                    help="comma-separated app names whose Windows notifications go to the board")
+    ap.add_argument("--notify-apps", metavar="APPS",
+                    help="comma-separated app names whose Windows notifications go to the board (remembered)")
+    ap.add_argument("--no-web", action="store_true", help="don't serve the settings page")
+    ap.add_argument("--version", action="version", version=f"claude-buddy {VERSION}")
     ap.add_argument("--no-away", action="store_true", help="don't say 'oh, you're back!'")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -1635,7 +1679,11 @@ def main():
                                      MacMusicWatcher() if sys.platform == "darwin" else None)
     usage = None if a.no_usage else UsageFetcher()
     music_state, music_sent = (0, ""), 0.0
-    lyrics = None if (a.no_music or a.no_lyrics) else Lyrics()
+    cfg0 = load_json(CONFIG_FILE, {})
+    if a.lyrics_offset is not None:
+        cfg0["lyrics_offset"] = a.lyrics_offset
+        save_json(CONFIG_FILE, cfg0)
+    lyrics = None if (a.no_music or a.no_lyrics) else Lyrics(0.3 + float(cfg0.get("lyrics_offset", 0.0)))
     lyric_sent = None              # last lyric line sent (index), None = cleared
     rx_buf = b""                   # partial line from the board
     date_sent = 0.0                # last time the board got the date & time
@@ -1647,9 +1695,12 @@ def main():
     for u in a.ics:
         if u not in cfg.setdefault("ics", []):
             cfg["ics"].append(u)
+    if a.notify_apps:
+        cfg["notify_apps"] = a.notify_apps
     save_json(CONFIG_FILE, cfg)
-    calendar = None if a.no_calendar else CalendarWatcher(cfg.get("ics", []))
-    notifier = None if a.no_notify else NotifyWatcher(a.notify_apps)
+    S = {**DEFAULT_SETTINGS, **{k: cfg[k] for k in DEFAULT_SETTINGS if k in cfg}}
+    calendar = None if a.no_calendar else CalendarWatcher(S["ics"])
+    notifier = None if a.no_notify else NotifyWatcher(S["notify_apps"])
     away = None if a.no_away else AwayWatcher()
     todos, progress = Todos(), Progress()
     progress.seed(stats.day)       # today's commits/tasks from before streaks existed
@@ -1658,6 +1709,43 @@ def main():
     ui.stats, ui.sticky, ui.music = stats, sticky, music
     ui.calendar, ui.todos, ui.progress = calendar, todos, progress
     say(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}", "ok")
+    locked = [k for k, obj in (("music", music), ("lyrics", lyrics), ("notify", notifier),
+                               ("calendar", calendar), ("away", away), ("typing", keys),
+                               ("usage", usage)) if obj is None]
+    web = None if a.no_web else WebApp()
+    if web is not None:
+        if web.ok:
+            say(f"settings page: {web.url}", "ok")
+        else:
+            say(f"settings page unavailable ({web.err})", "warn")
+            web = None
+    web_at = 0.0
+    board_cfg = None               # the board's brightness / volume / sound, as it reports them
+
+    def apply_settings(change):
+        """A change from the settings page: check it, keep it, use it now."""
+        for k, v in change.items():
+            if k not in DEFAULT_SETTINGS:
+                continue
+            if isinstance(DEFAULT_SETTINGS[k], bool):
+                S[k] = bool(v)
+            elif k == "lyrics_offset":
+                try:
+                    S[k] = round(max(-3.0, min(3.0, float(v))), 2)
+                except (TypeError, ValueError):
+                    pass
+            elif k == "notify_apps":
+                S[k] = str(v)[:200]
+                if notifier is not None:
+                    notifier.apps = [x.strip().lower() for x in S[k].split(",") if x.strip()]
+            elif k == "ics" and isinstance(v, list):
+                S[k] = [str(u)[:500] for u in v if str(u).lower().startswith(("http://", "https://", "webcal://"))][:10]
+                if calendar is not None:
+                    calendar.ics = list(S[k])
+        c = load_json(CONFIG_FILE, {})
+        c.update({k: S[k] for k in DEFAULT_SETTINGS})
+        save_json(CONFIG_FILE, c)
+        say("settings changed: " + ", ".join(change), "info")
 
     def out(line):
         if ser is None:                    # board away: state is kept and replayed on reconnect
@@ -1709,6 +1797,7 @@ def main():
                     date_sent = beat_at = 0.0          # fresh time + heartbeat right away
                     lyric_sent = -1                    # resend the current lyric line
                     out("H:1")                         # board plays its "Build something great" intro
+                    out("F:?")                         # ...and tells us its brightness / volume / sound
                     for line in list(sticky.values()) + git_lines:
                         out(line)
                 except (serial.SerialException, OSError) as e:
@@ -1797,12 +1886,38 @@ def main():
                 for b in badges[-4:]:
                     out(oled_text(b, 40))
                 badges = []
-            if away is not None and ser is not None:
+            if web is not None:                    # the settings page
+                while not web.changes.empty():
+                    apply_settings(web.changes.get())
+                while not web.outbox.empty():
+                    line = web.outbox.get()
+                    if ser is not None:
+                        out(line)
+                if time.time() >= web_at:
+                    web_at = time.time() + 0.5
+                    u = ui._nums(sticky.get("U"), 3)
+                    web.state = {
+                        "version": VERSION, "link": ui.link, "port": ui.port, "rssi": ui.rssi,
+                        "board": board_cfg if ser is not None else None,
+                        "music": ({"state": music.state, "title": music.title, "lyric": ui.lyric,
+                                   "pos": int(music.pos), "dur": int(music.dur)}
+                                  if music is not None and S["music"] else None),
+                        "usage": {"five": u[0], "week": u[1], "reset": u[2]} if u and S["usage"] else None,
+                        "today": {k: stats.day.get(k, 0) for k in ("commits", "tasks", "tests")},
+                        "streak": progress.streak(), "badges": len(progress.unlocked),
+                        "badgesTotal": len(Progress.BADGES),
+                        "todos": {"done": todos.done(), "total": len(todos.items), "current": todos.current()},
+                        "settings": S, "locked": locked, "faces": FACES, "data": DATA,
+                        "events": [[t, m] for t, _k, m in list(ui.events)[-12:]],
+                    }
+            if notifier is not None and not S["notify"]:
+                notifier.queue.clear()             # switched off: nothing piles up
+            if away is not None and ser is not None and S["away"]:
                 mins = away.poll()
                 if mins is not None:               # you came back to the laptop
                     say(f"welcome back! (away {mins} min)", "ok")
                     out(f"B:{mins}")
-            if calendar is not None and ser is not None:
+            if calendar is not None and ser is not None and S["calendar"]:
                 for mins, title in calendar.due():  # meeting coming up -> alarm clock panic
                     say(f"meeting: {title} " + ("starting now" if mins <= 0 else f"in {mins} min"), "warn")
                     out("N:%d,%s" % (mins, oled_text(title, 33)))
@@ -1814,12 +1929,16 @@ def main():
             if time.time() - date_sent > 60:       # the board's clock: local time every minute
                 date_sent = time.time()
                 out("D:%d" % (int(date_sent) + time.localtime().tm_gmtoff))
-            if usage is not None and usage.line and usage.line != sticky.get("U"):
+            if usage is not None and S["usage"] and usage.line and usage.line != sticky.get("U"):
                 sticky["U"] = usage.line           # your 5-hour / weekly limits -> usage screen
                 out(usage.line)
                 if a.verbose:
                     say("> " + usage.line, "tx")
-            if music is not None:                  # music on this laptop -> music faces
+            if music is not None and not S["music"] and music_state != (0, ""):
+                music_state, lyric_sent = (0, ""), None    # switched off: the board stops the music faces
+                out("M:0,")
+                out("Z:0,")
+            if music is not None and S["music"]:   # music on this laptop -> music faces
                 music.tick()
                 now = time.time()
                 state = (music.state, music.title)
@@ -1836,7 +1955,11 @@ def main():
                     if abs(lvl - level_sent) >= 2 or now - level_at > 0.5:
                         out(f"A:{lvl}")
                         level_sent, level_at = lvl, now
-                if lyrics is not None:             # karaoke: the line under the playhead
+                if lyrics is not None and not S["lyrics"] and lyric_sent is not None:
+                    lyric_sent, ui.lyric = None, ""
+                    out("Z:0,")
+                if lyrics is not None and S["lyrics"]:   # karaoke: the line under the playhead
+                    lyrics.lead = 0.3 + float(S["lyrics_offset"])
                     if music.state:
                         lyrics.want(music.track, music.artist, music.dur)
                     cur = lyrics.at(music.position()) if music.state == 1 and lyrics.texts and music.dur else None
@@ -1859,7 +1982,7 @@ def main():
                     out(gl)
                 if a.verbose and git_lines:
                     say("> git history: " + git_lines[0], "tx")
-            if keys is not None:
+            if keys is not None and S["typing"]:
                 now = time.time()
                 if keys.active():
                     last_key = now
@@ -1880,6 +2003,12 @@ def main():
                 if msg.startswith("P:") and music is not None:
                     say("◆ board button: " + msg[2:], "music")
                     music.control(msg[2:])
+                elif msg.startswith("F:"):         # the board's settings
+                    try:
+                        b, bn, v, vn, snd = (int(x) for x in msg[2:].split(",")[:5])
+                        board_cfg = {"bri": b, "briCount": bn, "vol": v, "volCount": vn, "snd": snd}
+                    except ValueError:
+                        pass
             rx_buf = rx_buf[-200:]
             ui.draw()
         except (serial.SerialException, OSError) as e:

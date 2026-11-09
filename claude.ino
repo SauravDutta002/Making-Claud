@@ -56,6 +56,7 @@
      G:1 / G:0      start / stop the game
      H:1            bridge connected -> "Build something great" intro
      Z:<ms>,<line>  lyric line, sung over <ms> (Z:0, = no lyrics)
+     F:<key>,<val>  settings page: bri / vol / snd / face / hello; F:? asks (reply F:bri,n,vol,n,snd)
      I:1            heartbeat, every 5 s (15 s of silence = bridge gone, Claude goes solo)
      B:<min>        you're back after <min> minutes away
      N:<min>,<title> meeting in <min> minutes
@@ -344,7 +345,7 @@ class BleConn : public BLEServerCallbacks {
 };
 
 void bleInit() {
-  bleQ = xQueueCreate(1024, 1);
+  bleQ = xQueueCreate(2048, 1);
   BLEDevice::init(BLE_NAME);
   BLEDevice::setMTU(185);                 // bigger packets: fewer, faster writes from the laptop
   BLEServer* srv = BLEDevice::createServer();
@@ -794,27 +795,38 @@ void btRune(int x, int y, int h, int split) {        // the Bluetooth rune, cent
   display.drawLine(x + q + split, y + q, x - q + split, y - q, C_WHITE);
 }
 
+/* a phone-style notification card: drops in from the top with a little
+   bounce, an icon in a circle, a title line and a (scrolling) message line */
+int cardY(int t, int dur) {
+  if (t < 320) return -26 + (int)(28 * easeOutBack(t / 320.0f));
+  if (t > dur - 220) return 2 - (int)(28 * clamp01((t - (dur - 220)) / 220.0f));
+  return 2;
+}
+
+void drawCard(int y, const char* title, const char* body, int scroll) {
+  display.fillRoundRect(1, y, 126, 25, 6, C_BLACK);
+  txt(27 - scroll, y + 14, 1, body);                 // message first: it may scroll...
+  display.fillRect(0, y + 13, 26, 10, C_BLACK);      // ...inside its own lane
+  display.fillRect(123, y + 13, 5, 10, C_BLACK);
+  display.drawRoundRect(1, y, 126, 25, 6, C_WHITE);
+  txt(27, y + 3, 1, title);
+  display.drawFastHLine(27, y + 11, (int)strlen(title) * 6 - 1, C_WHITE);   // title underline
+  display.drawCircle(13, y + 12, 9, C_WHITE);
+}
+
+/* Bluetooth connected / disconnected */
 void drawLinkToast() {
   if (!linkToastAt) return;
+  const int dur = 2400;
   int t = (int)(millis() - linkToastAt);
-  if (t > 2200) { linkToastAt = 0; return; }
-  int slide = t < 200 ? (200 - t) / 10 : t > 1950 ? (t - 1950) / 10 : 0;   // slides in from the top
-  int y0 = 2 - slide;
-  display.fillRoundRect(18, y0, 92, 22, 5, C_BLACK);
-  display.drawRoundRect(18, y0, 92, 22, 5, C_WHITE);
+  if (t > dur) { linkToastAt = 0; return; }
+  int y = cardY(t, dur);
+  drawCard(y, "Bluetooth", linkToastUp ? "connected" : "disconnected", 0);
   if (linkToastUp) {
-    for (uint8_t k = 0; k < 2; k++) {                // radio waves pulse out of the rune
-      int r = ((t / 25) + k * 3) % 6 + 5;            // radius 5..10 stays inside the box
-      display.drawCircle(32, y0 + 11, r, C_WHITE);
-    }
-    btRune(32, y0 + 11, 16, 0);
-    txt(50, y0 + 3, 1, "bluetooth");
-    txt(50, y0 + 12, 1, "linked up");
+    if ((t / 260) % 2) display.drawCircle(13, y + 12, 7, C_WHITE);   // pulsing ring
+    btRune(13, y + 12, 12, 0);
   } else {
-    int split = t < 300 ? 0 : t < 600 ? (t - 300) / 100 : 3;  // the rune cracks in half
-    btRune(32, y0 + 11, 16, split);
-    txt(50, y0 + 3, 1, "bluetooth");
-    txt(50, y0 + 12, 1, (t / 300) % 2 ? "link lost" : "link lost.");
+    btRune(13, y + 12, 12, t < 400 ? 0 : t < 700 ? (t - 400) / 100 : 3);   // cracks in half
   }
 }
 
@@ -1472,14 +1484,6 @@ void sc_petted(uint32_t f) {
 }
 
 /* --- juggling ----------------------------------------------- */
-void sc_juggling(uint32_t f) {
-  eyes(64, 36, 20, 26, 24, EY_HAPPY, 6);
-  uint8_t p = f % 36;
-  float t = p / 36.0f;
-  int x = 44 + (int)(t * 40);
-  int y = 24 - (int)(sinf(t * PI) * 18);
-  display.fillRect(x, y, 6, 6, C_WHITE);
-}
 
 /* --- stargazing --------------------------------------------- */
 void sc_stargazing(uint32_t f) {
@@ -1507,7 +1511,18 @@ void sc_dreaming(uint32_t f) {
 }
 
 /* --- moods -------------------------------------------------- */
-void sc_sleepy(uint32_t f) { eyes(64, 30, 28, 30, 22, EY_SLEEPY, 8); }
+void sc_sleepy(uint32_t f) {
+  uint32_t c = f % 160;                            // 4 s: droop... droop... jolt!
+  int h, jx = 0;
+  if (c < 130)      h = 26 - (int)(c * 20 / 130);  // eyelids sink
+  else if (c < 136) { h = 30; jx = (c % 2) ? 2 : -2; }   // jolt awake, a little shake
+  else              h = 26;
+  eyes(64 + jx, 30, 28, h, 22, EY_SLEEPY, 8, false);
+  if (c > 90 && c < 130) txt(104, 30 - (int)((c - 90) / 8), 1, "z");
+  display.drawRect(100, 3, 22, 11, C_WHITE);       // battery
+  display.fillRect(122, 6, 2, 5, C_WHITE);
+  if ((f / 12) % 2) display.fillRect(102, 5, 4, 7, C_WHITE);   // the last bar, blinking
+}
 
 void sc_happy(uint32_t f) {
   eyes(64, 28 + (int)wobble(f, 0.1f, 2), 30, 32, 22, EY_HAPPY, 9);
@@ -1623,17 +1638,25 @@ void sc_branchMerge(uint32_t f) {
 
 /* --- packages ----------------------------------------------- */
 void sc_packages(uint32_t f) {
-  display.drawRect(44, 24, 48, 32, C_WHITE);
-  display.drawLine(44, 24, 36, 12, C_WHITE);
-  display.drawLine(92, 24, 100, 12, C_WHITE);
-  int up = (int)((f * 2) % 18);
+  // parcels drop into an open crate, one after another
   for (uint8_t i = 0; i < 2; i++) {
-    int x = 58 + i * 18, y = 48 - up - i * 4;
-    display.drawFastVLine(x, y, 8, C_WHITE);
-    display.drawLine(x - 3, y + 3, x, y, C_WHITE);
-    display.drawLine(x + 3, y + 3, x, y, C_WHITE);
+    int ph = (int)((f + i * 30) % 60);
+    int x = i ? 66 : 44, y = -16 + ph * 44 / 60;
+    if (y > 26) continue;                          // landed inside
+    display.fillRect(x, y, 18, 14, C_WHITE);
+    display.drawFastVLine(x + 8, y, 14, C_BLACK);  // tape across the top
+    display.drawFastVLine(x + 9, y, 14, C_BLACK);
+    display.drawFastHLine(x + 2, y + 10, 4, C_BLACK);   // a label
   }
-  display.fillRect(100 + (int)wobble(f, 0.1f, 2), 4, 10, 7, C_WHITE);
+  // the crate, in front of the parcels
+  display.fillRect(34, 30, 60, 23, C_BLACK);
+  display.drawRect(34, 30, 60, 23, C_WHITE);
+  display.drawLine(34, 30, 25, 21, C_WHITE);       // flaps
+  display.drawLine(93, 30, 102, 21, C_WHITE);
+  // its front slat is the progress bar
+  int w = (int)((f / 2) % 52);
+  display.drawRect(38, 40, 52, 6, C_WHITE);
+  display.fillRect(38, 40, w, 6, C_WHITE);
 }
 
 /* --- trophy ------------------------------------------------- */
@@ -1651,13 +1674,34 @@ void sc_trophy(uint32_t f) {
 
 /* --- goal --------------------------------------------------- */
 void sc_goal(uint32_t f) {
+  uint32_t p = f % 140;                            // 3.5 s: run-up, kick, flight, goal!
+  // the goal on the right; the net bulges when the ball hits it
+  bool hit = p >= 84 && p < 96;
+  display.drawRect(104, 26, 22, 28, C_WHITE);
   for (uint8_t c = 0; c < 4; c++)
-    for (uint8_t r = 0; r < 8; r++)
-      display.drawPixel(100 + c * 6, 16 + r * 5, C_WHITE);
-  display.drawRect(98, 12, 24, 40, C_WHITE);
-  int bx = (int)((f * 3) % 96);
-  display.fillCircle(14 + bx, 36 - (int)(sinf(bx * 0.05f) * 8), 4, C_WHITE);
-  eyes(24, 30, 14, 18, 14, EY_HAPPY, 4);
+    for (uint8_t r = 0; r < 6; r++)
+      display.drawPixel(107 + c * 5 + (hit && r > 1 && r < 5 ? 1 : 0), 29 + r * 4, C_WHITE);
+  display.drawFastHLine(0, 54, 128, C_WHITE);      // the pitch
+
+  // Claude: runs up, kicks, then jumps for joy
+  int cx, cy = 35;
+  if (p < 40)      { cx = 4 + (int)p * 26 / 40; cy = 35 - (int)((f / 4) % 2); }   // running: a little bob
+  else             cx = 30;
+  if (p >= 96)     cy = 35 - (int)(fabsf(sinf((p - 96) * 0.25f)) * 6);
+  claudeFB(cx, cy, false, p >= 40 && p < 48 ? -3 : 0);
+
+  // the ball: waits at the spot, then flies into the net
+  int bx = 62, by = 51;
+  if (p >= 42 && p < 84) {
+    float t = (p - 42) / 42.0f;
+    bx = 62 + (int)(t * 52);
+    by = 51 - (int)(t * 10) - (int)(sinf(t * PI) * 22);
+  } else if (p >= 84) { bx = 117; by = 44; }
+  display.fillCircle(bx, by, 3, C_BLACK);
+  display.drawCircle(bx, by, 3, C_WHITE);
+  display.drawPixel(bx, by, C_WHITE);
+
+  if (p >= 90 && (p / 6) % 2) txt(34, 4, 2, "GOAL!");
 }
 
 /* --- usage -------------------------------------------------- */
@@ -1736,26 +1780,6 @@ void sc_wait(uint32_t f) {
 void sc_paperPlane(uint32_t f) { sc_planeThrow(f); }     // same scene: Claude launches it
 
 /* --- bug squashed ------------------------------------------- */
-void sc_bugSquashed(uint32_t f) {
-  bool dead = (f % 60) > 30;
-  int cx = 56, cy = 36;
-  if (!dead) {
-    display.fillRoundRect(cx - 12, cy - 8, 24, 16, 6, C_WHITE);
-    for (int s = -1; s <= 1; s += 2)
-      for (uint8_t i = 0; i < 3; i++)
-        display.drawLine(cx + s * 11, cy - 4 + i * 5,
-                         cx + s * 18, cy - 8 + i * 7 + (int)wobble(f, 0.4f, 2), C_WHITE);
-    display.drawLine(cx - 4, cy - 8, cx - 8, cy - 15, C_WHITE);
-    display.drawLine(cx + 4, cy - 8, cx + 8, cy - 15, C_WHITE);
-  } else {
-    display.fillRoundRect(cx - 14, cy + 2, 28, 6, 3, C_WHITE);
-    for (uint8_t i = 0; i < 6; i++) {
-      float a = i * 60 * PI / 180.0f;
-      display.drawLine(cx, cy + 4, cx + cosf(a) * 20, cy + 4 + sinf(a) * 8, C_WHITE);
-    }
-  }
-  eyes(104, 26, 10, 14, 10, dead ? EY_HAPPY : EY_NORMAL, 3);
-}
 
 /* --- typing along (shown while YOU type) -------------------- */
 void sc_typingAlong(uint32_t f) {
@@ -2596,6 +2620,19 @@ void mClaude(int x, int y, bool air, bool dead, uint32_t f) {   // 12x10 runner
   display.fillRect(x + 8 - a, y + 6, 2, 4, C_WHITE);
 }
 
+void sc_hello(uint32_t f) {
+  int x = 51, y = 36;
+  claudeFB(x, y, false, 0);
+  display.fillRect(x + 26, y + 4, 5, 5, C_BLACK);          // lift the right arm...
+  float a = -1.1f + sinf(f * 0.3f) * 0.5f;                 // ...and wave it
+  int ex = x + 27 + (int)(cosf(a) * 10), ey = y + 6 + (int)(sinf(a) * 10);
+  for (int o = -1; o <= 1; o++) display.drawLine(x + 26, y + 6 + o, ex, ey + o, C_WHITE);
+  display.drawRoundRect(84, 6, 32, 14, 4, C_WHITE);
+  display.fillTriangle(88, 19, 94, 19, 86, 24, C_WHITE);
+  txt(91, 9, 1, "hi!");
+  for (int xx = 0; xx < 128; xx += 2) display.drawPixel(xx, 56, C_WHITE);
+}
+
 void sc_mario(uint32_t f) {
   static uint32_t enter = 0xFFFFFFFF;
   static bool     restart = false, onGround = false;
@@ -3193,18 +3230,6 @@ void sc_napClaude(uint32_t f) {
 }
 
 /* Claude waving hello */
-void sc_hello(uint32_t f) {
-  int x = 51, y = 36;
-  claudeFB(x, y, false, 0);
-  display.fillRect(x + 26, y + 4, 5, 5, C_BLACK);          // lift the right arm...
-  float a = -1.1f + sinf(f * 0.3f) * 0.5f;                 // ...and wave it
-  int ex = x + 27 + (int)(cosf(a) * 10), ey = y + 6 + (int)(sinf(a) * 10);
-  for (int o = -1; o <= 1; o++) display.drawLine(x + 26, y + 6 + o, ex, ey + o, C_WHITE);
-  display.drawRoundRect(84, 6, 32, 14, 4, C_WHITE);
-  display.fillTriangle(88, 19, 94, 19, 86, 24, C_WHITE);
-  txt(91, 9, 1, "hi!");
-  for (int xx = 0; xx < 128; xx += 2) display.drawPixel(xx, 56, C_WHITE);
-}
 
 /* ============================================================
    LYRICS — Z:<ms>,<line> from the bridge (lrclib.net synced lyrics).
@@ -3238,22 +3263,7 @@ void sc_lyrics(uint32_t f) {
   int t = (int)(now - lyricAt);
   bool noLyrics = !lyricsOn || t > 20000;
   bool gap = !noLyrics && (!lyricText[0] || t > (int)lyricMs + 1500);
-  if (noLyrics || gap) {                          // a break in the singing: Claude grooves
-    bool hit = millis() - beatAt < 120;
-    for (int x = 4; x < 124; x += 3) display.drawPixel(x, 19, C_WHITE);
-    singClaude(64, 18 - (int)(beatGlow * 3), hit);
-    const char* name = musicTitle[0] ? musicTitle : "";
-    int w = (int)strlen(name) * 6;
-    if (w <= 124) txt((SCREEN_WIDTH - w) / 2, 34, 1, name);
-    else {
-      int span = w + 30, off = (int)(f % span);
-      txt(4 - off, 34, 1, name);
-      txt(4 - off + span, 34, 1, name);
-    }
-    for (uint8_t i = 0; i < 3; i++)
-      display.fillCircle(56 + i * 8, 50 - (int)(fabsf(sinf(f * 0.1f + i * 0.9f)) * 3), 1, C_WHITE);
-    return;
-  }
+  if (noLyrics || gap) { sc_player(f); return; }   // a break in the singing: the record player
 
   // word-wrap into up to 3 rows of 21 characters
   char rows[3][22];
@@ -3334,6 +3344,156 @@ void sc_lyrics(uint32_t f) {
 }
 
 /* ============================================================
+   FIXING THE WIRING — small Claude reconnects the database to the
+   server: picks up the loose cable, plugs it in (spark!), data flows,
+   the server's lights settle... until it pops loose again.
+   ============================================================ */
+/* the cable from the database to (ex, ey), sagging a little */
+void cable(int ex, int ey, int sag) {
+  const int sx = 33, sy = 31;
+  int px = sx, py = sy;
+  for (int i = 1; i <= 16; i++) {
+    float t = i / 16.0f;
+    int x = sx + (int)((ex - sx) * t), y = sy + (int)((ey - sy) * t + sag * 4 * t * (1 - t));
+    display.drawLine(px, py, x, y, C_WHITE);
+    px = x; py = y;
+  }
+}
+
+void sc_wiring(uint32_t f) {
+  uint32_t p = f % 240;                            // 6 s
+  const int portX = 97, portY = 29;
+  bool connected = p >= 100 && p < 200;
+
+  // the database: three stacked platters
+  for (int k = 0; k < 3; k++) {
+    int y = 14 + k * 9;
+    display.fillRoundRect(8, y, 24, 10, 4, C_BLACK);
+    display.drawRoundRect(8, y, 24, 10, 4, C_WHITE);
+    display.drawPixel(26, y + 5, C_WHITE);
+  }
+  display.fillRect(31, 29, 3, 4, C_WHITE);         // its port
+
+  // the server rack: three slots with status lights
+  display.drawRect(98, 10, 24, 38, C_WHITE);
+  for (int k = 0; k < 3; k++) {
+    int y = 14 + k * 11;
+    display.drawRect(101, y, 18, 8, C_WHITE);
+    bool on = connected ? ((f / 6 + k) % 3 != 0) : ((f / 4) % 2 == 0);   // busy / alarm
+    if (on) display.fillRect(114, y + 3, 3, 2, C_WHITE);
+    if (connected) display.drawFastHLine(103, y + 3, 2 + (int)((f / 3 + k * 2) % 8), C_WHITE);
+  }
+  display.fillRect(95, portY - 1, 3, 4, C_WHITE);  // its port
+  if (connected && p > 110) {                      // all good
+    display.drawLine(106, 4, 108, 6, C_WHITE); display.drawLine(108, 6, 113, 1, C_WHITE);
+  } else if (!connected && (f / 8) % 2) {
+    txt(108, 1, 1, "!");
+  }
+  display.drawFastHLine(0, 56, 128, C_WHITE);      // the floor
+
+  // Claude: walks over, picks the cable up, plugs it in, cheers, walks back
+  int cx = 36, cy = 37, arm = 0;
+  if (p < 60)        { cx = 36 + (int)p / 3; cy = 37 - (int)((f / 4) % 2); }
+  else if (p < 100)  { cx = 56 + (int)(p - 60) / 7; arm = -3; }
+  else if (p < 200)  { cx = 62; if ((p / 10) % 2) { arm = -3; cy = 35; } }
+  else               { cx = 62 - (int)(p - 200) * 26 / 40; cy = 37 - (int)((f / 4) % 2); }
+  claudeFB(cx, cy, false, arm);
+
+  // the cable's loose end: on the floor, in Claude's hand, or plugged in
+  int hx = cx + 31, hy = cy + 5 + arm;             // Claude's right hand
+  int ex, ey, sag = 6;
+  if (p < 62)        { ex = 84; ey = 53; sag = 10; }
+  else if (p < 70)   { float t = (p - 62) / 8.0f; ex = 84 + (int)((hx - 84) * t); ey = 53 + (int)((hy - 53) * t); }
+  else if (p < 100)  { float t = (p - 70) / 30.0f; ex = hx + (int)((portX - hx) * t); ey = hy + (int)((portY - hy) * t); }
+  else if (p < 200)  { ex = portX - 2; ey = portY; sag = 5; }
+  else               { float t = clamp01((p - 200) / 12.0f);        // pops out and drops
+                       ex = portX - 2 - (int)(t * 11); ey = portY + (int)(t * 24); sag = 10; }
+  cable(ex, ey, sag);
+  display.fillRect(ex - 1, ey - 1, 3, 3, C_WHITE); // the plug
+
+  if ((p >= 100 && p < 110) || (p >= 200 && p < 208)) sparkle(portX - 1, portY, f, 3);   // zap
+  if (connected)                                   // data flowing along the cable
+    for (int i = 0; i < 3; i++) {
+      float t = ((f + i * 9) % 27) / 27.0f;
+      int x = 33 + (int)((ex - 33) * t), y = 31 + (int)((ey - 31) * t + sag * 4 * t * (1 - t));
+      display.fillRect(x - 1, y - 1, 3, 3, C_WHITE);
+    }
+}
+
+/* ============================================================
+   DJ SET — small Claude in headphones on the decks, under a light
+   show: sweeping moving-head spots, a turning fan of lasers, a
+   strobe on the beat, and level bars on the console.
+   ============================================================ */
+void dottedLine(int x0, int y0, int x1, int y1, int step, int phase) {
+  int n = max(abs(x1 - x0), abs(y1 - y0));
+  for (int i = phase % step; i <= n; i += step) {
+    int y = y0 + (y1 - y0) * i / max(n, 1);
+    if (y < 57) display.drawPixel(x0 + (x1 - x0) * i / max(n, 1), y, C_WHITE);   // not below the stage
+  }
+}
+
+void sc_dj(uint32_t f) {
+  uint32_t now = millis();
+  bool hit = now - beatAt < 110;                    // on the beat
+  float lvl = musicSmooth / 99.0f;
+
+  // lasers: a fan shooting up from behind the decks, turning; on with the beat
+  if ((beatAt / 500) % 2 == 0 || hit) {
+    float base = sinf(f * 0.03f) * 0.45f;
+    for (int k = -2; k <= 2; k++) {
+      float a = -PI / 2 + base + k * 0.36f;
+      dottedLine(64, 40, 64 + (int)(cosf(a) * 110), 40 + (int)(sinf(a) * 110), 3, (int)f);
+    }
+  }
+
+  // moving-head spots in the corners, beams sweeping the stage
+  for (int side = 0; side < 2; side++) {
+    int fx = side ? 120 : 7;
+    float sw = sinf(f * 0.045f + side * 2.2f);
+    int tx = 64 + (int)(sw * 44);                  // where the beam lands on the floor
+    display.fillRect(fx - 4, 0, 9, 4, C_WHITE);    // the fixture
+    display.fillRect(fx - 2, 4, 5, 3, C_WHITE);
+    dottedLine(fx, 7, tx - 9, 56, 2, 0);           // the beam's edges
+    dottedLine(fx, 7, tx + 9, 56, 2, 1);
+    for (int y = 14; y < 54; y += 7)               // a little haze inside the beam
+      display.drawPixel(fx + (tx - fx) * (y - 7) / 49 + (int)((f + y) % 5) - 2, y, C_WHITE);
+  }
+
+  // strobe on the beat
+  if (hit) { sparkle(30, 12, f, 3); sparkle(98, 10, f + 5, 3); }
+
+  // Claude behind the decks: headphones on, nodding, scratching
+  int bob = (int)(beatGlow * 2);
+  int cx = 51, cy = 22 + bob;
+  display.fillRect(cx - 6, cy - 3, 38, 18, C_BLACK);   // clear the beams behind it
+  claudeFB(cx, cy, false, ((f / 6) % 2) ? -3 : 0);
+  for (int r = 15; r <= 16; r++) display.drawCircleHelper(64, cy + 6, r, 1 | 2, C_WHITE);   // headband
+  display.fillRoundRect(cx - 5, cy - 1, 5, 9, 2, C_WHITE);    // ear cups
+  display.fillRoundRect(cx + 26, cy - 1, 5, 9, 2, C_WHITE);
+
+  // the console, in front: two turntables on top, level bars on the front
+  display.fillRect(20, 40, 88, 17, C_BLACK);
+  display.drawRect(20, 40, 88, 17, C_WHITE);
+  for (int t = 0; t < 2; t++) {
+    int tx = t ? 82 : 46;
+    display.fillRoundRect(tx - 14, 35, 28, 7, 3, C_BLACK);
+    display.drawRoundRect(tx - 14, 35, 28, 7, 3, C_WHITE);
+    float a = f * 0.25f + t;                       // the platter's mark spins
+    display.drawPixel(tx + (int)(cosf(a) * 10), 38 + (int)(sinf(a) * 2), C_WHITE);
+    display.drawPixel(tx, 38, C_WHITE);
+  }
+  for (int i = 0; i < 12; i++) {
+    float wv = 0.5f + 0.5f * sinf(f * 0.3f + i * 1.3f);
+    int h = 1 + (int)((2 + lvl * 9) * wv);
+    if (h > 12) h = 12;
+    display.fillRect(26 + i * 7, 55 - h, 4, h, C_WHITE);
+  }
+  display.drawFastHLine(0, 57, 128, C_WHITE);       // the stage edge
+}
+
+
+/* ============================================================
    SCENE TABLE
    capStyle: 0 = none, 1 = sparkle + animated dots, 2 = plain centred
    ============================================================ */
@@ -3360,7 +3520,7 @@ const Scene SCENES[] = {
   { NULL,              0, sc_nowPlaying  },   // 17
   { "love",            2, sc_love        },   // 18
   { "petted",          2, sc_petted      },   // 19
-  { "juggling",        0, sc_juggling    },   // 20
+  { NULL,              0, NULL           },   // 20  (removed)
   { "stargazing",      0, sc_stargazing  },   // 21
   { "dreaming",        0, sc_dreaming    },   // 22
   { "low power",       2, sc_sleepy      },   // 23
@@ -3376,14 +3536,14 @@ const Scene SCENES[] = {
   { NULL,              0, sc_branchMerge },   // 33
   { "packages",        2, sc_packages    },   // 34
   { "trophy",          0, sc_trophy      },   // 35
-  { "goal",            2, sc_goal        },   // 36
+  { NULL,              0, sc_goal        },   // 36  penalty kick
   { NULL,              0, sc_usage       },   // 37
   { NULL,              0, sc_limitHit    },   // 38
   { NULL,              0, sc_testFailed  },   // 39
   { NULL,              0, sc_varCheck    },   // 40
   { NULL,              0, sc_wait        },   // 41
   { NULL,              0, sc_paperPlane  },   // 42
-  { "bug squashed",    2, sc_bugSquashed },   // 43
+  { NULL,              0, NULL           },   // 43  (removed)
   { NULL,              0, sc_typingAlong },   // 44
   { "goal",            2, sc_goalCheer   },   // 45
   { "bicycle kick",    2, sc_bicycleKick },   // 46
@@ -3407,6 +3567,8 @@ const Scene SCENES[] = {
   { NULL,              0, sc_player      },   // 64  record player (real music controls)
   { NULL,              0, sc_clock       },   // 65  clock + date
   { NULL,              0, sc_lyrics      },   // 66  karaoke: Claude sings the lyrics
+  { NULL,              0, sc_wiring      },   // 67  Claude fixes the wiring
+  { NULL,              0, sc_dj          },   // 68  DJ set with stage lights
 };
 const uint8_t SCENE_COUNT = sizeof(SCENES) / sizeof(SCENES[0]);
 
@@ -3455,7 +3617,9 @@ void updateBlink() {
    ============================================================ */
 void setScene(uint8_t i) {
   gameMode = false;                    // any scene change leaves the game
-  scene = i % SCENE_COUNT;
+  i %= SCENE_COUNT;
+  for (uint8_t k = 0; k < SCENE_COUNT && !SCENES[i].draw; k++) i = (i + 1) % SCENE_COUNT;   // removed: skip
+  scene = i;
   sceneSince = millis();
   sceneTick0 = tick;
   playLives = -1; playOver = false;
@@ -3467,8 +3631,8 @@ void setScene(uint8_t i) {
    moods, a bit of work, games (and reacts to how they went), naps.
    ============================================================ */
 const uint8_t MOODS[] = { 0, 24, 27, 28, 29, 12, 18, 21, 3, 19, 53, 62, 65, 65 };
-const uint8_t WORKS[] = { 1, 2, 4, 5, 6, 7, 8, 9, 11, 30, 31, 32, 33, 34, 40, 41, 44, 51, 37, 57, 58 };
-const uint8_t PLAYS[] = { 47, 48, 49, 50, 48, 49, 50, 45, 46, 36, 20, 13, 14, 15, 16, 17, 59, 60, 60, 63, 63, 63 };
+const uint8_t WORKS[] = { 1, 2, 4, 5, 6, 7, 8, 9, 11, 30, 31, 32, 33, 34, 40, 41, 44, 51, 37, 57, 58, 67, 67 };
+const uint8_t PLAYS[] = { 47, 48, 49, 50, 48, 49, 50, 45, 46, 36, 13, 14, 15, 16, 17, 59, 60, 60, 63, 63, 63 };
 const uint8_t RESTS[] = { 22, 23, 21, 61, 61 };
 const uint8_t WINS[]  = { 35, 24, 45, 28 };
 const uint8_t LOSES[] = { 26, 25 };
@@ -3476,6 +3640,7 @@ const uint8_t LOSES[] = { 26, 25 };
 /* can this scene be shown right now? without the bridge, the usage, context,
    stats and git screens would only show stale or empty numbers */
 bool sceneOk(uint8_t s) {
+  if (!SCENES[s].draw) return false;                     // removed face
   if (s == 65) return timeKnown;                         // clock: needs the time once
   if (!bridgeUp && (s == 11 || s == 37 || s == 51)) return false;
   if ((s == 32 || s == 57 || s == 58) && !gitKnown) return false;
@@ -3662,7 +3827,7 @@ const Ev EVENTS[] = {
   { "git",     2, { 32, 57 } },          { "test",    1, { 9 } },
   { "need",    1, { 10 } },              { "done",    1, { 35 } },
   { "fail",    2, { 39, 26 } },          { "merge",   2, { 33, 58 } },
-  { "wait",    1, { 41 } },              { "bug",     3, { 43, 45, 46 } }, // tests pass -> celebrate
+  { "wait",    1, { 41 } },              { "bug",     2, { 45, 46 } }, // tests pass -> celebrate
   { "plane",   2, { 42, 59 } },          { "compact", 1, { 11 } },
   { "pkg",     2, { 34, 47 } },          { "key",     1, { 44 } },
   { "goal",    1, { 45 } },              { "kick",    1, { 46 } },
@@ -3866,6 +4031,30 @@ void handleLine(char* line) {
     }
     case 'G': if (atoi(v)) startGame(); else if (gameMode) exitGame(); break;
     case 'I': break;                                  // I:1  heartbeat (handled above)
+    case 'F': {                                       // F:<setting>,<value>  from the settings page
+      char key[8] = "";
+      const char* c = strchr(v, ',');
+      size_t kl = c ? (size_t)(c - v) : strlen(v);
+      if (kl > 7) kl = 7;
+      memcpy(key, v, kl); key[kl] = 0;
+      int val = c ? atoi(c + 1) : -1;
+      if (!strcmp(key, "bri") && val >= 0 && val < BRI_COUNT) {
+        briIndex = val; applyBrightness(); saveSettings();
+      } else if (!strcmp(key, "vol") && val >= 0 && val < VOL_COUNT) {
+        volIndex = val; saveSettings(); sndPreview();
+      } else if (!strcmp(key, "snd") && val >= SND_OFF && val <= SND_ALL) {
+        setSoundMode(val); saveSettings();
+      } else if (!strcmp(key, "face") && val >= 0 && val < SCENE_COUNT && SCENES[val].draw) {
+        setScene(val);                                // hold it like a face you picked by tapping
+        autoCycle = false; manualAt = lastInput = millis(); sceneDur = 20000;
+      } else if (!strcmp(key, "hello")) {
+        lastIntroAt = 0; startIntro();
+      }
+      char b[32];                                     // tell the page what the board has now
+      snprintf(b, sizeof(b), "F:%u,%u,%u,%u,%u", briIndex, BRI_COUNT, volIndex, VOL_COUNT, soundMode);
+      sendToLaptop(b);
+      break;
+    }
     case 'Z': {                                       // Z:<ms>,<lyric line>   "Z:0," = no lyrics
       const char* p = strchr(v, ',');
       int ms = atoi(v);
@@ -4465,7 +4654,7 @@ void startNotify(uint8_t icon, const char* text) {
   ntIcon = icon;
   ntAt = millis() ? millis() : 1;
   int w = (int)strlen(ntText) * 6;
-  ntMs = w <= 112 ? 5000 : 1900 + (uint32_t)(w - 112) * 22 + 1600;
+  ntMs = w <= 140 ? 5000 : 2200 + (uint32_t)(w - 95) * 22 + 1800;
   if (soundOn && !gameMode) { sndPushV(1319, 1319, 60, 25, 40); sndPushV(1047, 1047, 100, 0, 35); }
 }
 
@@ -4473,18 +4662,25 @@ void drawNotify() {
   if (!ntAt) return;
   int t = (int)(millis() - ntAt);
   if (t > (int)ntMs) { ntAt = 0; return; }
-  int slide = t < 160 ? (160 - t) / 14 : t > (int)ntMs - 160 ? (t - ((int)ntMs - 160)) / 14 : 0;
-  int y = 52 + slide;
-  int w = (int)strlen(ntText) * 6;
-  int scroll = t > 900 ? (t - 900) / 22 : 0;
-  if (w > 112 && scroll > w - 112) scroll = w - 112;
-  if (w <= 112) scroll = 0;
-  display.fillRect(0, y, SCREEN_WIDTH, 12, C_BLACK);
-  display.drawFastHLine(0, y, SCREEN_WIDTH, C_WHITE);
-  txt(14 - scroll, y + 3, 1, ntText);
-  display.fillRect(0, y + 1, 12, 11, C_BLACK);
-  display.drawFastVLine(11, y + 2, 9, C_WHITE);
-  notifyIcon(ntIcon, 1, y + 2);
+  // "source: message" -> title + message
+  char title[16];
+  const char* body = ntText;
+  const char* colon = strstr(ntText, ": ");
+  if (colon && colon - ntText <= 15) {
+    int n = (int)(colon - ntText);
+    memcpy(title, ntText, n); title[n] = 0;
+    body = colon + 2;
+  } else {
+    strcpy(title, ntIcon == 1 ? "GitHub" : ntIcon == 2 ? "Message" : ntIcon == 4 ? "Calendar" : "Notification");
+  }
+  int w = (int)strlen(body) * 6, lane = 95, scroll = 0;
+  if (w > lane) {
+    scroll = t > 1300 ? (t - 1300) / 22 : 0;
+    if (scroll > w - lane) scroll = w - lane;
+  }
+  int y = cardY(t, (int)ntMs);
+  drawCard(y, title, body, scroll);
+  notifyIcon(ntIcon, 9, y + 8);
 }
 
 /* ---- to-do strip: one segment per item along the top edge */
@@ -4636,9 +4832,9 @@ void feedChar(uint8_t src, char c) {
     }
   } else if (c >= 'A' && c <= 'Z') {
     inLine[src] = true; lineLen[src] = 0; lineBuf[src][lineLen[src]++] = c;
-  } else {
-    handleKey(c);
-  }
+  } else if (src == 0) {
+    handleKey(c);           // single-key commands: USB serial monitor only. Over Bluetooth a
+  }                         // dropped packet would turn a commit message into commands
 }
 
 void handleSerial() {
@@ -4667,8 +4863,10 @@ void updateLive() {
 
   // mid-turn and no tool running (Claude is thinking / writing): show the spinner
   if (busy && live && !gameMode && !menuOpen && !petting && followStage == 0 &&
-      scene != 54 && scene != 10 && scene != 44 && now - lastToolAt > SPIN_AFTER_MS)
-    setScene(54);
+      scene != 10 && scene != 44 && now - lastToolAt > SPIN_AFTER_MS) {
+    if (scene != 54 && scene != 67) setScene(54);
+    else if (now - sceneSince > 9000) setScene(scene == 54 ? 67 : 54);   // spinner <-> fixing wires
+  }
 
   // while a turn is running, stay synced (no random faces) — up to 15 min of silence
   bool turnAlive = busy && now - lastEvent < 900000UL;
@@ -4734,6 +4932,7 @@ void loop() {
   static bool bleWas = false;              // the laptop linked up / dropped over Bluetooth
   if (bleConnected != bleWas) {
     bleWas = bleConnected;
+    inLine[1] = false; lineLen[1] = 0;     // a new link starts with a clean line
     linkToastUp = bleWas; linkToastAt = millis();
     if (soundOn) {
       sndClear();
@@ -4754,21 +4953,27 @@ void loop() {
   bool musicNow = (musicOn || musicPaused) && !busy && !gameMode && !menuOpen && !petting &&
                   followStage == 0 && scene != 10 &&
                   (manualAt == 0 || millis() - manualAt > RESUME_MS);   // you changed face: leave it
-  // music: the disk and the equalizer take turns; lyrics while a line is being sung
-  bool inMus = scene == 64 || scene == 16 || scene == 66;
+  // music, 12 s per face:
+  //   singing:        lyrics -> disk or equalizer (taking turns) -> lyrics ...
+  //   just the tune:  DJ set -> disk -> equalizer -> DJ set ...
+  static bool eqNext = false;
+  bool inMus = scene == 64 || scene == 16 || scene == 66 || scene == 68;
   uint32_t la = millis() - lyricAt;
   bool lyricsNow = lyricsOn && musicOn && !musicPaused &&
-                   (lyricText[0] ? la < lyricMs + 3000UL : la < 3000UL);   // a long break: disk / eq
+                   lyricText[0] && la < lyricMs + 3000UL;      // a break in the singing: the tune
+  bool due = millis() - sceneSince > 12000UL;
   if (musicNow) {
     musicMode = true;
     if (musicPaused) {                             // paused: keep the player up to resume it
       if (scene != 64) setScene(64);
-    } else if (lyricsNow) {                        // a line is being sung: sing along
-      if (scene != 66) setScene(66);
-    } else if (!inMus || scene == 66) {            // the music starts (or the singing pauses)
-      setScene(64);
-    } else if (millis() - sceneSince > (scene == 64 ? 15000UL : 10000UL)) {
-      setScene(scene == 64 ? 16 : 64);             // disk <-> equalizer
+    } else if (lyricsNow) {
+      if (scene != 66 && scene != 64 && scene != 16) setScene(66);
+      else if (due && scene == 66) { setScene(eqNext ? 16 : 64); eqNext = !eqNext; }   // a break from the words
+      else if (due) setScene(66);                  // back to singing along
+    } else if (!inMus || scene == 66) {            // just the tune: the DJ takes the stage
+      setScene(68);
+    } else if (due) {
+      setScene(scene == 68 ? 64 : scene == 64 ? 16 : 68);   // DJ -> disk -> equalizer -> DJ
     }
   } else if (musicMode && !musicOn && !musicPaused) {   // the music stopped
     musicMode = false;

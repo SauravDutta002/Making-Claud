@@ -96,4 +96,5 @@ EOF
   note "USB on Linux: you may need  sudo usermod -aG dialout \$USER  (then log out and in)"
 fi
 
+done_ "settings: http://localhost:47801  (or run: claude-buddy-settings)"
 printf '\n  \033[38;5;209mAll set. Restart Claude Code and watch the screen.\033[0m\n\n'

@@ -78,9 +78,12 @@ function Install-ClaudeBuddy {
         $lnk.WindowStyle = $(if ($place -like "*Startup*") { 7 } else { 1 })   # minimized at login
         $lnk.Save()
     }
+    $url = Join-Path ([Environment]::GetFolderPath("Programs")) "Claude Buddy Settings.url"
+    Set-Content -Path $url -Value "[InternetShortcut]`r`nURL=http://localhost:47801/`r`n" -Encoding ASCII
     Start-Process -FilePath $exe
     Done "the bridge is running (its window shows the live dashboard)"
     Done "it starts by itself when you log in - or run: claude-buddy"
+    Done "settings: http://localhost:47801  (Start menu > Claude Buddy Settings)"
 
     Write-Host ""
     Write-Host "  All set. Restart Claude Code and watch the screen." -ForegroundColor DarkYellow
