@@ -295,7 +295,7 @@ uint32_t menuSince  = 0;
    TOUCH SENSOR STATE
    ============================================================ */
 #define TOUCH_PIN      3
-#define PET_HOLD_MS    250
+#define PET_HOLD_MS    650       // a deliberate hold, not a brush of the finger
 #define TAP_WINDOW_MS  320
 #define DEBOUNCE_MS    30
 
@@ -309,6 +309,7 @@ uint8_t  tapCount     = 0;
 uint32_t lastTap      = 0;
 bool     touchPressed  = false;   // finger-down edge, consumed by the game
 bool     touchReleased = false;   // finger-up edge, consumed by the game
+bool     touchBusy     = false;   // this touch began in a game / menu / intro: it never pets
 
 /* ============================================================
    BLUETOOTH LE  — a wireless "serial cable" (Nordic UART service)
@@ -1461,19 +1462,31 @@ void sc_love(uint32_t f) {
 
 /* --- petted (> <) ------------------------------------------- */
 void sc_petted(uint32_t f) {
-  int dy = (int)wobble(f, 0.15f, 2);
-  chevronEyes(64, 26 + dy, 22, true);
+  int sway = (int)wobble(f, 0.12f, 4);             // leaning into the hand
+  int dy = (int)fabsf(wobble(f, 0.24f, 3));        // a happy squish with each stroke
+  chevronEyes(64 + sway, 27 + dy, 22, true);
 
   // blush
   for (uint8_t i = 0; i < 3; i++) {
-    display.drawLine(30 + i * 4, 45 + dy, 32 + i * 4, 42 + dy, C_WHITE);
-    display.drawLine(88 + i * 4, 45 + dy, 90 + i * 4, 42 + dy, C_WHITE);
+    display.drawLine(30 + sway + i * 4, 45 + dy, 32 + sway + i * 4, 42 + dy, C_WHITE);
+    display.drawLine(88 + sway + i * 4, 45 + dy, 90 + sway + i * 4, 42 + dy, C_WHITE);
   }
   // little "w" mouth
-  display.drawLine(58, 42 + dy, 61, 46 + dy, C_WHITE);
-  display.drawLine(61, 46 + dy, 64, 43 + dy, C_WHITE);
-  display.drawLine(64, 43 + dy, 67, 46 + dy, C_WHITE);
-  display.drawLine(67, 46 + dy, 70, 42 + dy, C_WHITE);
+  int mx = 58 + sway;
+  display.drawLine(mx, 42 + dy, mx + 3, 46 + dy, C_WHITE);
+  display.drawLine(mx + 3, 46 + dy, mx + 6, 43 + dy, C_WHITE);
+  display.drawLine(mx + 6, 43 + dy, mx + 9, 46 + dy, C_WHITE);
+  display.drawLine(mx + 9, 46 + dy, mx + 12, 42 + dy, C_WHITE);
+
+  // the stroke: a soft swish moving over the top of the head
+  int hx = 64 + (int)wobble(f, 0.12f, 26);
+  for (int k = 0; k < 3; k++) display.drawFastHLine(hx - 9 + k * 3, 3 + k * 2, 18 - k * 6, C_WHITE);
+
+  // purring: little wiggles beside the eyes
+  if ((f / 4) % 2) {
+    display.drawLine(21, 22, 24, 25, C_WHITE); display.drawLine(24, 25, 21, 28, C_WHITE);
+    display.drawLine(107, 22, 104, 25, C_WHITE); display.drawLine(104, 25, 107, 28, C_WHITE);
+  }
 
   // hearts drifting up both sides
   for (uint8_t i = 0; i < 2; i++) {
@@ -3707,6 +3720,7 @@ void startGame() {
 
 void exitGame() {
   gameMode = false;
+  if (touchState) holdConsumed = true;   // the hold that left the game isn't a pet
   sceneSince = millis();
   Serial.println("game exit");
 }
@@ -4749,6 +4763,7 @@ void handleTouch() {
       touchDown = now;
       touchPressed = true;
       lastInput = now;
+      touchBusy = gameMode || menuOpen || introAt || moAt;
     } else {                           // finger up
       touchReleased = true;
       if (gameMode)          { }       // the game reads the edges itself
@@ -4761,7 +4776,8 @@ void handleTouch() {
 
   // hold threshold passed
   uint32_t holdMs = menuOpen ? MENU_HOLD_MS : PET_HOLD_MS;
-  if (touchState && !gameMode && !petting && !holdConsumed && now - touchDown > holdMs) {
+  if (touchState && !gameMode && !petting && !holdConsumed && now - touchDown > holdMs &&
+      (menuOpen || !touchBusy)) {
     if (menuOpen) { menuHold(); holdConsumed = true; }
     else {
       petting = true; tapCount = 0; sndPetStart();
