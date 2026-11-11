@@ -1341,6 +1341,8 @@ def say(msg, kind="info"):
         UI.log(msg, kind)
     else:
         print(msg)
+        if UI is not None:                    # still kept for the settings page's activity list
+            UI.events.append((time.strftime("%H:%M:%S"), kind, str(msg)))
 
 
 def paint(code, s):

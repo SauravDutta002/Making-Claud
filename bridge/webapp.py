@@ -2,10 +2,15 @@
 webapp.py - the Claude Buddy settings page, served by the bridge.
 
 While the bridge runs, open http://localhost:47801 (or run `claude-buddy-settings`).
+The page itself is a React app (frontend/), built into bridge/web/.
+
 Only this computer can reach it: the server listens on 127.0.0.1, refuses
-other host names, and every API call needs a token that only the page knows.
+other host names (so other websites can't reach it through DNS tricks), and
+every API call needs a per-run token. A page from another site can't read
+that token, because browsers don't let one site read another site's replies.
 """
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -15,9 +20,12 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+WEB = os.path.join(HERE, "web")
 PORT = 47801
 URL = f"http://localhost:{PORT}"
 LINE_RE = re.compile(r"^[EFGHNOV]:[\x20-\x7e]{0,70}$")   # what the page may send to the board
+TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html", ".svg": "image/svg+xml",
+         ".woff2": "font/woff2", ".woff": "font/woff", ".png": "image/png", ".ico": "image/x-icon"}
 
 
 class WebApp:
@@ -28,8 +36,6 @@ class WebApp:
         self.outbox = queue.Queue()           # lines for the board
         self.changes = queue.Queue()          # settings changes {key: value}
         self.ok, self.err = False, ""
-        with open(os.path.join(HERE, "web", "settings.html"), encoding="utf-8") as f:
-            self.page = f.read()
         app = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -43,7 +49,7 @@ class WebApp:
             def _send(self, code, body, ctype="application/json"):
                 data = body.encode("utf-8") if isinstance(body, str) else body
                 self.send_response(code)
-                self.send_header("Content-Type", ctype + "; charset=utf-8")
+                self.send_header("Content-Type", ctype + ("; charset=utf-8" if ctype.startswith(("text", "application/json")) else ""))
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
@@ -54,16 +60,30 @@ class WebApp:
             def _authorized(self):
                 return self._local() and secrets.compare_digest(self.headers.get("X-Buddy-Token") or "", app.token)
 
+            def _file(self, path):
+                """A file of the built page, never anything outside bridge/web/."""
+                rel = path.split("?", 1)[0].lstrip("/") or "index.html"
+                full = os.path.realpath(os.path.join(WEB, rel))
+                if not full.startswith(os.path.realpath(WEB) + os.sep) or not os.path.isfile(full):
+                    return False
+                ext = os.path.splitext(full)[1].lower()
+                ctype = TYPES.get(ext) or mimetypes.guess_type(full)[0] or "application/octet-stream"
+                with open(full, "rb") as f:
+                    self._send(200, f.read(), ctype)
+                return True
+
             def do_GET(self):
                 if not self._local():
                     return self._send(403, '{"error":"open it as localhost"}')
-                if self.path in ("/", "/index.html"):
-                    return self._send(200, app.page.replace("__TOKEN__", app.token), "text/html")
-                if self.path == "/api/state":
+                if self.path.startswith("/api/token"):
+                    return self._send(200, json.dumps({"token": app.token}))
+                if self.path.startswith("/api/state"):
                     if not self._authorized():
                         return self._send(403, '{"error":"reload the page"}')
                     return self._send(200, json.dumps(app.state))
-                return self._send(404, '{"error":"not found"}')
+                if not self._file(self.path):
+                    if not self._file("/index.html"):
+                        return self._send(404, "The settings page isn't built. Run: cd frontend && npm run build", "text/plain")
 
             def do_POST(self):
                 if not self._authorized():

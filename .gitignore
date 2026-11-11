@@ -9,3 +9,6 @@ bridge/stats.json
 bridge/repos.json
 bridge/config.json
 bridge/progress.json
+
+# the settings page's build tools (the built page is in bridge/web/)
+frontend/node_modules/

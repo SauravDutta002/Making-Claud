@@ -39,4 +39,4 @@ package-dir = { "claude_buddy" = "bridge" }
 packages = ["claude_buddy"]
 
 [tool.setuptools.package-data]
-claude_buddy = ["firmware/*.bin", "web/*.html"]
+claude_buddy = ["firmware/*.bin", "web/*.html", "web/assets/*"]

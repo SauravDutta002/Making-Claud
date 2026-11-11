@@ -3507,6 +3507,82 @@ void sc_dj(uint32_t f) {
 
 
 /* ============================================================
+   NIGHT SKY — small Claude stargazing: twinkling stars, two dithered
+   clouds drifting, a crescent moon, and now and then a shooting star
+   that makes Claude hop.
+   ============================================================ */
+void ditherBox(int x, int y, int w, int h, int phase) {      // a checkerboard grey
+  for (int py = y; py < y + h; py++)
+    for (int px = x; px < x + w; px++)
+      if (((px + py + phase) & 1) == 0) display.drawPixel(px, py, C_WHITE);
+}
+
+void nightCloud(int x, int y, int s) {                        // three stacked tiers, like pixel art
+  ditherBox(x + 6 * s, y, 8 * s, 2 * s, 0);
+  ditherBox(x + 2 * s, y + 2 * s, 16 * s, 2 * s, 0);
+  ditherBox(x, y + 4 * s, 22 * s, 2 * s, 0);
+}
+
+void sc_night(uint32_t f) {
+  uint32_t t = millis();
+
+  // stars: some steady, some twinkling
+  static const int8_t ST[][2] = { { 20, 8 }, { 52, 4 }, { 74, 12 }, { 10, 30 }, { 44, 26 }, { 64, 40 },
+                                  { 116, 6 }, { 120, 34 }, { 86, 46 }, { 30, 48 }, { 104, 52 }, { 58, 16 } };
+  for (uint8_t i = 0; i < 12; i++) {
+    uint32_t ph = (t / 90 + i * 37) % 60;
+    if (ph < 4) continue;                                     // a blink
+    if (i % 3 == 0 && ph < 14) {                              // a bright twinkle
+      display.drawFastHLine(ST[i][0] - 1, ST[i][1], 3, C_WHITE);
+      display.drawFastVLine(ST[i][0], ST[i][1] - 1, 3, C_WHITE);
+    } else {
+      display.drawPixel(ST[i][0], ST[i][1], C_WHITE);
+    }
+  }
+
+  // the moon: a crescent, its inner edge dithered
+  const int mx = 98, my = 20;
+  display.fillCircle(mx, my, 12, C_WHITE);
+  display.fillCircle(mx + 6, my - 3, 11, C_BLACK);
+  for (int a = 0; a < 40; a++) {                              // soft shading along the inside
+    float ang = 1.6f + a * 0.08f;
+    int x = mx + 6 + (int)(cosf(ang) * 12), y = my - 3 + (int)(sinf(ang) * 12);
+    if (a % 2 == 0) display.drawPixel(x, y, C_BLACK);
+  }
+
+  // clouds drifting slowly, in opposite directions
+  int c1 = (int)((t / 70) % 190) - 50, c2 = 150 - (int)((t / 110) % 210);
+  nightCloud(c1, 16, 2);
+  nightCloud(c2, 36, 2);
+
+  // a shooting star every ~8 s
+  uint32_t sh = t % 8000;
+  bool shooting = sh < 600;
+  if (shooting) {
+    int sx = 120 - (int)(sh * 0.18f), sy = 4 + (int)(sh * 0.05f);
+    for (int k = 0; k < 10; k++) if (k % 2 == 0 || k < 3) display.drawPixel(sx + k, sy - k / 3, C_WHITE);
+    display.fillRect(sx - 1, sy, 2, 2, C_WHITE);
+  }
+
+  // the ground
+  for (int x = 0; x < SCREEN_WIDTH; x += 2) display.drawPixel(x, 63, C_WHITE);
+
+  // small Claude: breathing, blinking, looking up, hopping at a shooting star
+  int hop = 0;
+  if (sh >= 300 && sh < 900) hop = (int)(sinf((sh - 300) / 600.0f * PI) * 6);
+  int cx = 20, cy = 44 - hop - (int)((t / 900) % 2);
+  claudeFB(cx, cy, false, hop ? -3 : 0);
+  bool lookUp = (t % 6000) > 3500 || (sh >= 300 && sh < 1500);
+  bool blink = (t % 4300) < 140;
+  for (int ex : { cx + 6, cx + 18 }) {
+    display.fillRect(ex, cy + 2, 2, 5, C_WHITE);             // redraw the eyes
+    if (blink)       display.fillRect(ex, cy + 5, 2, 1, C_BLACK);
+    else if (lookUp) display.fillRect(ex, cy + 2, 2, 3, C_BLACK);
+    else             display.fillRect(ex, cy + 3, 2, 4, C_BLACK);
+  }
+}
+
+/* ============================================================
    SCENE TABLE
    capStyle: 0 = none, 1 = sparkle + animated dots, 2 = plain centred
    ============================================================ */
@@ -3582,6 +3658,7 @@ const Scene SCENES[] = {
   { NULL,              0, sc_lyrics      },   // 66  karaoke: Claude sings the lyrics
   { NULL,              0, sc_wiring      },   // 67  Claude fixes the wiring
   { NULL,              0, sc_dj          },   // 68  DJ set with stage lights
+  { NULL,              0, sc_night       },   // 69  night sky: stargazing, shooting star
 };
 const uint8_t SCENE_COUNT = sizeof(SCENES) / sizeof(SCENES[0]);
 
@@ -3646,7 +3723,7 @@ void setScene(uint8_t i) {
 const uint8_t MOODS[] = { 0, 24, 27, 28, 29, 12, 18, 21, 3, 19, 53, 62, 65, 65 };
 const uint8_t WORKS[] = { 1, 2, 4, 5, 6, 7, 8, 9, 11, 30, 31, 32, 33, 34, 40, 41, 44, 51, 37, 57, 58, 67, 67 };
 const uint8_t PLAYS[] = { 47, 48, 49, 50, 48, 49, 50, 45, 46, 36, 13, 14, 15, 16, 17, 59, 60, 60, 63, 63, 63 };
-const uint8_t RESTS[] = { 22, 23, 21, 61, 61 };
+const uint8_t RESTS[] = { 22, 23, 21, 61, 61, 69, 69 };
 const uint8_t WINS[]  = { 35, 24, 45, 28 };
 const uint8_t LOSES[] = { 26, 25 };
 

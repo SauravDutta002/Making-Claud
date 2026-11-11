@@ -1,0 +1,23 @@
+{
+  "name": "claude-buddy-settings",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "The Claude Buddy settings page. Built into bridge/web/ and served by the bridge at http://localhost:47801.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource/anton": "5.0.8",
+    "@fontsource/dm-sans": "5.0.21",
+    "@fontsource/silkscreen": "5.0.12",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "4.3.3",
+    "vite": "5.4.10"
+  }
+}
