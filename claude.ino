@@ -77,7 +77,7 @@
    ("Claude Buddy", Nordic UART service), so it only needs USB for power.
    0 = USB cable only. */
 #define USE_BLE 1
-#define FW_VERSION "1.1.0"      // reported to the laptop, which offers updates when a newer one ships
+#define FW_VERSION "1.1.1"      // reported to the laptop, which offers updates when a newer one ships
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -1481,26 +1481,34 @@ void sc_coffee(uint32_t f) {
     if (p < 40 && q >= 18 && q < 26) h = 3 + abs((int)q - 22) * 5;   // a blink
     else if (p >= 46 && p < 52) h = 26 - (int)(p - 46) * 23 / 6;
     else if (p >= 52 && p < 96) h = 3;
-    display.fillRoundRect(lx - 9, EY - h / 2, 18, h, h > 6 ? 4 : 1, C_WHITE);
-    display.fillRoundRect(rx - 9, EY - h / 2, 18, h, h > 6 ? 4 : 1, C_WHITE);
+    display.fillRect(lx - 9, EY - h / 2, 18, h, C_WHITE);       // square corners, like Idle's eyes
+    display.fillRect(rx - 9, EY - h / 2, 18, h, C_WHITE);
   }
 
-  // the mug: rounded, a handle, a "v" on the front
-  display.fillRoundRect(mx - 14, top, 28, 18, 3, C_WHITE);
-  display.fillCircle(mx + 17, top + 8, 5, C_WHITE);
-  display.fillCircle(mx + 17, top + 8, 2, C_BLACK);
+  // the mug: square body, square handle, a "v" on the front
+  display.fillRect(mx - 14, top, 28, 18, C_WHITE);
+  display.fillRect(mx + 14, top + 3, 7, 12, C_WHITE);
+  display.fillRect(mx + 14, top + 6, 4, 6, C_BLACK);
   for (int i = 0; i < 4; i++) {
     display.drawPixel(mx - 3 + i, top + 6 + i, C_BLACK); display.drawPixel(mx - 4 + i, top + 6 + i, C_BLACK);
     display.drawPixel(mx + 3 - i, top + 6 + i, C_BLACK); display.drawPixel(mx + 4 - i, top + 6 + i, C_BLACK);
   }
 
-  // steam: two wisps winding round each other (not while it's at Claude's mouth)
+  // steam: two smooth wisps curling up from the mug, widening as they rise and
+  // breaking into puffs that drift upward (not while it's at Claude's mouth)
   if (lift == 0)
-    for (int y = 0; y < 16; y++) {
-      if ((y + (int)(f / 3)) % 18 >= 14) continue;       // they rise and break up
-      int w = (int)(sinf(y * 0.42f + f * 0.15f) * 3.5f);
-      display.drawPixel(mx + w, top - 3 - y, C_WHITE); display.drawPixel(mx + w + 1, top - 3 - y, C_WHITE);
-      display.drawPixel(mx - w, top - 3 - y, C_WHITE); display.drawPixel(mx - w - 1, top - 3 - y, C_WHITE);
+    for (int k = 0; k < 2; k++) {
+      int px = 0, py = 0;
+      bool pen = false;
+      for (int y = 0; y < 17; y++) {
+        bool on = ((y + (int)(f / 4) + k * 5) % 9) < 6;           // gaps rise with the steam
+        float amp = 1.0f + y * 0.16f;                               // wider near the top
+        int x = mx - 6 + k * 11 + (int)lroundf(sinf(y * 0.34f - f * 0.12f + k * 2.6f) * amp);
+        int yy = top - 3 - y;
+        if (on && pen) { display.drawLine(px, py, x, yy, C_WHITE); display.drawLine(px + 1, py, x + 1, yy, C_WHITE); }
+        else if (on)   display.fillRect(x, yy, 2, 1, C_WHITE);       // 2 px thick: soft, not scratchy
+        px = x; py = yy; pen = on;
+      }
     }
 }
 

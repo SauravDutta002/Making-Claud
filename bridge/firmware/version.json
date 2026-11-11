@@ -1,9 +1,9 @@
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "files": {
     "bootloader.bin": "3494404029d3ed3516741c894f6c45e1ba41d7abdce3e41cd7b5b9f120c7354d",
     "partitions.bin": "148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1",
     "boot_app0.bin": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0",
-    "claude-buddy.bin": "65238545ec7e2f93cdb1df24801b7f04d9a7b026e06088839ee90eb9f8122f6b"
+    "claude-buddy.bin": "667562a954b1687a02d3ebad25197bdbfc45ff5bff4c43182c0f269987f152c7"
   }
 }
