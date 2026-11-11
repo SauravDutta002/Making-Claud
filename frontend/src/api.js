@@ -34,7 +34,9 @@ async function call(path, body) {
 
 /** Send one line to the board (see the protocol at the top of claude.ino). */
 export const sendLine = (line) => call("api/board", { line }).catch(() => {});
-/** Change settings: { lyrics: false }, { lyrics_offset: 0.4 } ... */
+/** Put the newest firmware on the board (over USB; progress shows in the state). */
+export const flashFirmware = () => call("api/firmware", { action: "flash" }).catch(() => {});
+/** Change settings: { lyrics: false }, { lyrics_offset: 0.4 }, { link: "ble" } ... */
 export const saveSettings = (change) => call("api/settings", change).catch(() => {});
 
 /** The bridge's live state, refreshed every second. null while it isn't answering. */

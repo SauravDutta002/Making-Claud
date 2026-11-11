@@ -9,7 +9,10 @@ Adafruit GFX + Adafruit SH110X libraries installed.
 """
 import argparse
 import glob
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -61,7 +64,17 @@ def main():
                                          "partitions", "boot_app0.bin")))
     if boot:
         shutil.copy(boot[-1], os.path.join(OUT, "boot_app0.bin"))
-    print(f"firmware ready in {OUT}")
+    # what the bridge compares with the board's own version (and checks downloads against)
+    ino = open(os.path.join(ROOT, "claude.ino"), encoding="utf-8").read()
+    ver = re.search(r'#define FW_VERSION "([^"]+)"', ino).group(1)
+    files = {}
+    for name in ("bootloader.bin", "partitions.bin", "boot_app0.bin", "claude-buddy.bin"):
+        with open(os.path.join(OUT, name), "rb") as f:
+            files[name] = hashlib.sha256(f.read()).hexdigest()
+    with open(os.path.join(OUT, "version.json"), "w", encoding="utf-8") as f:
+        json.dump({"version": ver, "files": files}, f, indent=2)
+        f.write("\n")
+    print(f"firmware {ver} ready in {OUT}")
 
     if a.upload:
         run([cli, "upload", "--fqbn", FQBN, "--input-dir", build, "-p", a.upload, sketch])

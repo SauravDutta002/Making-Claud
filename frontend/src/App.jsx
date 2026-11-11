@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { useBridge, sendLine, saveSettings, HOSTED } from "./api.js";
+import { useBridge, sendLine, saveSettings, flashFirmware, HOSTED } from "./api.js";
 import { useDevice, canUsb, canBle } from "./device.js";
 import Oled, { Thumb } from "./Oled.jsx";
 
@@ -132,7 +132,7 @@ function Row({ label, hint, children }) {
 const TABS = [
   ["overview", "Overview", false],
   ["screen", "Screen & sound", false],
-  ["reactions", "Reactions", true],      // true: needs the helper (bridge)
+  ["reactions", "Reactions", true],      // true: needs Claude Buddy running on this computer
   ["music", "Music", true],
   ["alerts", "Alerts", true],
   ["setup", "Install & uninstall", false],
@@ -154,7 +154,7 @@ const TRIES = [
   ["Badge", "V:0,Test badge"],
 ];
 
-// faces you can pick when talking to the board directly (the helper sends its own list)
+// faces you can pick when talking to the board directly (Claude Buddy sends its own list)
 const FACES = [
   [0, "Idle"], [3, "Bright idea"], [12, "Coffee"], [13, "Music"], [14, "Headbang"], [15, "Dance"],
   [16, "Equalizer"], [18, "Love"], [19, "Petted"], [21, "Stargazing"], [22, "Dreaming"], [24, "Feeling great"],
@@ -182,7 +182,7 @@ function Copy({ text }) {
 
 function Install({ n = "02", title = "Make it react to Claude Code" }) {
   return (
-    <Panel n={n} title={title} hint="One line installs the small Claude Buddy helper. It passes Claude Code's activity to the board, and this page finds it by itself.">
+    <Panel n={n} title={title} hint="One line installs Claude Buddy on this computer. It passes Claude Code's activity to the board, starts by itself at every login, and this page finds it by itself.">
       {INSTALL.map(([os, app, cmd]) => (
         <div className="cmd" key={os}>
           <span className="label">{os} <em>{app}</em></span>
@@ -337,7 +337,7 @@ function Alerts({ s }) {
   );
 }
 
-/* everything about getting the helper on (and off) a computer */
+/* everything about getting Claude Buddy on (and off) a computer */
 const RAW = "https://raw.githubusercontent.com/SauravDutta002/Making-Claud/main/";
 const SETUP = {
   win: { name: "Windows", app: "PowerShell", open: "Start menu → type PowerShell → Enter",
@@ -347,15 +347,16 @@ const SETUP = {
 };
 const STEPS = [
   ["Installs uv", "It brings its own Python, so you don't need Python already."],
-  ["Installs the Claude Buddy helper", "The claude-buddy commands listed below."],
+  ["Installs Claude Buddy", "The claude-buddy commands listed below."],
   ["Connects Claude Code", "Adds hooks and a status line to ~/.claude/settings.json, after backing up the old file."],
   ["Offers a firmware update", "Only if the board is plugged in over USB. Say yes the first time."],
-  ["Starts the helper", "Right away, and at every login from then on."],
+  ["Starts Claude Buddy", "In the background, right away and at every login. No window to keep open, and it restarts itself if it ever stops."],
 ];
 const COMMANDS = [
-  ["claude-buddy", "Starts the helper (it already starts at login)"],
+  ["claude-buddy-service", "Starts Claude Buddy in the background (it already starts at login)"],
+  ["claude-buddy", "The live dashboard in a terminal, instead of the background one"],
   ["claude-buddy-settings", "Opens this page"],
-  ["claude-buddy-flash", "Puts the latest firmware on a board plugged in over USB (close the helper first)"],
+  ["claude-buddy-flash", "Puts the latest firmware on a board plugged in over USB (the Update firmware button on this page does the same)"],
   ["claude-buddy-setup", "Connects Claude Code again, e.g. after you reset its settings"],
   ["claude-buddy-setup --remove", "Disconnects Claude Code, keeps everything else"],
 ];
@@ -383,10 +384,10 @@ function Setup() {
         <p className="callout">When it finishes, <strong>restart Claude Code</strong> (close and reopen any open sessions). Then plug the board in, or switch it on for Bluetooth.</p>
       </Panel>
       <Panel n="02" title="Connect the board">
-        <Row label="USB" hint="Plug it into the computer. The helper finds it by itself." />
-        <Row label="Bluetooth" hint={`Power it from anywhere. The helper finds "Claude Buddy" and reconnects if the link drops. Don't pair it in your system's Bluetooth settings.`} />
+        <Row label="USB" hint="Plug it into the computer. Claude Buddy finds it by itself." />
+        <Row label="Bluetooth" hint={`Power it from anywhere. Claude Buddy finds it and reconnects if the link drops. Don't pair it in your system's Bluetooth settings.`} />
       </Panel>
-      <Panel n="03" title="Update" hint="Run the install command again. It updates the helper and keeps your stats, streaks and settings, and offers new firmware if the board is plugged in.">
+      <Panel n="03" title="Update" hint="Run the install command again. It updates Claude Buddy and keeps your stats, streaks and settings. New board firmware then shows up on this page, with an Update button.">
         <Cmd text={o.install} />
       </Panel>
       <Panel n="04" title="Commands" hint="Type these in a terminal once Claude Buddy is installed.">
@@ -403,6 +404,66 @@ function Setup() {
       </Panel>
     </>
   );
+}
+
+/* how Claude Buddy reaches the board, and which firmware the board runs */
+function Connection({ s }) {
+  const locked = s.locked.includes("link");
+  const mode = s.linkMode || "auto";
+  const fw = s.firmware || {};
+  return (
+    <Panel n="01" title="Connection" hint={locked ? "Set by a command-line option." : "Claude Buddy connects by itself, at every login, and reconnects if the link drops."}>
+      <Row label="Connect over" hint={{ auto: "USB when the cable is plugged in, Bluetooth otherwise. Plug the cable in and it switches over.",
+        usb: "Only over the USB cable.", ble: "Only over Bluetooth, even with the cable plugged in." }[mode]}>
+        <div className="seg" role="group" aria-label="Connect over">
+          {[["auto", "Automatic"], ["usb", "USB"], ["ble", "Bluetooth"]].map(([k, n]) => (
+            <button key={k} disabled={locked} aria-pressed={mode === k} onClick={() => saveSettings({ link: k })}>{n}</button>
+          ))}
+        </div>
+      </Row>
+      <Row label="Firmware" hint={fw.board == null ? "Connect the board to see its version."
+        : fw.update ? `Version ${fw.latest} is ready to install.` : "Up to date."}>
+        <span className="mono">{fw.board == null ? "–" : fw.board || "older"}{fw.latest && fw.board !== fw.latest ? ` → ${fw.latest}` : ""}</span>
+      </Row>
+    </Panel>
+  );
+}
+
+/* new firmware: a banner on every tab, the button, then the progress */
+function FirmwareBar({ s }) {
+  const fw = s.firmware || {};
+  const usb = s.link === "usb";
+  if (fw.state === "flashing")
+    return (
+      <div className="fwbar busy" role="status">
+        <div><strong>Updating the firmware…</strong><small>Keep the cable plugged in. The board restarts when it's done.</small></div>
+        <div className="fwprog"><div className="meter"><i style={{ width: (fw.pct || 0) + "%" }} /></div><span>{fw.pct || 0}%</span></div>
+      </div>
+    );
+  if (fw.state === "error" && fw.msg)
+    return <div className="fwbar err" role="alert"><div><strong>Firmware not updated</strong><small>{fw.msg}</small></div>
+      {fw.update && <button className="btn primary" disabled={!usb} onClick={flashFirmware}>Try again</button>}</div>;
+  if (!fw.update) return null;
+  return (
+    <div className="fwbar">
+      <div>
+        <strong>New firmware for your buddy: {fw.latest}</strong>
+        <small>{usb ? `It's on ${fw.board || "an older version"}. Takes about 20 seconds.` : "Connect the board with a USB cable to update it (Bluetooth can't flash)."}</small>
+      </div>
+      <button className="btn primary" disabled={!usb} onClick={flashFirmware}>Update firmware</button>
+    </div>
+  );
+}
+
+/* little notes in the corner: connected, disconnected, updated */
+function useToasts() {
+  const [list, setList] = useState([]);
+  const push = (text, kind = "ok") => {
+    const id = Date.now() + Math.random();
+    setList((l) => [...l.slice(-2), { id, text, kind }]);
+    setTimeout(() => setList((l) => l.filter((t) => t.id !== id)), 3800);
+  };
+  return [list, push];
 }
 
 /* the browser's "install this app" offer */
@@ -451,10 +512,11 @@ export default function App() {
   const tab = useTab();
   const install = useInstall();
   const [theme, flipTheme] = useTheme();
+  const [toasts, toast] = useToasts();
 
-  // one way to reach the board, whichever is there: the helper, or a direct link
+  // one way to reach the board, whichever is there: Claude Buddy on this computer, or a direct link
   const ctl = bridge
-    ? { via: "bridge", linked: s.link === "usb" || s.link === "ble", board: s.board, send: sendLine }
+    ? { via: "bridge", linked: s.link === "usb" || s.link === "ble", board: s.board, send: sendLine }   // tabs show even while it's away
     : dev.link ? { via: dev.link.kind, linked: true, board: dev.cfg, send: dev.send } : null;
   const linked = !!ctl && ctl.linked;
   const [pick, setPick] = useState(null);          // a face picked on the Screen tab, previewed on the stage
@@ -463,27 +525,51 @@ export default function App() {
   const tabs = TABS.filter(([, , needsBridge]) => !needsBridge || bridge);
   const shown = tabs.some(([id]) => id === tab) ? tab : "overview";
   const face = shown === "screen" && pick != null ? pick : bridge && s.music && s.music.state === 1 ? 70 : 69;
+  const flashing = bridge && s.link === "flash";
+
+  // "connected" / "disconnected" as it happens (and when the page first finds it)
+  const linkKey = linked ? (ctl.via === "bridge" ? s.link + (s.port || "") : ctl.via) : flashing ? "flash" : "";
+  const prevLink = useRef(null);
+  useEffect(() => {
+    const was = prevLink.current;
+    prevLink.current = linkKey;
+    if (linkKey === was || linkKey === "flash") return;
+    if (linkKey) {
+      const how = ctl.via === "bridge" ? (s.link === "usb" ? `over USB (${s.port})` : "over Bluetooth") : `over ${ctl.via === "usb" ? "USB" : "Bluetooth"}`;
+      toast(`Connected ${how}`);
+    } else if (was && was !== "flash") toast("Disconnected - looking for it…", "warn");
+  }, [linkKey]);
+  const fwState = bridge && s.firmware ? s.firmware.state : "";
+  const prevFw = useRef(fwState);
+  useEffect(() => {
+    if (prevFw.current === "flashing" && fwState === "done") toast(s.firmware.msg || "Firmware updated");
+    prevFw.current = fwState;
+  }, [fwState]);
 
   // what the stage says
   let status, title, sub;
-  if (ctl && ctl.via === "bridge") {
+  if (flashing) {
+    status = "wait"; title = "Updating…";
+    sub = `Putting new firmware on the board: ${s.firmware.pct || 0}%. Keep the cable plugged in.`;
+  } else if (ctl && ctl.via === "bridge") {
     status = linked ? "ok" : "wait";
     title = linked ? "Connected" : "Looking for it…";
-    sub = s.link === "usb" ? `Over USB on ${s.port}, through the helper on this computer.`
-      : s.link === "ble" ? "Over Bluetooth, through the helper on this computer" + (s.rssi != null ? ` · ${s.rssi} dBm` : "") + "."
-      : "Plug it in with USB, or switch it on: the helper finds it over Bluetooth.";
+    sub = s.link === "usb" ? `Over USB on ${s.port}.`
+      : s.link === "ble" ? "Over Bluetooth" + (s.rssi != null ? ` · signal ${s.rssi} dBm` : "") + "."
+      : s.linkMode === "usb" ? "Plug it in with the USB cable: Claude Buddy finds it by itself."
+      : "Plug it in with USB, or switch it on: Claude Buddy finds it over Bluetooth.";
   } else if (ctl) {
     status = "ok"; title = "Connected";
     sub = `Straight over ${ctl.via === "usb" ? "USB" : "Bluetooth"}, from this browser.`;
   } else if (HOSTED) {
     status = "wait"; title = "Say hi to your buddy";
     sub = !canUsb && !canBle
-      ? "This browser can't reach the board. Open this page in Chrome or Edge on a computer, or install the helper below."
-      : "Plug it in with USB or switch it on, then connect. If the Claude Buddy helper runs on this computer, the page finds it by itself.";
+      ? "This browser can't reach the board. Open this page in Chrome or Edge on a computer, or install Claude Buddy below."
+      : "Plug it in with USB or switch it on, then connect. If Claude Buddy is running on this computer, the page finds it by itself.";
   } else {
     status = down ? "bad" : "wait";
-    title = down ? "Helper not running" : "Connecting…";
-    sub = down ? "This page talks to the Claude Buddy helper on this computer. Start it with claude-buddy and the page comes back by itself." : "";
+    title = down ? "Claude Buddy isn't running" : "Connecting…";
+    sub = down ? "It starts by itself when you log in. To start it now, open Claude Buddy from the Start menu (or run claude-buddy-service); this page comes back by itself." : "";
   }
 
   return (
@@ -493,7 +579,7 @@ export default function App() {
           <Mascot />
           <span>Claude <b>Buddy</b></span>
         </a>
-        <span className={"led " + status}><i />{status === "ok" ? (ctl.via === "bridge" ? (s.link === "usb" ? `USB · ${s.port}` : "Bluetooth") : `${ctl.via.toUpperCase()} · direct`) : status === "bad" ? "Offline" : "Not connected"}</span>
+        <span className={"led " + status}><i />{flashing ? "Updating…" : status === "ok" ? (ctl.via === "bridge" ? (s.link === "usb" ? `USB · ${s.port}` : "Bluetooth") : `${ctl.via.toUpperCase()} · direct`) : status === "bad" ? "Offline" : "Not connected"}</span>
         <span className="end">
           {install && <button className="btn ghost sm" onClick={install}>Install app</button>}
           {bridge && <span className="ver">v{s.version}</span>}
@@ -538,7 +624,8 @@ export default function App() {
             ))}
           </nav>
           <main className="content">
-            {shown === "overview" && (ctl.via === "bridge" ? <Readouts s={s} /> : <Install n="01" />)}
+            {bridge && <FirmwareBar s={s} />}
+            {shown === "overview" && (ctl.via === "bridge" ? <><Readouts s={s} /><Connection s={s} /></> : <Install n="01" />)}
             {shown === "screen" && <Screen ctl={ctl} faces={(bridge && s.faces) || FACES} pick={pick} setPick={setPick} />}
             {shown === "reactions" && <Reactions s={s} />}
             {shown === "music" && <Music s={s} />}
@@ -547,6 +634,10 @@ export default function App() {
           </main>
         </>
       ) : HOSTED && <main className="content"><Setup /></main>}
+
+      <div className="toasts" aria-live="polite">
+        {toasts.map((t) => <div key={t.id} className={"toast " + t.kind}>{t.text}</div>)}
+      </div>
 
       <footer className="foot">
         <span>Claude Buddy · a desk companion for Claude Code</span>

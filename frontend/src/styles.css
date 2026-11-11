@@ -163,6 +163,25 @@ button, input, select { font: inherit; color: inherit; }
 .inline > input, .inline > select { flex: 1; min-width: 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* ---------- firmware banner, toasts */
+.fwbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 16px 20px;
+  border-radius: 14px; background: color-mix(in srgb, var(--accent) 10%, var(--paper)); border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.fwbar > div:first-child { display: grid; gap: 2px; min-width: 0; }
+.fwbar strong { font-weight: 700; }
+.fwbar small { color: var(--ink-2); font-size: 13.5px; }
+.fwbar.err { background: color-mix(in srgb, var(--bad) 8%, var(--paper)); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+.fwbar.busy { display: grid; }
+.fwprog { display: flex; align-items: center; gap: 12px; }
+.fwprog .meter { flex: 1; height: 8px; }
+.fwprog span { font: 500 12px var(--f-mono); min-width: 38px; text-align: right; }
+.mono { font: 500 13px var(--f-mono); color: var(--ink-2); }
+.toasts { position: fixed; z-index: 50; right: 18px; bottom: 18px; display: grid; gap: 8px; justify-items: end; pointer-events: none; }
+.toast { display: flex; align-items: center; gap: 10px; padding: 11px 16px; border-radius: 12px; background: var(--ink); color: var(--paper);
+  font-weight: 500; font-size: 14px; box-shadow: 0 12px 30px -10px rgba(0, 0, 0, .45); animation: toast-in .25s ease-out; }
+.toast::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.toast.warn::before { background: var(--warn); }
+@keyframes toast-in { from { transform: translateY(10px); opacity: 0; } }
+
 /* ---------- face picker */
 .picker { position: relative; flex: 1; min-width: 0; }
 .pick-btn { width: 100%; display: flex; align-items: center; gap: 12px; padding: 6px 14px 6px 6px; background: var(--bg);

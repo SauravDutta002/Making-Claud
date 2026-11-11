@@ -3,8 +3,8 @@
 #   irm https://raw.githubusercontent.com/SauravDutta002/Making-Claud/main/install.ps1 | iex
 #
 # Installs uv (which brings its own Python), the claude-buddy commands, connects
-# Claude Code, flashes the board if it's plugged in over USB, and starts the
-# bridge now and at every login. Run it again any time to update.
+# Claude Code, flashes the board if it's plugged in over USB, and starts Claude
+# Buddy in the background now and at every login. Run it again any time to update.
 # Uninstall: irm https://raw.githubusercontent.com/SauravDutta002/Making-Claud/main/uninstall.ps1 | iex
 
 function Install-ClaudeBuddy {
@@ -35,7 +35,7 @@ function Install-ClaudeBuddy {
     Done (& $uv --version)
 
     # a running bridge holds the board's port and its own files: stop it while we update
-    Get-Process claude-buddy -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process claude-buddy, claude-buddy-service -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
         Where-Object { $_.CommandLine -match 'claude_bridge' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -66,24 +66,22 @@ function Install-ClaudeBuddy {
         Note "to update its firmware later: plug it in over USB and run  claude-buddy-flash"
     }
 
-    # 5. start now and at every login (a minimized window with the live dashboard)
+    # 5. start now and at every login: in the background, no window, restarting itself if it stops
     Step "Starting"
-    $exe = "$bin\claude-buddy.exe"
+    $exe = "$bin\claude-buddy-service.exe"
     $shell = New-Object -ComObject WScript.Shell
     foreach ($place in @([Environment]::GetFolderPath("Startup"), [Environment]::GetFolderPath("Programs"))) {
         $lnk = $shell.CreateShortcut((Join-Path $place "Claude Buddy.lnk"))
         $lnk.TargetPath = $exe
         $lnk.WorkingDirectory = $env:USERPROFILE
-        $lnk.Description = "Claude Buddy bridge"
-        $lnk.WindowStyle = $(if ($place -like "*Startup*") { 7 } else { 1 })   # minimized at login
+        $lnk.Description = "Claude Buddy (runs in the background)"
         $lnk.Save()
     }
     $url = Join-Path ([Environment]::GetFolderPath("Programs")) "Claude Buddy Settings.url"
     Set-Content -Path $url -Value "[InternetShortcut]`r`nURL=http://localhost:47801/`r`n" -Encoding ASCII
     Start-Process -FilePath $exe
-    Done "the bridge is running (its window shows the live dashboard)"
-    Done "it starts by itself when you log in - or run: claude-buddy"
-    Done "settings: http://localhost:47801  (Start menu > Claude Buddy Settings)"
+    Done "Claude Buddy is running in the background, and starts by itself when you log in"
+    Done "status and settings: http://localhost:47801  (Start menu > Claude Buddy Settings)"
 
     Write-Host ""
     Write-Host "  All set. Restart Claude Code and watch the screen." -ForegroundColor DarkYellow

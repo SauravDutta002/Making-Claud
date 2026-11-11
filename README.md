@@ -37,7 +37,7 @@ The command does everything:
 2. Installs the Claude Buddy commands.
 3. Connects Claude Code to the bridge: it adds hooks and a status line to `~/.claude/settings.json` and backs up the old file first.
 4. If the board is plugged in over USB, it offers to install the latest firmware.
-5. Starts the bridge now and at every login.
+5. Starts Claude Buddy in the background (no window) now and at every login. If it ever stops, it starts itself again.
 
 ### Connecting the board
 
@@ -75,7 +75,8 @@ Only this computer can open the page. It is not reachable from the network.
 
 | Command | What it does |
 |---|---|
-| `claude-buddy` | The bridge, with its live dashboard (started at login for you) |
+| `claude-buddy-service` | Claude Buddy in the background, no window (this is what starts at login) |
+| `claude-buddy` | The same, with a live dashboard in the terminal (only when the background one isn't running) |
 | `claude-buddy-settings` | Opens the settings page |
 | `claude-buddy-flash` | Installs the latest firmware on a board plugged in over USB |
 | `claude-buddy-setup` | Connects Claude Code to the bridge again (`--remove` disconnects it) |
@@ -119,14 +120,15 @@ pause, 3 taps skip to the next song, 4 taps go back.
 ## Updating
 
 **On any computer that already has Claude Buddy**, run the same install command
-again. It updates the bridge and keeps your stats, streaks and settings. If the
-board is plugged in over USB, it also offers to update the firmware.
+again. It updates Claude Buddy and keeps your stats, streaks and settings.
 
-To update only the board's firmware, plug it in over USB, close the bridge, and run:
-
-```sh
-claude-buddy-flash
-```
+**The board's firmware** updates from the settings page. The board reports its
+firmware version; when a newer one is available (shipped with Claude Buddy, or
+published in this repository, which Claude Buddy checks every few hours and
+verifies against the checksums in `bridge/firmware/version.json`), the page shows
+**New firmware** with an **Update firmware** button. It works while the board is
+connected over USB, shows its progress, and reconnects when the board restarts.
+From a terminal, `claude-buddy-flash` does the same (close Claude Buddy first).
 
 The board keeps its brightness, volume, XP and level.
 
@@ -140,12 +142,14 @@ just a push:
 2. **Rebuild the firmware the installer ships.** Optionally flash your own board
    at the same time:
    ```sh
-   python tools/build_firmware.py               # refreshes bridge/firmware/*.bin
+   python tools/build_firmware.py               # refreshes bridge/firmware/*.bin + version.json
    python tools/build_firmware.py --upload COM25
    ```
    This needs the Arduino IDE 2 (it includes `arduino-cli`), the ESP32 core 3.x
    and the *Adafruit GFX* and *Adafruit SH110X* libraries.
-3. **Bump the version** in `pyproject.toml` and `VERSION` in `bridge/claude_bridge.py`.
+3. **Bump the versions**: `pyproject.toml` and `VERSION` in `bridge/claude_bridge.py`
+   for the app, `FW_VERSION` in `claude.ino` for the firmware (boards offer the
+   update once it's pushed).
 4. **Commit and push to `main`.**
 5. Users run the install command again to get it.
 
@@ -201,13 +205,13 @@ core 3.x and the *Adafruit GFX* and *Adafruit SH110X* libraries. Choose
 
 | Problem | Fix |
 |---|---|
-| "Port busy" / "Access is denied" when flashing | Close the bridge (and the Arduino Serial Monitor) first. Only one program can use the port. |
+| "Port busy" / "Access is denied" when flashing | Use **Update firmware** on the settings page (it frees the port itself), or close Claude Buddy and the Arduino Serial Monitor first. Only one program can use the port. |
 | "Claude Buddy is already running" | It started at login. Close that window to run another one. |
 | The board isn't found over Bluetooth | Make sure Bluetooth is on. If "Claude Buddy" is paired in your system's Bluetooth settings, remove it there. |
 | Nothing happens when Claude works | Restart Claude Code after installing. Run `claude-buddy-setup` if you changed your settings file. |
 | Lyrics are early or late | Settings page > Lyrics timing. Some songs only have lyrics for a different version. |
 | No Slack/Teams cards (Windows) | Allow notification access: Settings > Privacy > Notifications. |
-| The settings page won't open | The bridge must be running: run `claude-buddy`. |
+| The settings page won't open | Claude Buddy must be running: open *Claude Buddy* from the Start menu (or run `claude-buddy-service`). Its log is `claude-buddy.log` in the data folder. |
 
 ---
 

@@ -35,6 +35,7 @@ class WebApp:
         self.state = {}                       # filled by the bridge twice a second
         self.outbox = queue.Queue()           # lines for the board
         self.changes = queue.Queue()          # settings changes {key: value}
+        self.actions = queue.Queue()          # "flash": put the newest firmware on the board
         self.ok, self.err = False, ""
         app = self
 
@@ -97,6 +98,11 @@ class WebApp:
                     return self._send(400, '{"error":"bad request"}')
                 if self.path == "/api/settings":
                     app.changes.put(body)
+                    return self._send(200, '{"ok":true}')
+                if self.path == "/api/firmware":
+                    if body.get("action") != "flash":
+                        return self._send(400, '{"error":"bad request"}')
+                    app.actions.put("flash")
                     return self._send(200, '{"ok":true}')
                 if self.path == "/api/board":
                     line = str(body.get("line", ""))

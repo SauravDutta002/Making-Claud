@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-buddy"
-version = "1.0.0"
+version = "1.1.0"
 description = "Bridge between Claude Code and the Claude Buddy desk screen (ESP32-C3 + OLED)"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -34,9 +34,12 @@ claude-buddy-setup = "claude_buddy.setup_claude:main"
 claude-buddy-flash = "claude_buddy.flash:main"
 claude-buddy-settings = "claude_buddy.webapp:open_page"
 
+[project.gui-scripts]
+claude-buddy-service = "claude_buddy.claude_bridge:service"   # background, no window (starts at login)
+
 [tool.setuptools]
 package-dir = { "claude_buddy" = "bridge" }
 packages = ["claude_buddy"]
 
 [tool.setuptools.package-data]
-claude_buddy = ["firmware/*.bin", "web/*.html", "web/*.js", "web/*.bin", "web/*.png", "web/*.webmanifest", "web/assets/*"]
+claude_buddy = ["firmware/*.bin", "firmware/*.json", "web/*.html", "web/*.js", "web/*.bin", "web/*.png", "web/*.webmanifest", "web/assets/*"]

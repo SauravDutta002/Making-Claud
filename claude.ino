@@ -77,6 +77,7 @@
    ("Claude Buddy", Nordic UART service), so it only needs USB for power.
    0 = USB cable only. */
 #define USE_BLE 1
+#define FW_VERSION "1.1.0"      // reported to the laptop, which offers updates when a newer one ships
 
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -786,6 +787,7 @@ void iconSpeaker(int x, int y, bool on, uint16_t c) {
 /* Bluetooth link toast: the rune pulses on connect, cracks apart when it drops */
 uint32_t linkToastAt = 0;
 bool     linkToastUp = false;
+uint8_t  linkToastKind = 0;      // 0 Bluetooth, 1 USB
 
 void btRune(int x, int y, int h, int split) {        // the Bluetooth rune, centred on x,y
   int q = h / 4;
@@ -815,15 +817,27 @@ void drawCard(int y, const char* title, const char* body, int scroll) {
   display.drawCircle(13, y + 12, 9, C_WHITE);
 }
 
-/* Bluetooth connected / disconnected */
+void usbIcon(int x, int y) {                          // the USB trident, centred on x,y
+  display.drawFastVLine(x, y - 6, 12, C_WHITE);
+  display.fillTriangle(x, y - 8, x - 2, y - 5, x + 2, y - 5, C_WHITE);
+  display.drawLine(x, y + 2, x - 4, y - 1, C_WHITE); display.fillCircle(x - 4, y - 2, 1, C_WHITE);
+  display.drawLine(x, y, x + 4, y - 3, C_WHITE);     display.fillRect(x + 3, y - 5, 3, 3, C_WHITE);
+  display.fillCircle(x, y + 6, 2, C_WHITE);
+}
+
+/* the laptop linked up (USB or Bluetooth) / Bluetooth dropped */
 void drawLinkToast() {
   if (!linkToastAt) return;
   const int dur = 2400;
   int t = (int)(millis() - linkToastAt);
+  if (t < 0) return;                                   // waiting for the hello intro to finish
   if (t > dur) { linkToastAt = 0; return; }
   int y = cardY(t, dur);
-  drawCard(y, "Bluetooth", linkToastUp ? "connected" : "disconnected", 0);
-  if (linkToastUp) {
+  drawCard(y, linkToastKind ? "USB" : "Bluetooth", linkToastUp ? "connected" : "disconnected", 0);
+  if (linkToastUp && linkToastKind) {
+    if ((t / 260) % 2) display.drawCircle(13, y + 12, 7, C_WHITE);
+    usbIcon(13, y + 12);
+  } else if (linkToastUp) {
     if ((t / 260) % 2) display.drawCircle(13, y + 12, 7, C_WHITE);   // pulsing ring
     btRune(13, y + 12, 12, 0);
   } else {
@@ -887,9 +901,12 @@ void sceneSfx(uint8_t sc, uint32_t f) {
     case 7:  if (f % 8 == 0 && (f / 8) % 6) amb(1500, 1500, 10, 22); break;    // letters pop in
     case 10: if (f % 16 == 0) amb(1760, 1568, 40, 30); break;          // needs you: alert
     case 11: if (f % 15 == 0) amb(1200, 1200, 8, 15); break;           // context ticking up
-    case 12:                                              // coffee: sip-sip
-      if (f % 70 == 0 && ambOk()) { sndPushV(600, 500, 60, 40, 20); sndPushV(620, 480, 60, 0, 18); }
+    case 12: {                                            // coffee: three gulps, then a soft "ahh"
+      uint32_t p = (f - sceneTick0) % 160;
+      if (p == 52 || p == 64 || p == 76) amb(560, 430, 70, 24);
+      else if (p == 98) amb(880, 560, 380, 26);
       break;
+    }
     case 19: if (f % 80 == 0) amb(1100, 950, 120, 30); break;          // petted face: coo
     case 24: if (f % 100 == 0) amb(1319, 1568, 60, 30); break;         // feeling great
     case 25:                                              // not amused: grumble
@@ -1256,11 +1273,38 @@ void sc_reading(uint32_t f) {
 
 /* --- typing ------------------------------------------------- */
 void sc_typing(uint32_t f) {
-  eyes(64, 14, 14, 18, 30, EY_NORMAL, 4);
-  txt(10, 32, 1, "return len;");
-  txt(16, 42, 1, "if (ok = 8) {");
-  txt(10, 52, 1, "// le");
-  if ((f / 10) % 2) display.fillRect(46, 51, 5, 8, C_WHITE);
+  static const char* CODE[] = {
+    "fn count(xs) {", "  let n = 0;", "  for x in xs {", "    if x > 8 {",
+    "      n += 1;", "    }", "  }", "  return n;", "}",
+  };
+  const int NL = 9, CPT = 2, PAUSE = 14;               // 2 ticks a letter, a beat at each line end
+  static uint32_t total = 0;
+  if (!total) for (int i = 0; i < NL; i++) total += strlen(CODE[i]) * CPT + PAUSE;
+  uint32_t t = (f - sceneTick0) % (total + 50);        // then a rest, and the next file
+
+  int line = NL - 1, chars = (int)strlen(CODE[NL - 1]);
+  uint32_t acc = 0;
+  for (int i = 0; i < NL; i++) {
+    uint32_t len = strlen(CODE[i]), dur = len * CPT + PAUSE;
+    if (t < acc + dur) { line = i; chars = (int)min(len, (t - acc) / CPT); break; }
+    acc += dur;
+  }
+
+  // the last three lines, the newest one being typed; the view scrolls as it goes
+  int first = max(0, line - 2), curX = 4, curY = 24;
+  char buf[24];
+  for (int i = first; i <= line; i++) {
+    int y = 24 + (i - first) * 9;
+    int n = (i == line) ? chars : (int)strlen(CODE[i]);
+    memcpy(buf, CODE[i], n); buf[n] = 0;
+    txt(4, y, 1, buf);
+    if (i == line) { curX = 4 + n * 6; curY = y; }
+  }
+  bool busyTyping = chars < (int)strlen(CODE[line]);
+  if (busyTyping || (f / 8) % 2) display.fillRect(curX, curY, 5, 7, C_WHITE);
+
+  // Claude's eyes follow the cursor along the line
+  eyes(64 + (curX - 50) / 8, 11, 14, 16, 30, EY_NORMAL, 4);
 }
 
 /* --- keyboard peek ------------------------------------------ */
@@ -1351,51 +1395,113 @@ void sc_needsYou(uint32_t f) {
   }
 }
 
-/* --- context filling up ------------------------------------- */
+/* --- context filling up -------------------------------------
+   The bin on the right is the real context window: Claude Code's status line
+   sends the used percentage (X:<pct>), and that many bricks stack up in it.
+   45 bricks = 100%. It fills from empty each time the face appears; if the
+   context shrinks (after a /compact) the bricks vanish down to the new level. */
+#define CTX_BRICKS 45
+void ctxBrick(int i, int* x, int* y, int* w) {
+  int r = 0, k = i;
+  for (;;) { int n = (r % 2) ? 5 : 4; if (k < n) break; k -= n; r++; }
+  static const int8_t OFF_E[4] = { 0, 10, 20, 30 };          // even rows: 4 bricks
+  static const int8_t OFF_O[5] = { 0, 5, 15, 25, 35 };       // odd rows, shifted: 5 bricks
+  static const int8_t W_O[5]   = { 4, 9, 9, 9, 4 };
+  *x = 81 + ((r % 2) ? OFF_O[k] : OFF_E[k]);
+  *w = (r % 2) ? W_O[k] : 9;
+  *y = 59 - r * 4;
+}
+
 void sc_context(uint32_t f) {
-  eyes(34, 22, 14, 20, 18, EY_NORMAL, 4);
-  uint8_t pct = (ctxPct >= 0) ? ctxPct : 40 + (f / 3) % 60;
-  char b[18]; snprintf(b, sizeof(b), "context %u%%", pct);
-  txt(60, 24, 1, b);
-  for (uint8_t r = 0; r < 4; r++)
-    for (uint8_t c = 0; c < 14; c++) {
-      bool on = (r * 14 + c) < (56 * pct / 100);
-      if (on) display.fillRect(58 + c * 5, 36 + r * 6, 4, 5, C_WHITE);
-      else    display.drawPixel(60 + c * 5, 38 + r * 6, C_WHITE);
-    }
+  static int shown = 0, drop = 0;
+  uint32_t t = f - sceneTick0;
+  if (t < 2) { shown = 0; drop = 0; }
+
+  bool known = ctxPct >= 0;
+  int pct = known ? ctxPct : bridgeUp ? 0 : 20 + (int)((t / 2) % 80);   // board on its own: a demo sweep
+  int target = CTX_BRICKS * pct / 100;
+  if (shown > target) shown = target;
+  else if (shown < target && ++drop >= 4) { shown++; drop = 0; }
+  bool filling = shown < target;
+
+  // eyes: tall, blinking now and then, glancing at the bin while it fills
+  uint32_t bt = f % 150;
+  int h = bt < 8 ? 3 + abs((int)bt - 4) * 4 : 19;
+  int ey = 21 + (int)wobble(f, 0.05f, 2), ex = filling ? 2 : 0;
+  display.fillRoundRect(21 + ex, ey - h / 2, 11, h, 2, C_WHITE);
+  display.fillRoundRect(50 + ex, ey - h / 2, 11, h, 2, C_WHITE);
+
+  char b[18];
+  if (known || !bridgeUp) snprintf(b, sizeof(b), "context %d%%", pct);
+  else                    snprintf(b, sizeof(b), "context --");
+  txt(6, 53, 1, b);
+
+  // the bin
+  display.drawFastVLine(80, 16, 48, C_WHITE);
+  display.drawFastVLine(120, 16, 48, C_WHITE);
+  display.drawFastHLine(80, 63, 41, C_WHITE);
+  for (int i = 0; i < shown; i++) {
+    int x, y, w; ctxBrick(i, &x, &y, &w);
+    display.fillRect(x, y, w, 3, C_WHITE);
+  }
+  if (filling) {                                         // the next brick drops into place
+    int x, y, w; ctxBrick(shown, &x, &y, &w);
+    display.fillRect(x, max(17, y - (4 - drop) * 2), w, 3, C_WHITE);
+  }
+  if (pct >= 85) display.fillRect(78, 11 + (int)((f / 8) % 2), 45, 2, C_WHITE);   // nearly full: the lid hovers
 }
 
 /* --- coffee ------------------------------------------------- */
 void sc_coffee(uint32_t f) {
-  uint32_t p = (f - sceneTick0) % 170;            // ~4 s: sleepy, sip, awake
-  int lift = (p >= 60 && p < 100) ? (int)(sinf((p - 60) / 40.0f * PI) * 10) : 0;
-  int cx = 64, cy = 40 - lift;
+  // ~4 s, on repeat: a warm mug -> lifts it -> sips, eyes shut -> "mmm" ^ ^ -> sets it down
+  uint32_t p = (f - sceneTick0) % 160;
+  const int REST = 38, mx = 62, lx = 30, rx = 98, EY = 22;
 
-  // Claude's eyes: half asleep, closed for the sip, then wide awake and happy
-  if (p < 60)       eyes(64, 20, 22, 8, 26, EY_SLEEPY, 3, false);
-  else if (p < 100) eyes(64, 20, 22, 4, 26, EY_SLEEPY, 2, false);
-  else if (p < 116) { int g = (int)(p - 100) / 3; eyes(64, 20, 24 + g, 26 + g, 26, EY_WIDE, 8, false); }
-  else              chevronEyes(64, 20 + (int)wobble(f, 0.2f, 1), 22, false);   // happy ^ ^
-  if (p >= 100) { sparkle(14, 12, f, 3); sparkle(114, 12, f + 6, 3); }
-  if (p >= 100 && p < 140) txt(118, 26, 2, "!");
+  float lf = 0;                                          // the mug glides up and back (eased)
+  if (p >= 40 && p < 52)      lf = (1 - cosf((p - 40) / 12.0f * PI)) / 2;
+  else if (p >= 52 && p < 84) lf = 1;
+  else if (p >= 84 && p < 96) lf = (1 + cosf((p - 84) / 12.0f * PI)) / 2;
+  int lift = (int)(lf * 22 + 0.5f);
+  bool sip = p >= 52 && p < 84;
+  if (sip && ((p - 52) % 12) < 4) lift += 2;             // a little tip on each gulp
+  bool mmm = p >= 96 && p < 140;
+  int top = REST - lift;
 
-  // the mug, its handle, curls of steam (none mid-sip)
-  display.fillRoundRect(cx - 12, cy, 22, 15, 3, C_WHITE);
-  display.drawCircle(cx + 12, cy + 7, 4, C_WHITE);
-  display.drawCircle(cx + 12, cy + 7, 3, C_WHITE);
-  display.drawFastHLine(cx - 9, cy + 4, 16, C_BLACK);
-  display.drawFastHLine(cx - 9, cy + 10, 16, C_BLACK);
-  if (!lift)
-    for (int k = 0; k < 3; k++) {
-      int x0 = cx - 7 + k * 6;
-      for (int y = 0; y < 12; y++) {
-        if ((y + (int)(f / 3) + k * 4) % 12 >= 8) continue;   // wisps rise and break up
-        int x = x0 + (int)(sinf((y + f * 0.3f + k * 2) * 0.6f) * 2);
-        display.drawPixel(x, cy - 3 - y, C_WHITE);
+  // eyes: big and tall, shut for the sip, then happy ^ ^
+  if (mmm) {
+    int ey = EY - (int)fabsf(sinf((p - 96) * 0.2f) * 2);
+    for (int t = 0; t < 4; t++)
+      for (int e : { lx, rx }) {
+        display.drawLine(e - 11, ey + 6 + t, e, ey - 6 + t, C_WHITE);
+        display.drawLine(e, ey - 6 + t, e + 11, ey + 6 + t, C_WHITE);
       }
+  } else {
+    int h = 26;
+    uint32_t q = p % 40;
+    if (p < 40 && q >= 18 && q < 26) h = 3 + abs((int)q - 22) * 5;   // a blink
+    else if (p >= 46 && p < 52) h = 26 - (int)(p - 46) * 23 / 6;
+    else if (p >= 52 && p < 96) h = 3;
+    display.fillRoundRect(lx - 9, EY - h / 2, 18, h, h > 6 ? 4 : 1, C_WHITE);
+    display.fillRoundRect(rx - 9, EY - h / 2, 18, h, h > 6 ? 4 : 1, C_WHITE);
+  }
+
+  // the mug: rounded, a handle, a "v" on the front
+  display.fillRoundRect(mx - 14, top, 28, 18, 3, C_WHITE);
+  display.fillCircle(mx + 17, top + 8, 5, C_WHITE);
+  display.fillCircle(mx + 17, top + 8, 2, C_BLACK);
+  for (int i = 0; i < 4; i++) {
+    display.drawPixel(mx - 3 + i, top + 6 + i, C_BLACK); display.drawPixel(mx - 4 + i, top + 6 + i, C_BLACK);
+    display.drawPixel(mx + 3 - i, top + 6 + i, C_BLACK); display.drawPixel(mx + 4 - i, top + 6 + i, C_BLACK);
+  }
+
+  // steam: two wisps winding round each other (not while it's at Claude's mouth)
+  if (lift == 0)
+    for (int y = 0; y < 16; y++) {
+      if ((y + (int)(f / 3)) % 18 >= 14) continue;       // they rise and break up
+      int w = (int)(sinf(y * 0.42f + f * 0.15f) * 3.5f);
+      display.drawPixel(mx + w, top - 3 - y, C_WHITE); display.drawPixel(mx + w + 1, top - 3 - y, C_WHITE);
+      display.drawPixel(mx - w, top - 3 - y, C_WHITE); display.drawPixel(mx - w - 1, top - 3 - y, C_WHITE);
     }
-  display.drawFastHLine(0, 56, SCREEN_WIDTH, C_WHITE);          // the table
-  if (!lift) display.drawFastHLine(cx - 18, 55, 34, C_WHITE);   // the saucer
 }
 
 /* --- music (^ ^) -------------------------------------------- */
@@ -1500,10 +1606,6 @@ void sc_petted(uint32_t f) {
   display.drawLine(mx + 3, 46 + dy, mx + 6, 43 + dy, C_WHITE);
   display.drawLine(mx + 6, 43 + dy, mx + 9, 46 + dy, C_WHITE);
   display.drawLine(mx + 9, 46 + dy, mx + 12, 42 + dy, C_WHITE);
-
-  // the stroke: a soft swish moving over the top of the head
-  int hx = 64 + (int)wobble(f, 0.12f, 26);
-  for (int k = 0; k < 3; k++) display.drawFastHLine(hx - 9 + k * 3, 3 + k * 2, 18 - k * 6, C_WHITE);
 
   // purring: little wiggles beside the eyes
   if ((f / 4) % 2) {
@@ -3619,7 +3721,7 @@ const Scene SCENES[] = {
   { "test tubes",      0, sc_testTubes   },   //  9
   { "needs you",       2, sc_needsYou    },   // 10
   { NULL,              0, sc_context     },   // 11
-  { NULL,              0, sc_coffee      },   // 12  coffee: sleepy, sip, awake
+  { NULL,              0, sc_coffee      },   // 12  coffee: sipping
   { "music",           2, sc_music       },   // 13
   { "headbang",        2, sc_headbang    },   // 14
   { "dance",           2, sc_dance       },   // 15
@@ -3741,7 +3843,7 @@ void setScene(uint8_t i) {
    ============================================================ */
 const uint8_t MOODS[] = { 0, 24, 27, 28, 29, 12, 18, 21, 3, 19, 53, 65, 65 };
 const uint8_t WORKS[] = { 1, 2, 4, 5, 6, 7, 8, 9, 11, 30, 31, 32, 33, 34, 40, 41, 44, 51, 37, 57, 58, 67, 67 };
-const uint8_t PLAYS[] = { 47, 48, 49, 50, 48, 49, 50, 45, 46, 36, 13, 14, 15, 16, 17, 59, 60, 60, 63, 63, 63 };
+const uint8_t PLAYS[] = { 47, 48, 49, 50, 48, 49, 50, 45, 46, 36, 13, 14, 15, 16, 17, 59, 60, 60, 63 };
 const uint8_t RESTS[] = { 22, 23, 21, 69, 69 };
 const uint8_t WINS[]  = { 35, 24, 45, 28 };
 const uint8_t LOSES[] = { 26, 25 };
@@ -3773,6 +3875,7 @@ void director(bool alive) {
     return;
   }
 
+  static uint32_t marioAt = 0;
   uint8_t r = random(100), next;
   if (alive && r >= 30 && r < 58) r = 58 + random(32);   // play instead of fake work
   if (isNight() && r < 90 && random(100) < 40) r = 95;   // late at night: more naps
@@ -3781,7 +3884,9 @@ void director(bool alive) {
     else if (r < 58) next = WORKS[random(sizeof(WORKS))];
     else if (r < 90) next = PLAYS[random(sizeof(PLAYS))];
     else             next = RESTS[random(sizeof(RESTS))];
-  } while (next == scene || !sceneOk(next));
+  } while (next == scene || !sceneOk(next) ||
+           (next == 63 && marioAt && millis() - marioAt < 15UL * 60000UL));   // Super Claude: now and then
+  if (next == 63) marioAt = millis();
 
   if (isLongScene(next))  sceneDur = alive ? random(12000, 16000) : random(16000, 24000);
   else if (r < 30)        sceneDur = random(4000, 6500);
@@ -4160,8 +4265,8 @@ void handleLine(char* line) {
       } else if (!strcmp(key, "hello")) {
         lastIntroAt = 0; startIntro();
       }
-      char b[32];                                     // tell the page what the board has now
-      snprintf(b, sizeof(b), "F:%u,%u,%u,%u,%u", briIndex, BRI_COUNT, volIndex, VOL_COUNT, soundMode);
+      char b[48];                                     // tell the page what the board has now
+      snprintf(b, sizeof(b), "F:%u,%u,%u,%u,%u,%s", briIndex, BRI_COUNT, volIndex, VOL_COUNT, soundMode, FW_VERSION);
       sendToLaptop(b);
       break;
     }
@@ -4174,7 +4279,12 @@ void handleLine(char* line) {
       lyricText[sizeof(lyricText) - 1] = 0;
       break;
     }
-    case 'H': startIntro(); break;                    // H:1  the laptop bridge just linked up
+    case 'H': {                                       // H:1,usb | H:1,ble  the laptop just linked up
+      startIntro();                                   // "Build something great" (not on quick reconnects)
+      linkToastUp = true; linkToastKind = strstr(v, "usb") ? 1 : 0;
+      linkToastAt = millis() + (introAt ? INTRO_MS : 0);   // then a "connected" card
+      break;
+    }
     case 'B': pushMoment(MO_BACK, atoi(v), 0, ""); break;      // B:<minutes you were away>
     case 'N': {                                        // N:<minutes>,<meeting title>
       const char* p = strchr(v, ',');
@@ -5045,7 +5155,7 @@ void loop() {
   if (bleConnected != bleWas) {
     bleWas = bleConnected;
     inLine[1] = false; lineLen[1] = 0;     // a new link starts with a clean line
-    linkToastUp = bleWas; linkToastAt = millis();
+    linkToastUp = bleWas; linkToastKind = 0; linkToastAt = millis();
     if (soundOn) {
       sndClear();
       if (bleWas) { sndPushV(1047, 1047, 40, 10, 45); sndPushV(1568, 1568, 60, 0, 50); }

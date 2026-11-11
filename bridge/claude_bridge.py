@@ -15,6 +15,10 @@ board. Installed with install.ps1 (Windows) / install.sh (macOS) it runs as
     python claude_bridge.py --plain        # plain log lines, no live dashboard
     python claude_bridge.py --ble          # wireless only (board just needs power)
 
+Installed, it runs in the background as `claude-buddy-service` (no window, starts
+at login, restarts itself if it ever stops); `claude-buddy` is the same thing
+with the live dashboard in a terminal.
+
 WIRELESS: if the board isn't plugged into this laptop, the bridge finds it over
 Bluetooth LE ("Claude Buddy") and reconnects by itself if the link drops.
     python claude_bridge.py --repo D:\code\myproject   # also watch this repo's commits
@@ -38,7 +42,8 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+ALREADY_RUNNING = 3                # exit code: another Claude Buddy already runs on this computer
 
 try:
     from .webapp import WebApp
@@ -50,6 +55,7 @@ DEFAULT_SETTINGS = {
     "music": True, "lyrics": True, "lyrics_offset": 0.0,
     "notify": True, "notify_apps": "slack,teams,discord,whatsapp,telegram,signal,zoom,outlook",
     "calendar": True, "ics": [], "away": True, "typing": True, "usage": True,
+    "link": "auto",                # auto (USB if plugged in, else Bluetooth) | usb | ble
 }
 # faces the settings page can put on the screen (board scene numbers)
 FACES = [
@@ -850,7 +856,7 @@ PROGRESS_FILE = os.path.join(DATA, "progress.json")  # streak days + unlocked ba
 
 def load_json(path, default):
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:     # -sig: also files saved with a BOM
             return json.load(f)
     except (OSError, ValueError):
         return default
@@ -869,6 +875,116 @@ def http_json(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": "claude-buddy-bridge"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+
+FIRMWARE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware")
+FIRMWARE_URL = "https://raw.githubusercontent.com/SauravDutta002/Making-Claud/main/bridge/firmware/"
+FIRMWARE_PARTS = [("0x0", "bootloader.bin"), ("0x8000", "partitions.bin"),
+                  ("0xe000", "boot_app0.bin"), ("0x10000", "claude-buddy.bin")]
+
+
+def vkey(v):
+    """'1.10.2' -> (1, 10, 2), for comparing versions."""
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:3])
+
+
+class Firmware:
+    """Which firmware the board runs (it says so when asked), the newest one this
+    computer can install - the one that shipped with Claude Buddy, or a newer one
+    published on GitHub (downloaded and checked against its sha256) - and putting
+    it on the board over USB, with progress for the settings page."""
+
+    CHECK_EVERY = 6 * 3600
+
+    def __init__(self):
+        self.board = None                  # version the board reports; "" = too old to say
+        self.best = self._local(FIRMWARE_DIR)
+        self.state, self.pct, self.msg = "idle", 0, ""
+        self.finished = False              # a flash just ended: the bridge reconnects
+        threading.Thread(target=self._check, daemon=True).start()
+
+    @staticmethod
+    def _local(folder):
+        meta = load_json(os.path.join(folder, "version.json"), {})
+        ok = meta.get("version") and all(os.path.exists(os.path.join(folder, f)) for _, f in FIRMWARE_PARTS)
+        return (str(meta["version"]), folder) if ok else None
+
+    @property
+    def update(self):
+        return self.board is not None and self.best is not None and vkey(self.best[0]) > vkey(self.board)
+
+    def _check(self):
+        import hashlib
+        import urllib.request
+        time.sleep(20)
+        while True:
+            try:
+                meta = http_json(FIRMWARE_URL + "version.json")
+                ver = str(meta.get("version", ""))
+                if vkey(ver) > vkey(self.best[0] if self.best else "0"):
+                    folder = os.path.join(DATA, "firmware", re.sub(r"[^0-9A-Za-z.]", "", ver))
+                    if not self._local(folder):
+                        os.makedirs(folder, exist_ok=True)
+                        for _, name in FIRMWARE_PARTS:
+                            with urllib.request.urlopen(FIRMWARE_URL + name, timeout=60) as r:
+                                data = r.read(8 * 1024 * 1024)
+                            if hashlib.sha256(data).hexdigest() != meta["files"][name]:
+                                raise ValueError(f"{name} didn't match its checksum")
+                            with open(os.path.join(folder, name), "wb") as f:
+                                f.write(data)
+                        save_json(os.path.join(folder, "version.json"), meta)
+                    got = self._local(folder)
+                    if got:
+                        self.best = got
+                        say(f"firmware {ver} is out - update the board from the settings page", "ok")
+            except Exception:
+                pass                       # offline, or nothing newer published: look again later
+            time.sleep(self.CHECK_EVERY)
+
+    def flash(self, port):
+        ver, folder = self.best
+        files = [(addr, os.path.join(folder, name)) for addr, name in FIRMWARE_PARTS]
+        sizes = [max(1, os.path.getsize(f)) for _, f in files]
+        self.state, self.pct, self.msg, self.finished = "flashing", 0, f"Installing firmware {ver}", False
+
+        def go():
+            cmd = [sys.executable, "-m", "esptool", "--chip", "esp32c3", "--port", port,
+                   "--baud", "921600", "write_flash"]
+            for addr, f in files:
+                cmd += [addr, f]
+            last = ""
+            try:
+                pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      creationflags=0x08000000 if sys.platform == "win32" else 0)
+                part, buf = 0, ""
+                while True:
+                    chunk = os.read(pr.stdout.fileno(), 512)
+                    if not chunk:
+                        break
+                    buf += chunk.decode(errors="ignore")
+                    *done, buf = re.split(r"[\r\n]", buf)
+                    for seg in done:
+                        seg = seg.strip()
+                        if seg:
+                            last = seg
+                        if "Hash of data verified" in seg:
+                            part = min(part + 1, len(files) - 1)
+                        m = re.search(r"(\d+(?:\.\d+)?)\s?%", seg) if "Writing at" in seg else None
+                        if m:
+                            cur = float(m.group(1)) / 100
+                            self.pct = int(100 * (sum(sizes[:part]) + sizes[part] * cur) / sum(sizes))
+                ok = pr.wait() == 0
+            except Exception as e:
+                ok, last = False, str(e)
+            if ok:
+                self.state, self.pct, self.msg = "done", 100, f"Updated to firmware {ver}"
+                say(f"firmware {ver} installed - the board restarts", "ok")
+            else:
+                self.state, self.msg = "error", ("Update failed: " + last)[:160]
+                say(f"firmware update failed: {last}", "err")
+            self.finished = True
+
+        threading.Thread(target=go, daemon=True).start()
 
 
 class AwayWatcher:
@@ -1665,8 +1781,9 @@ def main():
     try:
         sock.bind((UDP_HOST, UDP_PORT))
     except OSError:
-        sys.exit("Claude Buddy is already running (it starts at login). "
-                 "Close that one first to see the dashboard here.")
+        print("Claude Buddy is already running on this computer (it starts at login).\n"
+              "Settings and status: http://localhost:47801", file=sys.stderr)
+        raise SystemExit(ALREADY_RUNNING)
     sock.settimeout(0.1)
 
     ui = UI = Dashboard(live=not a.plain)
@@ -1714,7 +1831,7 @@ def main():
     say(f"bridge listening on udp://{UDP_HOST}:{UDP_PORT}", "ok")
     locked = [k for k, obj in (("music", music), ("lyrics", lyrics), ("notify", notifier),
                                ("calendar", calendar), ("away", away), ("typing", keys),
-                               ("usage", usage)) if obj is None]
+                               ("usage", usage)) if obj is None] + (["link"] if a.ble or a.usb else [])
     web = None if a.no_web else WebApp()
     if web is not None:
         if web.ok:
@@ -1725,12 +1842,18 @@ def main():
     web_at = 0.0
     board_cfg = None               # the board's brightness / volume / sound, as it reports them
 
+    relink = False                 # the connection setting changed: connect again its way
+
     def apply_settings(change):
         """A change from the settings page: check it, keep it, use it now."""
+        nonlocal relink
         for k, v in change.items():
             if k not in DEFAULT_SETTINGS:
                 continue
-            if isinstance(DEFAULT_SETTINGS[k], bool):
+            if k == "link":
+                if v in ("auto", "usb", "ble") and v != S[k] and k not in locked:
+                    S[k], relink = v, True
+            elif isinstance(DEFAULT_SETTINGS[k], bool):
                 S[k] = bool(v)
             elif k == "lyrics_offset":
                 try:
@@ -1756,22 +1879,45 @@ def main():
         ser.write((line + "\n").encode())
         ui.tx += 1
 
+    fw = Firmware()
     next_try = 0.0                 # next attempt to find the board
     beat_at = 0.0                  # last heartbeat to the board
+    busy_said = None               # a USB port we said is busy (said once, not on every retry)
+    usb_probe = 0.0                # on Bluetooth in auto mode: next look for a USB cable
     while True:
-        if ser is None and time.time() >= next_try:
+        mode = "ble" if a.ble else "usb" if a.usb else S["link"]
+        if relink:                         # the connection setting changed
+            relink = False
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+            say({"auto": "connection: automatic (USB, else Bluetooth)",
+                 "usb": "connection: USB only", "ble": "connection: Bluetooth only"}[mode], "info")
+            next_try, announced = 0.0, False
+        if fw.finished:                    # a firmware update ended: the board restarts, reconnect
+            fw.finished, next_try = False, time.time() + 2.5
+        linked_now = False
+        if ser is None and fw.state != "flashing" and time.time() >= next_try:
             ui.link = "search"
-            # USB if the board is plugged into this laptop, else Bluetooth
-            port = None if a.ble else (a.port or find_port())
+            port = None if mode == "ble" else (a.port or find_port())
             if port:
                 try:
                     ser = open_serial(port, a.baud)
-                    ui.link, ui.port = "usb", port
+                    ui.link, ui.port, busy_said = "usb", port, None
                     say(f"connected on {port} (USB)", "ok")
+                    linked_now = True
                 except (serial.SerialException, OSError) as e:
-                    say(f"cannot open {port}: {e}", "err")
-                    ser = None
-            elif not a.usb:
+                    if busy_said != port:
+                        busy_said = port
+                        err = str(e).lower()
+                        why = ("another program is using it (the Arduino IDE, a firmware update...)"
+                               if any(w in err for w in ("denied", "permission", "busy", "in use")) else str(e))
+                        say(f"{port} is busy: {why}. "
+                            + ("Using Bluetooth meanwhile." if mode == "auto" else "Trying again..."), "warn")
+            if ser is None and mode != "usb" and (not port or mode == "auto"):
                 if not announced:
                     say("looking for 'Claude Buddy' over Bluetooth...")
                 ui.link = "scan"
@@ -1784,6 +1930,7 @@ def main():
                     sig = f", signal {ble.rssi} dBm" if ble.rssi is not None else ""
                     say(f"connected over Bluetooth{sig}, {ble.chunk}-byte packets"
                         + ("" if ble.buttons else ", buttons off"), "ok")
+                    linked_now = True
             if ser is None:
                 # no board: keep going offline - Claude's events, commits, to-dos and
                 # streaks still count, and the board catches up when it's back
@@ -1793,20 +1940,37 @@ def main():
                         "retrying...", "warn")
                     announced = True
                 next_try = time.time() + 3
-            else:
-                announced = False
+        # on Bluetooth, automatic mode, and the cable goes in: USB is quicker and steadier
+        if ser is not None and ser is ble and mode == "auto" and not a.port and time.time() >= usb_probe:
+            usb_probe = time.time() + 5
+            port = find_port()
+            usb = None
+            if port:
                 try:
-                    time.sleep(0.3)
-                    date_sent = beat_at = 0.0          # fresh time + heartbeat right away
-                    lyric_sent = -1                    # resend the current lyric line
-                    out("H:1")                         # board plays its "Build something great" intro
-                    out("F:?")                         # ...and tells us its brightness / volume / sound
-                    for line in list(sticky.values()) + git_lines:
-                        out(line)
-                except (serial.SerialException, OSError) as e:
-                    say(f"link lost while syncing: {e}", "err")
-                    ser = None
-                    next_try = time.time() + 3
+                    usb = open_serial(port, a.baud)
+                except (serial.SerialException, OSError):
+                    usb = None
+            if usb is not None:
+                ble.close()
+                ser = usb
+                ui.link, ui.port = "usb", port
+                say(f"USB cable plugged in - switched from Bluetooth to USB ({port})", "ok")
+                linked_now = True
+        if linked_now:
+            announced = False
+            board_cfg, fw.board = None, None
+            try:
+                time.sleep(0.3)
+                date_sent = beat_at = 0.0          # fresh time + heartbeat right away
+                lyric_sent = -1                    # resend the current lyric line
+                out("H:1," + ("usb" if ui.link == "usb" else "ble"))   # hello intro, then a "connected" card
+                out("F:?")                         # ...and its brightness / volume / sound / firmware
+                for line in list(sticky.values()) + git_lines:
+                    out(line)
+            except (serial.SerialException, OSError) as e:
+                say(f"link lost while syncing: {e}", "err")
+                ser = None
+                next_try = time.time() + 3
 
         try:
             data = sock.recvfrom(65535)[0].decode(errors="ignore")
@@ -1896,11 +2060,31 @@ def main():
                     line = web.outbox.get()
                     if ser is not None:
                         out(line)
+                while not web.actions.empty():
+                    if web.actions.get() != "flash" or fw.state == "flashing":
+                        continue
+                    if ser is None or ui.link != "usb":
+                        fw.state, fw.msg = "error", "Connect the board with a USB cable to update it."
+                    elif fw.best is None:
+                        fw.state, fw.msg = "error", "No firmware to install was found."
+                    else:
+                        say(f"updating the board to firmware {fw.best[0]}...", "info")
+                        port = ui.port
+                        try:
+                            ser.close()
+                        except Exception:
+                            pass
+                        ser, board_cfg = None, None
+                        ui.link = "flash"
+                        fw.flash(port)
                 if time.time() >= web_at:
                     web_at = time.time() + 0.5
                     u = ui._nums(sticky.get("U"), 3)
                     web.state = {
                         "version": VERSION, "link": ui.link, "port": ui.port, "rssi": ui.rssi,
+                        "linkMode": mode,
+                        "firmware": {"board": fw.board, "latest": fw.best[0] if fw.best else None,
+                                     "update": fw.update, "state": fw.state, "pct": fw.pct, "msg": fw.msg},
                         "board": board_cfg if ser is not None else None,
                         "music": ({"state": music.state, "title": music.title, "lyric": ui.lyric,
                                    "pos": int(music.pos), "dur": int(music.dur)}
@@ -2006,10 +2190,12 @@ def main():
                 if msg.startswith("P:") and music is not None:
                     say("◆ board button: " + msg[2:], "music")
                     music.control(msg[2:])
-                elif msg.startswith("F:"):         # the board's settings
+                elif msg.startswith("F:"):         # the board's settings (and firmware version)
                     try:
-                        b, bn, v, vn, snd = (int(x) for x in msg[2:].split(",")[:5])
+                        parts = msg[2:].split(",")
+                        b, bn, v, vn, snd = (int(x) for x in parts[:5])
                         board_cfg = {"bri": b, "briCount": bn, "vol": v, "volCount": vn, "snd": snd}
+                        fw.board = parts[5].strip()[:16] if len(parts) > 5 else ""
                     except ValueError:
                         pass
             rx_buf = rx_buf[-200:]
@@ -2025,7 +2211,8 @@ def main():
                 ser.close()
             except Exception:
                 pass
-            ser = None
+            ser, board_cfg, fw.board = None, None, None
+            next_try = time.time() + 1
 
 
 def run():
@@ -2037,6 +2224,34 @@ def run():
     finally:
         if UI is not None:
             UI.close()
+
+
+def service():
+    """The claude-buddy-service command: Claude Buddy in the background - no window,
+    started at login, and started again if it ever stops. Its log goes to
+    claude-buddy.log in the data folder."""
+    os.makedirs(DATA, exist_ok=True)
+    path = os.path.join(DATA, "claude-buddy.log")
+    try:
+        if os.path.getsize(path) > 2_000_000:          # keep the log small
+            os.replace(path, path + ".old")
+    except OSError:
+        pass
+    cmd = [sys.executable, "-m", "claude_buddy.claude_bridge", "--plain"] + sys.argv[1:]
+    wait = 5
+    while True:
+        started = time.time()
+        with open(path, "a", encoding="utf-8", errors="replace") as log:
+            log.write(time.strftime("\n--- %Y-%m-%d %H:%M:%S  Claude Buddy starting\n"))
+            log.flush()
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+            code = subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                                   creationflags=0x08000000 if sys.platform == "win32" else 0)
+            log.write(time.strftime("--- %H:%M:%S  stopped") + f" (exit code {code})\n")
+        if code == ALREADY_RUNNING:
+            return                                     # another one is already running
+        wait = 5 if time.time() - started > 120 else min(wait * 2, 120)   # back off if it keeps failing
+        time.sleep(wait)
 
 
 if __name__ == "__main__":
