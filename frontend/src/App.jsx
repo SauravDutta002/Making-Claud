@@ -1,79 +1,144 @@
-import React, { useEffect, useMemo, useState } from "react";
-import { useBridge, sendLine, saveSettings } from "./api.js";
+import React, { useEffect, useRef, useState } from "react";
+import { useBridge, sendLine, saveSettings, HOSTED } from "./api.js";
+import { useDevice, canUsb, canBle } from "./device.js";
+import Oled, { Thumb } from "./Oled.jsx";
 
-/* ------------------------------------------------------------ pieces */
+/* ------------------------------------------------------------ small pieces */
 
-// Claude Buddy's own pixel mascot: a little antenna creature (8x8, scaled up)
-const MASCOT = [
-  "...rr...",
-  "...r....",
-  ".rrrrrr.",
-  "rrwrrwrr",
-  "rrwrrwrr",
-  "rrrrrrrr",
-  ".rr..rr.",
-  ".r....r.",
-];
-function Mascot({ className = "" }) {
+// the logo: small Claude in pixels, headphones on (as on the board's chilling face)
+const LOGO_BODY = "M3 4h10v1h-10zM3 5h2v1h-2zM6 5h4v1h-4zM11 5h2v1h-2zM3 6h2v1h-2zM6 6h4v1h-4zM11 6h2v1h-2zM0 7h16v1h-16zM0 8h16v1h-16zM3 9h10v1h-10zM4 10h1v1h-1zM6 10h1v1h-1zM9 10h1v1h-1zM11 10h1v1h-1zM4 11h1v1h-1zM6 11h1v1h-1zM9 11h1v1h-1zM11 11h1v1h-1z";
+const LOGO_PHONES = "M5 0h6v1h-6zM3 1h2v1h-2zM11 1h2v1h-2zM2 2h1v1h-1zM13 2h1v1h-1zM1 3h1v1h-1zM14 3h1v1h-1zM1 4h2v1h-2zM13 4h2v1h-2zM1 5h2v1h-2zM13 5h2v1h-2zM1 6h2v1h-2zM13 6h2v1h-2z";
+function Mascot({ size = 30 }) {
   return (
-    <div className={"mascot " + className} aria-hidden="true">
-      {MASCOT.join("").split("").map((c, i) => <i key={i} className={c === "r" ? "r" : c === "w" ? "w" : ""} />)}
-    </div>
+    <svg className="mascot" width={size} height={size * 12 / 16} viewBox="0 0 16 12" shapeRendering="crispEdges" aria-hidden="true">
+      <path d={LOGO_BODY} fill="var(--accent)" />
+      <path d={LOGO_PHONES} fill="currentColor" />
+    </svg>
   );
 }
 
-function PixelPlus({ style }) {
-  return <span className="plus" style={style} aria-hidden="true" />;
-}
-
-// The device: a wide desk screen on a little stand, its OLED glowing
-function Device({ mode }) {
+// the buddy as it's printed, drawn like a product sheet: box, screen window,
+// little arms, four legs, the touch pad. The screen plays the firmware's own
+// night-sky faces (headphones on while music plays) and follows the brightness.
+function Device({ face, dim, level = 1 }) {
   return (
-    <div className={"device " + mode} aria-hidden="true">
-      <div className="bubble">{mode === "music" ? "♪ ♪" : mode === "off" ? "zz" : "HEY!"}</div>
-      <div className="body">
-        <div className="screen">
-          <span className="eye" /><span className="eye" />
-          {mode === "music" && <span className="note">♪</span>}
+    <figure className={"device" + (dim ? " off" : "")} aria-hidden="true">
+      <div className="dev">
+        <i className="arm l" /><i className="arm r" />
+        <div className="shell">
+          <i className="screw a" /><i className="screw b" /><i className="screw c" /><i className="screw d" />
+          <div className="window" style={{ "--lum": dim ? 0.35 : 0.45 + 0.55 * level }}>
+            <Oled face={face} dim={dim} />
+          </div>
+          <span className="print">CLAUDE BUDDY</span>
+          <i className="pad" />
         </div>
-        <span className="pad" />
+        <div className="legs"><i /><i /><i /><i /></div>
       </div>
-      <div className="stand" />
-      <div className="shadow" />
-      <span className="zap z1" /><span className="zap z2" /><span className="zap z3" />
-    </div>
+    </figure>
   );
 }
 
 function Toggle({ checked, disabled, onChange, label }) {
   return (
     <label className={"switch" + (disabled ? " off" : "")}>
-      <input type="checkbox" checked={checked} disabled={disabled} aria-label={label}
+      <input type="checkbox" role="switch" checked={checked} disabled={disabled} aria-label={label}
              onChange={(e) => onChange(e.target.checked)} />
       <span />
     </label>
   );
 }
 
-function Meter({ value }) {
-  return <div className="meter"><i style={{ width: Math.max(0, Math.min(100, value)) + "%" }} /></div>;
+// a stepped level, like the bars on a hardware meter: click a bar to set it
+function Steps({ count, value, disabled, onChange, label }) {
+  const [v, setV] = useState(value);
+  useEffect(() => setV(value), [value]);
+  return (
+    <div className="steps" role="radiogroup" aria-label={label}>
+      {Array.from({ length: count }, (_, i) => (
+        <button key={i} role="radio" aria-checked={v === i} aria-label={`${label} ${i}`} disabled={disabled}
+                className={i <= v && !disabled ? "on" : ""} style={{ "--h": 30 + (70 * i) / Math.max(1, count - 1) + "%" }}
+                onClick={() => { setV(i); onChange(i); }} />
+      ))}
+      <output>{disabled ? "–" : `${v}/${count - 1}`}</output>
+    </div>
+  );
 }
 
-function Section({ title, hint, children, className = "" }) {
+// every face as a picture: click one to preview it on the buddy, then show it
+function FacePicker({ faces, value, onPick }) {
+  const [open, setOpen] = useState(false);
+  const box = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const off = (e) => { if (box.current && !box.current.contains(e.target)) setOpen(false); };
+    const esc = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("pointerdown", off);
+    document.addEventListener("keydown", esc);
+    return () => { document.removeEventListener("pointerdown", off); document.removeEventListener("keydown", esc); };
+  }, [open]);
+  useEffect(() => {
+    if (open) box.current?.querySelector(".pick-grid")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [open]);
+  const cur = faces.find(([id]) => id === value);
+  const tag = (id) => "#" + String(id).padStart(2, "0");
   return (
-    <section className={"card " + className}>
-      <h2><span className="sq" aria-hidden="true" />{title}</h2>
-      {hint && <p className="hint">{hint}</p>}
-      {children}
+    <div className="picker" ref={box}>
+      <button className="pick-btn" aria-haspopup="listbox" aria-expanded={open} onClick={() => setOpen(!open)}>
+        {cur ? <Thumb face={cur[0]} /> : <span className="thumb empty" />}
+        <span className="pick-name">{cur ? <><small>{tag(cur[0])}</small>{cur[1]}</> : "Choose a face"}</span>
+        <span className="chev" aria-hidden="true">▾</span>
+      </button>
+      {open && (
+        <div className="pick-grid" role="listbox" aria-label="Faces">
+          {faces.map(([id, name]) => (
+            <button key={id} role="option" aria-selected={id === value} onClick={() => { onPick(id); setOpen(false); }}>
+              <Thumb face={id} />
+              <span><small>{tag(id)}</small>{name}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const Meter = ({ value }) => <div className="meter"><i style={{ width: Math.max(0, Math.min(100, value)) + "%" }} /></div>;
+const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+function Panel({ n, title, hint, children }) {
+  return (
+    <section className="panel">
+      <header>
+        {n && <span className="num">{n}</span>}
+        <div><h2>{title}</h2>{hint && <p>{hint}</p>}</div>
+      </header>
+      <div className="body">{children}</div>
     </section>
   );
 }
 
-const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+function Row({ label, hint, children }) {
+  return (
+    <div className="row">
+      <div className="row-text"><strong>{label}</strong>{hint && <small>{hint}</small>}</div>
+      <div className="row-ctl">{children}</div>
+    </div>
+  );
+}
 
-const FEATURES = [
-  ["music", "Music", "Record player, equalizer and DJ while a song plays"],
-  ["lyrics", "Lyrics", "Synced lyrics with small Claude hopping along"],
+/* ------------------------------------------------------------ data */
+
+const TABS = [
+  ["overview", "Overview", false],
+  ["screen", "Screen & sound", false],
+  ["reactions", "Reactions", true],      // true: needs the helper (bridge)
+  ["music", "Music", true],
+  ["alerts", "Alerts", true],
+  ["setup", "Install & uninstall", false],
+];
+
+const REACTIONS = [
   ["notify", "Notifications", "GitHub and chat messages as cards on the screen"],
   ["calendar", "Meeting alerts", "10, 5 and 1 minute before a meeting"],
   ["away", "Welcome back", "\"Oh, you're back!\" after 10 minutes away"],
@@ -89,208 +154,156 @@ const TRIES = [
   ["Badge", "V:0,Test badge"],
 ];
 
-/* ------------------------------------------------------------ the page */
+// faces you can pick when talking to the board directly (the helper sends its own list)
+const FACES = [
+  [0, "Idle"], [3, "Bright idea"], [12, "Coffee"], [13, "Music"], [14, "Headbang"], [15, "Dance"],
+  [16, "Equalizer"], [18, "Love"], [19, "Petted"], [21, "Stargazing"], [22, "Dreaming"], [24, "Feeling great"],
+  [25, "Not amused"], [26, "Oh no"], [27, "Hmmm"], [28, "Got it"], [29, "Whoa"], [35, "Trophy"],
+  [36, "Goal"], [42, "Paper plane"], [45, "Goal celebration"], [46, "Bicycle kick"], [47, "Build crane"],
+  [53, "Profile"], [59, "Plane throw"], [60, "Juggling three"], [64, "Record player"], [65, "Clock"],
+  [67, "Fixing the wiring"], [68, "DJ set"], [69, "Night sky"], [70, "Chilling"],
+];
 
-export default function App() {
-  const { state: s, down } = useBridge();
-  const linked = !!s && (s.link === "usb" || s.link === "ble");
-  const playing = !!(s && s.music && s.music.state === 1);
-  const mode = down || !s ? "off" : playing ? "music" : linked ? "on" : "off";
+const INSTALL = [
+  ["Windows", "PowerShell", "irm https://raw.githubusercontent.com/SauravDutta002/Making-Claud/main/install.ps1 | iex"],
+  ["macOS", "Terminal", "curl -LsSf https://raw.githubusercontent.com/SauravDutta002/Making-Claud/main/install.sh | sh"],
+];
 
-  const head = down ? ["START THE", "BRIDGE"]
-    : !s ? ["SAY HI TO", "YOUR BUDDY"]
-    : linked ? ["YOUR DESK", "BUDDY IS LIVE"]
-    : ["LOOKING FOR", "YOUR BUDDY"];
-  const tag = down ? "OFFLINE" : !s ? "…" : s.link === "usb" ? `USB · ${s.port}` : s.link === "ble" ? "BLUETOOTH" : "SEARCHING";
+/* ------------------------------------------------------------ sections */
 
+function Copy({ text }) {
+  const [done, setDone] = useState(false);
   return (
-    <div className="page">
-      <PixelPlus style={{ top: 60, left: "46%" }} />
-      <PixelPlus style={{ top: 330, left: "50%" }} />
-      <PixelPlus style={{ top: 650, right: "6%" }} />
+    <button className="btn ghost" onClick={async () => {
+      try { await navigator.clipboard.writeText(text); setDone(true); setTimeout(() => setDone(false), 1600); } catch {}
+    }}>{done ? "Copied ✓" : "Copy"}</button>
+  );
+}
 
-      <header className="nav">
-        <div className="logo">
-          <span className="logo-px">CLAUDE</span>
-          <span className="logo-bold">BUDDY</span>
+function Install({ n = "02", title = "Make it react to Claude Code" }) {
+  return (
+    <Panel n={n} title={title} hint="One line installs the small Claude Buddy helper. It passes Claude Code's activity to the board, and this page finds it by itself.">
+      {INSTALL.map(([os, app, cmd]) => (
+        <div className="cmd" key={os}>
+          <span className="label">{os} <em>{app}</em></span>
+          <div className="cmdline"><code><span aria-hidden="true">›</span>{cmd}</code><Copy text={cmd} /></div>
         </div>
-        <span className={"chip " + (linked ? "ok" : down ? "bad" : "warn")}>
-          <i />{down ? "Bridge not running" : !s ? "Connecting…" : linked
-            ? (s.link === "usb" ? `Connected over USB (${s.port})` : "Connected over Bluetooth" + (s.rssi != null ? ` · ${s.rssi} dBm` : ""))
-            : "Looking for the board…"}
-        </span>
-        {s && <span className="ver">v{s.version}</span>}
-      </header>
+      ))}
+    </Panel>
+  );
+}
 
-      <section className="hero">
-        <div className="hero-text">
-          <p className="eyebrow">THE LITTLE SCREEN THAT REACTS TO CLAUDE CODE</p>
-          <h1><span className="red">{head[0]}</span><span>{head[1]}</span></h1>
-          <p className="lede">
-            {down ? <>The settings page talks to the bridge on this computer. Start it with <code>claude-buddy</code> and this page comes alive.</>
-              : linked ? "Thinking, cheering, singing along. Tune what it shows and how it sounds, right here."
-              : "Plug the board in over USB, or switch it on: the bridge finds it over Bluetooth by itself."}
-          </p>
-          <div className="tag-row">
-            <span className="tag">{tag}</span>
-            <span className="tag-note">{linked ? "Changes apply instantly" : "Settings save on this computer"}</span>
+function Readouts({ s }) {
+  const playing = s.music && s.music.state;
+  return (
+    <div className="readouts">
+      <div className="readout wide">
+        <span className="label">Now playing</span>
+        {playing ? (
+          <>
+            <span className="track">{s.music.title}</span>
+            {s.music.lyric && <span className="lyric">“{s.music.lyric}”</span>}
+            {s.music.dur > 0 && <div className="prog"><Meter value={(100 * s.music.pos) / s.music.dur} /><span>{mmss(s.music.pos)} / {mmss(s.music.dur)}</span></div>}
+          </>
+        ) : <span className="quiet">Nothing playing</span>}
+      </div>
+      <div className="readout">
+        <span className="label">Claude usage</span>
+        {s.usage && s.usage.five >= 0 ? (
+          <div className="bars">
+            <div><span>5-hour</span><b>{s.usage.five}%</b></div><Meter value={s.usage.five} />
+            {s.usage.week >= 0 && <><div><span>Weekly</span><b>{s.usage.week}%</b></div><Meter value={s.usage.week} /></>}
           </div>
-          <div className="cta">
-            <button className="btn primary" disabled={!linked} onClick={() => sendLine("F:hello")}>Say hello <span aria-hidden="true">→</span></button>
-            <button className="btn ghost" disabled={!linked} onClick={() => sendLine("G:1")}><Mascot className="tiny" /> Play a game</button>
-          </div>
-        </div>
-        <div className="hero-art">
-          <Mascot className="big" />
-          <Device mode={mode} />
-        </div>
-      </section>
-
-      {s && <Dashboard s={s} linked={linked} />}
-
-      <footer className="foot">
-        {s ? <>Your stats and settings stay on this computer, in <code>{s.data}</code>. Only this computer can open this page.</>
-          : "Only this computer can open this page."}
-      </footer>
+        ) : <span className="quiet">Not known yet</span>}
+      </div>
+      <div className="readout">
+        <span className="label">Streak</span>
+        <span className="big-num">{s.streak}<small>day{s.streak === 1 ? "" : "s"}</small></span>
+        <span className="sub">{s.badges} of {s.badgesTotal} badges</span>
+      </div>
     </div>
   );
 }
 
-function Dashboard({ s, linked }) {
+function Screen({ ctl, faces, pick, setPick }) {
+  const b = ctl.linked ? ctl.board : null;
   return (
     <>
-      <div className="stats">
-        <div className="stat wide">
-          <span className="k">NOW PLAYING</span>
-          {s.music && s.music.state ? (
-            <>
-              <span className="v small">{s.music.state === 1 ? "▶ " : "❚❚ "}{s.music.title}</span>
-              {s.music.lyric && <span className="lyric">“{s.music.lyric}”</span>}
-              {s.music.dur > 0 && <><Meter value={(100 * s.music.pos) / s.music.dur} /><span className="sub">{mmss(s.music.pos)} / {mmss(s.music.dur)}</span></>}
-            </>
-          ) : <span className="v small muted">Nothing playing</span>}
-        </div>
-        <div className="stat">
-          <span className="k">TODAY</span>
-          <span className="v">{s.today.commits}<small>commits</small></span>
-          <span className="sub">{s.today.tasks} tasks · {s.today.tests} tests passed</span>
-        </div>
-        <div className="stat">
-          <span className="k">STREAK</span>
-          <span className="v">{s.streak}<small>day{s.streak === 1 ? "" : "s"}</small></span>
-          <span className="sub">{s.badges} of {s.badgesTotal} badges</span>
-        </div>
-        <div className="stat">
-          <span className="k">CLAUDE USAGE</span>
-          {s.usage && s.usage.five >= 0 ? (
-            <>
-              <span className="sub">5-hour · {s.usage.five}%</span><Meter value={s.usage.five} />
-              {s.usage.week >= 0 && <><span className="sub">Weekly · {s.usage.week}%</span><Meter value={s.usage.week} /></>}
-            </>
-          ) : <span className="v small muted">Not known yet</span>}
-        </div>
-        {s.todos.total > 0 && (
-          <div className="stat">
-            <span className="k">CLAUDE'S TO-DOS</span>
-            <span className="v">{s.todos.done}<small>/ {s.todos.total}</small></span>
-            <span className="sub">{s.todos.current || "All done"}</span>
+      <Panel n="01" title="Display and sound" hint={b ? "Saved on the board itself." : "Connect the board to change these."}>
+        <Row label="Brightness">
+          <Steps label="Brightness" count={b ? b.briCount : 8} value={b ? b.bri : 0} disabled={!b} onChange={(i) => ctl.send("F:bri," + i)} />
+        </Row>
+        <Row label="Volume">
+          <Steps label="Volume" count={b ? b.volCount : 7} value={b ? b.vol : 0} disabled={!b} onChange={(i) => ctl.send("F:vol," + i)} />
+        </Row>
+        <Row label="Sound" hint="Voice: only Claude's reactions. All: every scene's sounds too.">
+          <div className="seg" role="group" aria-label="Sound">
+            {[["Off", 0], ["Voice", 1], ["All", 2]].map(([n, v]) => (
+              <button key={v} disabled={!b} aria-pressed={!!b && b.snd === v} onClick={() => ctl.send("F:snd," + v)}>{n}</button>
+            ))}
           </div>
-        )}
-      </div>
-
-      <div className="grid">
-        <ScreenCard s={s} linked={linked} />
-        <Section title="WHAT IT REACTS TO" hint="Switch anything off or on. It applies right away and is remembered.">
-          <div className="toggles">
-            {FEATURES.map(([key, name, desc]) => {
-              const locked = s.locked.includes(key);
-              return (
-                <div className="toggle" key={key}>
-                  <div><strong>{name}</strong><small>{locked ? "Turned off by a command-line option" : desc}</small></div>
-                  <Toggle label={name} checked={!!s.settings[key] && !locked} disabled={locked}
-                          onChange={(v) => saveSettings({ [key]: v })} />
-                </div>
-              );
-            })}
-          </div>
-        </Section>
-        <LyricsCard s={s} />
-        <NotifyCard s={s} />
-        <CalendarCard s={s} />
-        <Section title="ACTIVITY" className="log-card">
-          <div className="log">
-            {s.events.slice().reverse().map(([t, m], i) => <div key={i}><span>{t}</span>{m}</div>)}
-          </div>
-        </Section>
-      </div>
+        </Row>
+      </Panel>
+      <Panel n="02" title="Show a face" hint="Pick one to preview it on the buddy above. Show it puts it on the board for 20 seconds.">
+        <div className="inline">
+          <FacePicker faces={faces} value={pick} onPick={setPick} />
+          <button className="btn primary" disabled={!ctl.linked || pick == null} onClick={() => ctl.send("F:face," + pick)}>Show it</button>
+        </div>
+      </Panel>
+      <Panel n="03" title="Try it out" hint="Sends a sample to the board.">
+        <div className="chips">
+          {TRIES.map(([n, line]) => <button key={n} className="btn ghost" disabled={!ctl.linked} onClick={() => ctl.send(line)}>{n}</button>)}
+        </div>
+      </Panel>
     </>
   );
 }
 
-function ScreenCard({ s, linked }) {
-  const b = linked ? s.board : null;
-  const [face, setFace] = useState(s.faces[0] ? s.faces[0][0] : 0);
+function Reactions({ s }) {
   return (
-    <Section title="THE SCREEN" hint={b ? "Saved on the board itself." : "Connect the board to change these."}>
-      <label className="field">Brightness
-        <input type="range" min="0" max={b ? b.briCount - 1 : 7} step="1" disabled={!b}
-               key={"bri" + (b ? b.bri : "x")} defaultValue={b ? b.bri : 0}
-               onChange={(e) => sendLine("F:bri," + e.target.value)} />
-      </label>
-      <label className="field">Volume
-        <input type="range" min="0" max={b ? b.volCount - 1 : 6} step="1" disabled={!b}
-               key={"vol" + (b ? b.vol : "x")} defaultValue={b ? b.vol : 0}
-               onChange={(e) => sendLine("F:vol," + e.target.value)} />
-      </label>
-      <div className="field row">Sound
-        <div className="seg" role="group" aria-label="Sound">
-          {[["Off", 0], ["Voice", 1], ["All", 2]].map(([n, v]) => (
-            <button key={v} disabled={!b} aria-pressed={!!b && b.snd === v} onClick={() => sendLine("F:snd," + v)}>{n}</button>
-          ))}
-        </div>
-      </div>
-      <div className="field row">
-        <select value={face} disabled={!linked} onChange={(e) => setFace(+e.target.value)} aria-label="Face">
-          {s.faces.map(([id, name]) => <option key={id} value={id}>#{id} {name}</option>)}
-        </select>
-        <button className="btn small" disabled={!linked} onClick={() => sendLine("F:face," + face)}>Show it</button>
-      </div>
-      <div className="tries">
-        {TRIES.map(([n, line]) => <button key={n} className="btn small ghost" disabled={!linked} onClick={() => sendLine(line)}>{n}</button>)}
-      </div>
-    </Section>
+    <Panel n="01" title="What the board reacts to" hint="Changes apply right away and are remembered.">
+      {REACTIONS.map(([key, name, desc]) => {
+        const locked = s.locked.includes(key);
+        return (
+          <Row key={key} label={name} hint={locked ? "Turned off by a command-line option" : desc}>
+            <Toggle label={name} checked={!!s.settings[key] && !locked} disabled={locked} onChange={(v) => saveSettings({ [key]: v })} />
+          </Row>
+        );
+      })}
+    </Panel>
   );
 }
 
-function LyricsCard({ s }) {
+function Music({ s }) {
   const [v, setV] = useState(s.settings.lyrics_offset);
   useEffect(() => setV(s.settings.lyrics_offset), [s.settings.lyrics_offset]);
   const label = v === 0 ? "On time" : v > 0 ? `${v.toFixed(1)} s earlier` : `${(-v).toFixed(1)} s later`;
+  const commit = () => saveSettings({ lyrics_offset: v });
   return (
-    <Section title="LYRICS TIMING" hint="Lines arriving late? Slide towards earlier.">
-      <input type="range" min="-2" max="2" step="0.1" value={v} aria-label="Lyrics timing"
-             onChange={(e) => setV(+e.target.value)} onMouseUp={() => saveSettings({ lyrics_offset: v })}
-             onTouchEnd={() => saveSettings({ lyrics_offset: v })} onKeyUp={() => saveSettings({ lyrics_offset: v })} />
-      <div className="scale"><span>later</span><strong>{label}</strong><span>earlier</span></div>
-    </Section>
+    <>
+      <Panel n="01" title="Music" hint="What plays on this computer shows on the board.">
+        {[["music", "Music faces", "Record player, equalizer, DJ and chilling under the stars while a song plays"],
+          ["lyrics", "Lyrics", "Synced lyrics, with small Claude hopping along"]].map(([key, name, desc]) => {
+          const locked = s.locked.includes(key);
+          return (
+            <Row key={key} label={name} hint={locked ? "Turned off by a command-line option" : desc}>
+              <Toggle label={name} checked={!!s.settings[key] && !locked} disabled={locked} onChange={(x) => saveSettings({ [key]: x })} />
+            </Row>
+          );
+        })}
+      </Panel>
+      <Panel n="02" title="Lyrics timing" hint="Lines arriving late? Slide towards earlier.">
+        <input type="range" min="-2" max="2" step="0.1" value={v} aria-label="Lyrics timing"
+               onChange={(e) => setV(+e.target.value)} onMouseUp={commit} onTouchEnd={commit} onKeyUp={commit} />
+        <div className="scale"><span>later</span><strong>{label}</strong><span>earlier</span></div>
+      </Panel>
+    </>
   );
 }
 
-function NotifyCard({ s }) {
+function Alerts({ s }) {
   const [apps, setApps] = useState(s.settings.notify_apps);
   const [saved, setSaved] = useState(false);
-  return (
-    <Section title="CHAT APPS" hint="Windows notifications from these apps go to the board. Separate them with commas.">
-      <div className="field row">
-        <input type="text" value={apps} onChange={(e) => setApps(e.target.value)} aria-label="Apps" />
-        <button className="btn small" onClick={async () => { await saveSettings({ notify_apps: apps }); setSaved(true); setTimeout(() => setSaved(false), 1800); }}>Save</button>
-      </div>
-      {saved && <span className="saved">Saved</span>}
-    </Section>
-  );
-}
-
-function CalendarCard({ s }) {
   const [url, setUrl] = useState("");
   const ics = s.settings.ics;
   const add = () => {
@@ -299,17 +312,246 @@ function CalendarCard({ s }) {
     saveSettings({ ics: [...ics, u] }); setUrl("");
   };
   return (
-    <Section title="CALENDAR" hint={'For meeting alerts. Google Calendar: Settings, your calendar, "Secret address in iCal format".'}>
-      <ul className="links">
-        {ics.length ? ics.map((u, i) => (
-          <li key={u}><code>{u}</code><button className="btn small ghost" onClick={() => saveSettings({ ics: ics.filter((_, k) => k !== i) })}>Remove</button></li>
-        )) : <li className="hint">No calendar links yet.</li>}
-      </ul>
-      <div className="field row">
-        <input type="url" value={url} placeholder="https://calendar.google.com/calendar/ical/…" onChange={(e) => setUrl(e.target.value)}
-               onKeyDown={(e) => e.key === "Enter" && add()} aria-label="New calendar link" />
-        <button className="btn small" onClick={add}>Add</button>
-      </div>
-    </Section>
+    <>
+      <Panel n="01" title="Chat apps" hint="Windows notifications from these apps go to the board. Separate them with commas.">
+        <div className="inline">
+          <input type="text" value={apps} onChange={(e) => setApps(e.target.value)} aria-label="Apps" />
+          <button className="btn primary" onClick={async () => { await saveSettings({ notify_apps: apps }); setSaved(true); setTimeout(() => setSaved(false), 1800); }}>{saved ? "Saved ✓" : "Save"}</button>
+        </div>
+      </Panel>
+      <Panel n="02" title="Calendar links" hint={'For meeting alerts. Google Calendar: Settings → your calendar → "Secret address in iCal format".'}>
+        {ics.length > 0 && (
+          <ul className="links">
+            {ics.map((u, i) => (
+              <li key={u}><code>{u}</code><button className="btn ghost" onClick={() => saveSettings({ ics: ics.filter((_, k) => k !== i) })}>Remove</button></li>
+            ))}
+          </ul>
+        )}
+        <div className="inline">
+          <input type="url" value={url} placeholder="https://calendar.google.com/calendar/ical/…" onChange={(e) => setUrl(e.target.value)}
+                 onKeyDown={(e) => e.key === "Enter" && add()} aria-label="New calendar link" />
+          <button className="btn primary" onClick={add}>Add</button>
+        </div>
+      </Panel>
+    </>
+  );
+}
+
+/* everything about getting the helper on (and off) a computer */
+const RAW = "https://raw.githubusercontent.com/SauravDutta002/Making-Claud/main/";
+const SETUP = {
+  win: { name: "Windows", app: "PowerShell", open: "Start menu → type PowerShell → Enter",
+    install: `irm ${RAW}install.ps1 | iex`, uninstall: `irm ${RAW}uninstall.ps1 | iex` },
+  mac: { name: "macOS", app: "Terminal", open: "Spotlight (⌘ Space) → type Terminal → Enter",
+    install: `curl -LsSf ${RAW}install.sh | sh`, uninstall: `curl -LsSf ${RAW}uninstall.sh | sh` },
+};
+const STEPS = [
+  ["Installs uv", "It brings its own Python, so you don't need Python already."],
+  ["Installs the Claude Buddy helper", "The claude-buddy commands listed below."],
+  ["Connects Claude Code", "Adds hooks and a status line to ~/.claude/settings.json, after backing up the old file."],
+  ["Offers a firmware update", "Only if the board is plugged in over USB. Say yes the first time."],
+  ["Starts the helper", "Right away, and at every login from then on."],
+];
+const COMMANDS = [
+  ["claude-buddy", "Starts the helper (it already starts at login)"],
+  ["claude-buddy-settings", "Opens this page"],
+  ["claude-buddy-flash", "Puts the latest firmware on a board plugged in over USB (close the helper first)"],
+  ["claude-buddy-setup", "Connects Claude Code again, e.g. after you reset its settings"],
+  ["claude-buddy-setup --remove", "Disconnects Claude Code, keeps everything else"],
+];
+
+function Cmd({ text }) {
+  return <div className="cmdline"><code><span aria-hidden="true">›</span>{text}</code><Copy text={text} /></div>;
+}
+
+function Setup() {
+  const [os, setOs] = useState(() => /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent) ? "mac" : "win");
+  const o = SETUP[os];
+  return (
+    <>
+      <Panel n="01" title="Install" hint="You need Claude Code, and Windows 10/11 or macOS. One command does everything.">
+        <div className="seg" role="group" aria-label="Your computer">
+          {Object.entries(SETUP).map(([k, v]) => <button key={k} aria-pressed={os === k} onClick={() => setOs(k)}>{v.name}</button>)}
+        </div>
+        <div className="cmd">
+          <span className="label">Open {o.app} <em>{o.open}</em></span>
+          <Cmd text={o.install} />
+        </div>
+        <ol className="steps-list">
+          {STEPS.map(([t, d]) => <li key={t}><strong>{t}</strong><small>{d}</small></li>)}
+        </ol>
+        <p className="callout">When it finishes, <strong>restart Claude Code</strong> (close and reopen any open sessions). Then plug the board in, or switch it on for Bluetooth.</p>
+      </Panel>
+      <Panel n="02" title="Connect the board">
+        <Row label="USB" hint="Plug it into the computer. The helper finds it by itself." />
+        <Row label="Bluetooth" hint={`Power it from anywhere. The helper finds "Claude Buddy" and reconnects if the link drops. Don't pair it in your system's Bluetooth settings.`} />
+      </Panel>
+      <Panel n="03" title="Update" hint="Run the install command again. It updates the helper and keeps your stats, streaks and settings, and offers new firmware if the board is plugged in.">
+        <Cmd text={o.install} />
+      </Panel>
+      <Panel n="04" title="Commands" hint="Type these in a terminal once Claude Buddy is installed.">
+        <dl className="commands">
+          {COMMANDS.map(([c, d]) => <div key={c}><dt><code>{c}</code></dt><dd>{d}</dd></div>)}
+        </dl>
+      </Panel>
+      <Panel n="05" title="Uninstall" hint="Disconnects Claude Code and removes the commands, the autostart and the shortcuts.">
+        <div className="cmd">
+          <span className="label">{o.name} <em>{o.app}</em></span>
+          <Cmd text={o.uninstall} />
+        </div>
+        <p className="callout">The board keeps its firmware, and your stats folder stays until you delete it{os === "win" ? <> (<code>%LOCALAPPDATA%\ClaudeBuddy</code>)</> : <> (<code>~/Library/Application Support/ClaudeBuddy</code>)</>}.</p>
+      </Panel>
+    </>
+  );
+}
+
+/* the browser's "install this app" offer */
+function useInstall() {
+  const [ev, setEv] = useState(null);
+  useEffect(() => {
+    const on = (e) => { e.preventDefault(); setEv(e); };
+    const done = () => setEv(null);
+    window.addEventListener("beforeinstallprompt", on);
+    window.addEventListener("appinstalled", done);
+    return () => { window.removeEventListener("beforeinstallprompt", on); window.removeEventListener("appinstalled", done); };
+  }, []);
+  return ev && (async () => { ev.prompt(); await ev.userChoice.catch(() => {}); setEv(null); });
+}
+
+/* light (default) or dark, remembered on this device */
+function useTheme() {
+  const [t, setT] = useState(() => document.documentElement.dataset.theme || "light");
+  useEffect(() => {
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem("buddy-theme", t); } catch {}
+  }, [t]);
+  return [t, () => setT(t === "dark" ? "light" : "dark")];
+}
+
+function useTab() {
+  const read = () => {
+    const h = location.hash.replace("#", "");
+    return TABS.some(([id]) => id === h) ? h : "overview";
+  };
+  const [tab, setTab] = useState(read);
+  useEffect(() => {
+    const on = () => setTab(read());
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  return tab;
+}
+
+/* ------------------------------------------------------------ the app */
+
+export default function App() {
+  const { state: s, down } = useBridge();
+  const bridge = !!s && !down;
+  const dev = useDevice(HOSTED && !bridge);
+  const tab = useTab();
+  const install = useInstall();
+  const [theme, flipTheme] = useTheme();
+
+  // one way to reach the board, whichever is there: the helper, or a direct link
+  const ctl = bridge
+    ? { via: "bridge", linked: s.link === "usb" || s.link === "ble", board: s.board, send: sendLine }
+    : dev.link ? { via: dev.link.kind, linked: true, board: dev.cfg, send: dev.send } : null;
+  const linked = !!ctl && ctl.linked;
+  const [pick, setPick] = useState(null);          // a face picked on the Screen tab, previewed on the stage
+  const b = linked ? ctl.board : null;
+  const level = b && b.briCount > 1 ? b.bri / (b.briCount - 1) : 1;
+  const tabs = TABS.filter(([, , needsBridge]) => !needsBridge || bridge);
+  const shown = tabs.some(([id]) => id === tab) ? tab : "overview";
+  const face = shown === "screen" && pick != null ? pick : bridge && s.music && s.music.state === 1 ? 70 : 69;
+
+  // what the stage says
+  let status, title, sub;
+  if (ctl && ctl.via === "bridge") {
+    status = linked ? "ok" : "wait";
+    title = linked ? "Connected" : "Looking for it…";
+    sub = s.link === "usb" ? `Over USB on ${s.port}, through the helper on this computer.`
+      : s.link === "ble" ? "Over Bluetooth, through the helper on this computer" + (s.rssi != null ? ` · ${s.rssi} dBm` : "") + "."
+      : "Plug it in with USB, or switch it on: the helper finds it over Bluetooth.";
+  } else if (ctl) {
+    status = "ok"; title = "Connected";
+    sub = `Straight over ${ctl.via === "usb" ? "USB" : "Bluetooth"}, from this browser.`;
+  } else if (HOSTED) {
+    status = "wait"; title = "Say hi to your buddy";
+    sub = !canUsb && !canBle
+      ? "This browser can't reach the board. Open this page in Chrome or Edge on a computer, or install the helper below."
+      : "Plug it in with USB or switch it on, then connect. If the Claude Buddy helper runs on this computer, the page finds it by itself.";
+  } else {
+    status = down ? "bad" : "wait";
+    title = down ? "Helper not running" : "Connecting…";
+    sub = down ? "This page talks to the Claude Buddy helper on this computer. Start it with claude-buddy and the page comes back by itself." : "";
+  }
+
+  return (
+    <div className="app">
+      <header className="top">
+        <a className="logo" href="#overview" aria-label="Claude Buddy">
+          <Mascot />
+          <span>Claude <b>Buddy</b></span>
+        </a>
+        <span className={"led " + status}><i />{status === "ok" ? (ctl.via === "bridge" ? (s.link === "usb" ? `USB · ${s.port}` : "Bluetooth") : `${ctl.via.toUpperCase()} · direct`) : status === "bad" ? "Offline" : "Not connected"}</span>
+        <span className="end">
+          {install && <button className="btn ghost sm" onClick={install}>Install app</button>}
+          {bridge && <span className="ver">v{s.version}</span>}
+          <button className="theme" onClick={flipTheme} aria-label={theme === "dark" ? "Light theme" : "Dark theme"} title={theme === "dark" ? "Light theme" : "Dark theme"}>
+            {theme === "dark" ? "☀" : "☾"}
+          </button>
+        </span>
+      </header>
+
+      <section className="stage">
+        <Device face={face} dim={!linked} level={level} />
+        <div className="stage-text">
+          <span className={"eyebrow " + status}>{status === "ok" ? "● Live" : "○ Standby"}</span>
+          <h1>{title}</h1>
+          {sub && <p>{sub}</p>}
+          <div className="actions">
+            {ctl ? (
+              <>
+                <button className="btn primary" disabled={!linked} onClick={() => ctl.send("F:hello")}>Say hello</button>
+                <button className="btn ghost" disabled={!linked} onClick={() => ctl.send("G:1")}>Play a game</button>
+                {ctl.via !== "bridge" && <button className="btn link" onClick={dev.disconnect}>Disconnect</button>}
+              </>
+            ) : HOSTED && (
+              <>
+                <button className="btn primary" disabled={!canUsb || dev.busy} onClick={dev.connectUsb}>Connect over USB</button>
+                <button className="btn ghost" disabled={!canBle || dev.busy} onClick={dev.connectBle}>Connect over Bluetooth</button>
+              </>
+            )}
+          </div>
+          {dev.busy && <p className="note">Connecting…</p>}
+          {dev.error && <p className="note err">{dev.error}</p>}
+        </div>
+      </section>
+
+      {ctl ? (
+        <>
+          <nav className="tabs" aria-label="Settings">
+            {tabs.map(([id, name], i) => (
+              <a key={id} href={"#" + id} aria-current={shown === id ? "page" : undefined}>
+                <span>{String(i + 1).padStart(2, "0")}</span>{name}
+              </a>
+            ))}
+          </nav>
+          <main className="content">
+            {shown === "overview" && (ctl.via === "bridge" ? <Readouts s={s} /> : <Install n="01" />)}
+            {shown === "screen" && <Screen ctl={ctl} faces={(bridge && s.faces) || FACES} pick={pick} setPick={setPick} />}
+            {shown === "reactions" && <Reactions s={s} />}
+            {shown === "music" && <Music s={s} />}
+            {shown === "alerts" && <Alerts s={s} />}
+            {shown === "setup" && <Setup />}
+          </main>
+        </>
+      ) : HOSTED && <main className="content"><Setup /></main>}
+
+      <footer className="foot">
+        <span>Claude Buddy · a desk companion for Claude Code</span>
+        {bridge && <span>Settings stay on your computer, in <code>{s.data}</code></span>}
+      </footer>
+    </div>
   );
 }

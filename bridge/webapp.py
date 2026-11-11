@@ -24,7 +24,7 @@ WEB = os.path.join(HERE, "web")
 PORT = 47801
 URL = f"http://localhost:{PORT}"
 LINE_RE = re.compile(r"^[EFGHNOV]:[\x20-\x7e]{0,70}$")   # what the page may send to the board
-TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html", ".svg": "image/svg+xml",
+TYPES = {".webmanifest": "application/manifest+json", ".bin": "application/octet-stream", ".js": "text/javascript", ".css": "text/css", ".html": "text/html", ".svg": "image/svg+xml",
          ".woff2": "font/woff2", ".woff": "font/woff", ".png": "image/png", ".ico": "image/x-icon"}
 
 
