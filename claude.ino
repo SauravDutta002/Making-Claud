@@ -1367,12 +1367,35 @@ void sc_context(uint32_t f) {
 
 /* --- coffee ------------------------------------------------- */
 void sc_coffee(uint32_t f) {
-  eyes(64, 26, 16, 22, 56, EY_NORMAL, 5);
-  display.fillTriangle(50, 34, 78, 34, 74, 50, C_WHITE);
-  display.fillTriangle(50, 34, 74, 50, 54, 50, C_WHITE);
-  display.drawCircle(80, 39, 5, C_WHITE);
-  display.drawFastHLine(46, 52, 36, C_WHITE);
-  steam(58, 30, f, 3);
+  uint32_t p = (f - sceneTick0) % 170;            // ~4 s: sleepy, sip, awake
+  int lift = (p >= 60 && p < 100) ? (int)(sinf((p - 60) / 40.0f * PI) * 10) : 0;
+  int cx = 64, cy = 40 - lift;
+
+  // Claude's eyes: half asleep, closed for the sip, then wide awake and happy
+  if (p < 60)       eyes(64, 20, 22, 8, 26, EY_SLEEPY, 3, false);
+  else if (p < 100) eyes(64, 20, 22, 4, 26, EY_SLEEPY, 2, false);
+  else if (p < 116) { int g = (int)(p - 100) / 3; eyes(64, 20, 24 + g, 26 + g, 26, EY_WIDE, 8, false); }
+  else              chevronEyes(64, 20 + (int)wobble(f, 0.2f, 1), 22, false);   // happy ^ ^
+  if (p >= 100) { sparkle(14, 12, f, 3); sparkle(114, 12, f + 6, 3); }
+  if (p >= 100 && p < 140) txt(118, 26, 2, "!");
+
+  // the mug, its handle, curls of steam (none mid-sip)
+  display.fillRoundRect(cx - 12, cy, 22, 15, 3, C_WHITE);
+  display.drawCircle(cx + 12, cy + 7, 4, C_WHITE);
+  display.drawCircle(cx + 12, cy + 7, 3, C_WHITE);
+  display.drawFastHLine(cx - 9, cy + 4, 16, C_BLACK);
+  display.drawFastHLine(cx - 9, cy + 10, 16, C_BLACK);
+  if (!lift)
+    for (int k = 0; k < 3; k++) {
+      int x0 = cx - 7 + k * 6;
+      for (int y = 0; y < 12; y++) {
+        if ((y + (int)(f / 3) + k * 4) % 12 >= 8) continue;   // wisps rise and break up
+        int x = x0 + (int)(sinf((y + f * 0.3f + k * 2) * 0.6f) * 2);
+        display.drawPixel(x, cy - 3 - y, C_WHITE);
+      }
+    }
+  display.drawFastHLine(0, 56, SCREEN_WIDTH, C_WHITE);          // the table
+  if (!lift) display.drawFastHLine(cx - 18, 55, 34, C_WHITE);   // the saucer
 }
 
 /* --- music (^ ^) -------------------------------------------- */
@@ -2633,18 +2656,6 @@ void mClaude(int x, int y, bool air, bool dead, uint32_t f) {   // 12x10 runner
   display.fillRect(x + 8 - a, y + 6, 2, 4, C_WHITE);
 }
 
-void sc_hello(uint32_t f) {
-  int x = 51, y = 36;
-  claudeFB(x, y, false, 0);
-  display.fillRect(x + 26, y + 4, 5, 5, C_BLACK);          // lift the right arm...
-  float a = -1.1f + sinf(f * 0.3f) * 0.5f;                 // ...and wave it
-  int ex = x + 27 + (int)(cosf(a) * 10), ey = y + 6 + (int)(sinf(a) * 10);
-  for (int o = -1; o <= 1; o++) display.drawLine(x + 26, y + 6 + o, ex, ey + o, C_WHITE);
-  display.drawRoundRect(84, 6, 32, 14, 4, C_WHITE);
-  display.fillTriangle(88, 19, 94, 19, 86, 24, C_WHITE);
-  txt(91, 9, 1, "hi!");
-  for (int xx = 0; xx < 128; xx += 2) display.drawPixel(xx, 56, C_WHITE);
-}
 
 void sc_mario(uint32_t f) {
   static uint32_t enter = 0xFFFFFFFF;
@@ -3222,25 +3233,6 @@ void sc_juggle3(uint32_t f) {
 }
 
 /* Claude lying down for a nap, breathing slowly */
-void sc_napClaude(uint32_t f) {
-  int x = 40, y = 42, b = (f / 24) % 2;
-  display.fillRect(x, y + 3 - b, 32, 10 + b, C_WHITE);
-  display.fillRect(x - 3, y + 9, 38, 3, C_WHITE);
-  display.drawFastHLine(x + 8,  y + 7, 4, C_BLACK);      // closed eyes
-  display.drawFastHLine(x + 20, y + 7, 4, C_BLACK);
-  for (uint8_t i = 0; i < 4; i++) display.fillRect(x + 2 + i * 8, y + 13, 2, 2, C_WHITE);
-  for (uint8_t i = 0; i < 3; i++) {
-    uint8_t p = (f + i * 14) % 42;
-    display.setTextSize(i == 2 ? 2 : 1);
-    display.setCursor(x + 36 + i * 6, y - 4 - p / 3);
-    display.print('z');
-  }
-  display.setTextSize(1);
-  display.fillCircle(110, 10, 6, C_WHITE);
-  display.fillCircle(107, 8, 6, C_BLACK);
-  for (uint8_t i = 0; i < 6; i++) if (((f / 8) + i) % 4) display.drawPixel((i * 37) % 90 + 4, (i * 13) % 20 + 3, C_WHITE);
-  for (int xx = 0; xx < 128; xx += 2) display.drawPixel(xx, 58, C_WHITE);
-}
 
 /* Claude waving hello */
 
@@ -3523,8 +3515,9 @@ void nightCloud(int x, int y, int s) {                        // three stacked t
   ditherBox(x, y + 4 * s, 22 * s, 2 * s, 0);
 }
 
-void sc_night(uint32_t f) {
+void nightScene(uint32_t f, bool music) {
   uint32_t t = millis();
+  bool beat = music && t - beatAt < 140;
 
   // stars: some steady, some twinkling
   static const int8_t ST[][2] = { { 20, 8 }, { 52, 4 }, { 74, 12 }, { 10, 30 }, { 44, 26 }, { 64, 40 },
@@ -3532,7 +3525,7 @@ void sc_night(uint32_t f) {
   for (uint8_t i = 0; i < 12; i++) {
     uint32_t ph = (t / 90 + i * 37) % 60;
     if (ph < 4) continue;                                     // a blink
-    if (i % 3 == 0 && ph < 14) {                              // a bright twinkle
+    if ((i % 3 == 0 && ph < 14) || (beat && i % 2 == 0)) {     // a bright twinkle (on the beat too)
       display.drawFastHLine(ST[i][0] - 1, ST[i][1], 3, C_WHITE);
       display.drawFastVLine(ST[i][0], ST[i][1] - 1, 3, C_WHITE);
     } else {
@@ -3567,20 +3560,45 @@ void sc_night(uint32_t f) {
   // the ground
   for (int x = 0; x < SCREEN_WIDTH; x += 2) display.drawPixel(x, 63, C_WHITE);
 
-  // small Claude: breathing, blinking, looking up, hopping at a shooting star
+  // small Claude: stargazing (hops at a shooting star), or grooving with headphones on
   int hop = 0;
-  if (sh >= 300 && sh < 900) hop = (int)(sinf((sh - 300) / 600.0f * PI) * 6);
-  int cx = 20, cy = 44 - hop - (int)((t / 900) % 2);
-  claudeFB(cx, cy, false, hop ? -3 : 0);
-  bool lookUp = (t % 6000) > 3500 || (sh >= 300 && sh < 1500);
+  if (!music && sh >= 300 && sh < 900) hop = (int)(sinf((sh - 300) / 600.0f * PI) * 6);
+  int groove = music ? (int)(beatGlow * 3) : 0;
+  int cx = 22, cy = 44 - hop - groove - (music ? 0 : (int)((t / 900) % 2));
+  int arm = hop ? -3 : music ? ((beatAt / 470) % 2 ? -3 : 0) : 0;
+  claudeFB(cx, cy, false, arm);
+  bool lookUp = !music && ((t % 6000) > 3500 || (sh >= 300 && sh < 1500));
   bool blink = (t % 4300) < 140;
   for (int ex : { cx + 6, cx + 18 }) {
     display.fillRect(ex, cy + 2, 2, 5, C_WHITE);             // redraw the eyes
-    if (blink)       display.fillRect(ex, cy + 5, 2, 1, C_BLACK);
+    if (music) {                                             // eyes closed, enjoying it: ^ ^
+      display.drawPixel(ex, cy + 5, C_BLACK);
+      display.drawPixel(ex + 1, cy + 4, C_BLACK);
+      display.drawPixel(ex + 2, cy + 5, C_BLACK);
+    }
+    else if (blink)  display.fillRect(ex, cy + 5, 2, 1, C_BLACK);
     else if (lookUp) display.fillRect(ex, cy + 2, 2, 3, C_BLACK);
     else             display.fillRect(ex, cy + 3, 2, 4, C_BLACK);
   }
+  if (music) {
+    for (int r = 15; r <= 16; r++) display.drawCircleHelper(cx + 13, cy + 5, r, 1 | 2, C_WHITE);   // headband
+    display.fillRoundRect(cx - 5, cy - 2, 5, 9, 2, C_WHITE);  // ear cups
+    display.fillRoundRect(cx + 26, cy - 2, 5, 9, 2, C_WHITE);
+    for (uint8_t i = 0; i < 3; i++) {                        // notes floating up from Claude
+      int ph = (int)((f + i * 26) % 78);
+      int nx = cx + 36 + i * 10 + (int)wobble(f + i * 17, 0.08f, 3), ny = 40 - ph / 2;
+      if (ny > 6) noteGlyph(nx, ny);
+    }
+  }
 }
+
+void sc_night(uint32_t f) { nightScene(f, false); }
+
+/* ============================================================
+   CHILLING — just the tune: the night sky (#69), but small Claude has
+   headphones on, eyes closed, grooving, notes floating up past the moon.
+   ============================================================ */
+void sc_chill(uint32_t f) { nightScene(f, true); }   // the night sky, headphones on, grooving
 
 /* ============================================================
    SCENE TABLE
@@ -3601,7 +3619,7 @@ const Scene SCENES[] = {
   { "test tubes",      0, sc_testTubes   },   //  9
   { "needs you",       2, sc_needsYou    },   // 10
   { NULL,              0, sc_context     },   // 11
-  { "coffee",          2, sc_coffee      },   // 12
+  { NULL,              0, sc_coffee      },   // 12  coffee: sleepy, sip, awake
   { "music",           2, sc_music       },   // 13
   { "headbang",        2, sc_headbang    },   // 14
   { "dance",           2, sc_dance       },   // 15
@@ -3650,8 +3668,8 @@ const Scene SCENES[] = {
   { "git graph",       0, sc_mergeLog    },   // 58  merge, dot rides the branch
   { NULL,              0, sc_planeThrow  },   // 59  Claude throws the plane
   { "juggling",        0, sc_juggle3     },   // 60  three-object cascade
-  { "nap time",        0, sc_napClaude   },   // 61  Claude naps
-  { NULL,              0, sc_hello       },   // 62  hi!
+  { NULL,              0, NULL           },   // 61  (removed)
+  { NULL,              0, NULL           },   // 62  (removed)
   { NULL,              0, sc_mario       },   // 63  SUPER CLAUDE platformer
   { NULL,              0, sc_player      },   // 64  record player (real music controls)
   { NULL,              0, sc_clock       },   // 65  clock + date
@@ -3659,6 +3677,7 @@ const Scene SCENES[] = {
   { NULL,              0, sc_wiring      },   // 67  Claude fixes the wiring
   { NULL,              0, sc_dj          },   // 68  DJ set with stage lights
   { NULL,              0, sc_night       },   // 69  night sky: stargazing, shooting star
+  { NULL,              0, sc_chill       },   // 70  chilling in an armchair (just the tune)
 };
 const uint8_t SCENE_COUNT = sizeof(SCENES) / sizeof(SCENES[0]);
 
@@ -3720,10 +3739,10 @@ void setScene(uint8_t i) {
    LIFE DIRECTOR — when nobody is driving, Claude lives on its own:
    moods, a bit of work, games (and reacts to how they went), naps.
    ============================================================ */
-const uint8_t MOODS[] = { 0, 24, 27, 28, 29, 12, 18, 21, 3, 19, 53, 62, 65, 65 };
+const uint8_t MOODS[] = { 0, 24, 27, 28, 29, 12, 18, 21, 3, 19, 53, 65, 65 };
 const uint8_t WORKS[] = { 1, 2, 4, 5, 6, 7, 8, 9, 11, 30, 31, 32, 33, 34, 40, 41, 44, 51, 37, 57, 58, 67, 67 };
 const uint8_t PLAYS[] = { 47, 48, 49, 50, 48, 49, 50, 45, 46, 36, 13, 14, 15, 16, 17, 59, 60, 60, 63, 63, 63 };
-const uint8_t RESTS[] = { 22, 23, 21, 61, 61, 69, 69 };
+const uint8_t RESTS[] = { 22, 23, 21, 69, 69 };
 const uint8_t WINS[]  = { 35, 24, 45, 28 };
 const uint8_t LOSES[] = { 26, 25 };
 
@@ -5050,7 +5069,7 @@ void loop() {
   //   singing:        lyrics -> disk or equalizer (taking turns) -> lyrics ...
   //   just the tune:  DJ set -> disk -> equalizer -> DJ set ...
   static bool eqNext = false;
-  bool inMus = scene == 64 || scene == 16 || scene == 66 || scene == 68;
+  bool inMus = scene == 64 || scene == 16 || scene == 66 || scene == 68 || scene == 70;
   uint32_t la = millis() - lyricAt;
   bool lyricsNow = lyricsOn && musicOn && !musicPaused &&
                    lyricText[0] && la < lyricMs + 3000UL;      // a break in the singing: the tune
@@ -5066,7 +5085,7 @@ void loop() {
     } else if (!inMus || scene == 66) {            // just the tune: the DJ takes the stage
       setScene(68);
     } else if (due) {
-      setScene(scene == 68 ? 64 : scene == 64 ? 16 : 68);   // DJ -> disk -> equalizer -> DJ
+      setScene(scene == 68 ? 64 : scene == 64 ? 16 : scene == 16 ? 70 : 68);   // DJ -> disk -> eq -> chilling
     }
   } else if (musicMode && !musicOn && !musicPaused) {   // the music stopped
     musicMode = false;

@@ -65,8 +65,9 @@ FACES = [
     (47, "Build crane"), (48, "Flappy Clawd"), (49, "Permission panic"), (50, "Whack a bug"),
     (51, "Today's stats"), (52, "Level up"), (53, "Profile"), (54, "Working"), (55, "Worked for"),
     (56, "Shell window"), (57, "Commit log"), (58, "Merge log"), (59, "Plane throw"),
-    (60, "Juggling three"), (61, "Nap"), (62, "Hello wave"), (63, "Super Claude"), (64, "Record player"),
+    (60, "Juggling three"), (63, "Super Claude"), (64, "Record player"),
     (65, "Clock"), (66, "Lyrics"), (67, "Fixing the wiring"), (68, "DJ set"),
+    (69, "Night sky"), (70, "Chilling"),
 ]
 
 # USB vendor ids: Espressif (ESP32-C3 native USB), then common USB-UART chips.
