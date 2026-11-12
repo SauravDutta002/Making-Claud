@@ -42,7 +42,7 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 ALREADY_RUNNING = 3                # exit code: another Claude Buddy already runs on this computer
 
 try:
@@ -2208,6 +2208,10 @@ def main():
                     web.state = {
                         "version": VERSION, "link": ui.link, "port": ui.port, "rssi": ui.rssi,
                         "linkMode": mode,
+                        "claude": {"ev": ui.ev, "label": EVENTS.get(ui.ev, (ui.ev,))[0],
+                                   "ago": int(time.time() - ui.ev_at),
+                                   "doing": getattr(ui, "doing", "") or "",
+                                   "doingAgo": int(time.time() - (getattr(ui, "doing_at", 0) or 0))},
                         "app": {"latest": app.latest, "update": app.available, "state": app.state,
                                 "msg": app.msg, "can": app.can},
                         "firmware": {"board": fw.board, "latest": fw.best[0] if fw.best else None,

@@ -193,33 +193,97 @@ function Install({ n = "02", title = "Make it react to Claude Code" }) {
   );
 }
 
-function Readouts({ s }) {
-  const playing = s.music && s.music.state;
+// which face the board most likely shows for what Claude is doing (for the drawing)
+const EVENT_FACE = {
+  think: 2, read: 4, type: 5, write: 47, search: 31, web: 8, bash: 30, ps: 30, build: 47,
+  git: 57, plane: 42, merge: 58, test: 9, need: 10, done: 55, fail: 39, bug: 24, compact: 11,
+  pkg: 34, wait: 41, key: 44,
+};
+const isActive = (c) => !!c && c.ago < 45 && !["idle", "key", "done"].includes(c.ev);
+
+function EqIcon({ on }) {
+  return <span className={"eq" + (on ? " on" : "")} aria-hidden="true"><i /><i /><i /><i /></span>;
+}
+
+const splitTitle = (t) => {
+  const i = (t || "").lastIndexOf(" - ");
+  return i > 0 ? [t.slice(0, i), t.slice(i + 3)] : [t || "", ""];
+};
+const hm = (min) => (min >= 60 ? `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m` : `${min}m`);
+
+/* the overview: music, usage, streak, today, to-dos and quick controls */
+function Dashboard({ s, ctl }) {
+  const m = s.music;
+  const playing = m && m.state ? m.state : 0;
+  const [song, artist] = splitTitle(m && m.title);
+  const u = s.usage;
+  const td = s.todos || { total: 0 };
+  const b = ctl.linked ? ctl.board : null;
   return (
-    <div className="readouts">
-      <div className="readout wide">
-        <span className="label">Now playing</span>
+    <div className="dash">
+      <div className={"card c6 music" + (playing ? "" : " idle")}>
+        <div className="card-head"><span className="label">Now playing</span><EqIcon on={playing === 1} /></div>
         {playing ? (
           <>
-            <span className="track">{s.music.title}</span>
-            {s.music.lyric && <span className="lyric">“{s.music.lyric}”</span>}
-            {s.music.dur > 0 && <div className="prog"><Meter value={(100 * s.music.pos) / s.music.dur} /><span>{mmss(s.music.pos)} / {mmss(s.music.dur)}</span></div>}
+            <div className="song"><strong>{song}</strong>{artist && <span>{artist}</span>}{playing === 2 && <em>Paused</em>}</div>
+            {m.lyric && <p className="lyric">“{m.lyric}”</p>}
+            {m.dur > 0 && (
+              <div className="prog">
+                <Meter value={(100 * m.pos) / m.dur} />
+                <div><span>{mmss(m.pos)}</span><span>{mmss(m.dur)}</span></div>
+              </div>
+            )}
           </>
-        ) : <span className="quiet">Nothing playing</span>}
+        ) : <p className="quiet">Nothing playing. Put on a song and your buddy dances along, with lyrics when it finds them.</p>}
       </div>
-      <div className="readout">
-        <span className="label">Claude usage</span>
-        {s.usage && s.usage.five >= 0 ? (
+
+      <div className="card c3">
+        <div className="card-head"><span className="label">Claude usage</span></div>
+        {u && u.five >= 0 ? (
           <div className="bars">
-            <div><span>5-hour</span><b>{s.usage.five}%</b></div><Meter value={s.usage.five} />
-            {s.usage.week >= 0 && <><div><span>Weekly</span><b>{s.usage.week}%</b></div><Meter value={s.usage.week} /></>}
+            <div><span>5-hour</span><b>{u.five}%</b></div><Meter value={u.five} />
+            {u.week >= 0 && <><div><span>Weekly</span><b>{u.week}%</b></div><Meter value={u.week} /></>}
+            {u.reset > 0 && <small className="sub">5-hour limit resets in {hm(u.reset)}</small>}
           </div>
-        ) : <span className="quiet">Not known yet</span>}
+        ) : <p className="quiet">Shows up once Claude Code has run.</p>}
       </div>
-      <div className="readout">
-        <span className="label">Streak</span>
+
+      <div className="card c3">
+        <div className="card-head"><span className="label">Streak</span></div>
         <span className="big-num">{s.streak}<small>day{s.streak === 1 ? "" : "s"}</small></span>
-        <span className="sub">{s.badges} of {s.badgesTotal} badges</span>
+        <Meter value={(100 * s.badges) / Math.max(1, s.badgesTotal)} />
+        <small className="sub">{s.badges} of {s.badgesTotal} badges</small>
+      </div>
+
+      <div className="card c4">
+        <div className="card-head"><span className="label">Today</span></div>
+        <div className="stats">
+          <div><b>{s.today.commits}</b><span>commits</span></div>
+          <div><b>{s.today.tasks}</b><span>tasks</span></div>
+          <div><b>{s.today.tests}</b><span>tests passed</span></div>
+        </div>
+      </div>
+
+      {td.total > 0 && (
+        <div className="card c4">
+          <div className="card-head"><span className="label">Claude's to-dos</span><span className="mono">{td.done}/{td.total}</span></div>
+          <Meter value={(100 * td.done) / td.total} />
+          <p className="todo">{td.current || "All done"}</p>
+        </div>
+      )}
+
+      <div className={"card quick " + (td.total > 0 ? "c4" : "c8")}>
+        <div className="card-head"><span className="label">Quick controls</span>{!b && <small className="sub">Connect the board</small>}</div>
+        <div className="qrow"><span>Brightness</span>
+          <Steps label="Brightness" count={b ? b.briCount : 8} value={b ? b.bri : 0} disabled={!b} onChange={(i) => ctl.send("F:bri," + i)} /></div>
+        <div className="qrow"><span>Volume</span>
+          <Steps label="Volume" count={b ? b.volCount : 7} value={b ? b.vol : 0} disabled={!b} onChange={(i) => ctl.send("F:vol," + i)} /></div>
+        <div className="qrow"><span>Sound</span>
+          <div className="seg" role="group" aria-label="Sound">
+            {[["Off", 0], ["Voice", 1], ["All", 2]].map(([n, v]) => (
+              <button key={v} disabled={!b} aria-pressed={!!b && b.snd === v} onClick={() => ctl.send("F:snd," + v)}>{n}</button>
+            ))}
+          </div></div>
       </div>
     </div>
   );
@@ -550,7 +614,12 @@ export default function App() {
   const level = b && b.briCount > 1 ? b.bri / (b.briCount - 1) : 1;
   const tabs = TABS.filter(([, , needsBridge]) => !needsBridge || bridge);
   const shown = tabs.some(([id]) => id === tab) ? tab : "overview";
-  const face = shown === "screen" && pick != null ? pick : bridge && s.music && s.music.state === 1 ? 70 : 69;
+  const claude = bridge ? s.claude : null;
+  const busy = isActive(claude);
+  // the drawing: a face you picked, else what Claude is doing, else music / the night sky
+  const face = shown === "screen" && pick != null ? pick
+    : busy && claude.ago < 20 && EVENT_FACE[claude.ev] != null ? EVENT_FACE[claude.ev]
+    : bridge && s.music && s.music.state === 1 ? 70 : 69;
   const flashing = bridge && s.link === "flash";
 
   // "connected" / "disconnected" as it happens (and when the page first finds it)
@@ -624,6 +693,13 @@ export default function App() {
           <span className={"eyebrow " + status}>{status === "ok" ? "● Live" : "○ Standby"}</span>
           <h1>{title}</h1>
           {sub && <p>{sub}</p>}
+          {bridge && !flashing && (
+            <div className={"now" + (busy ? " busy" : "")}>
+              <i aria-hidden="true" />
+              {busy ? <span>Claude is <b>{claude.label}</b>{claude.doing && claude.doingAgo < 60 && <em>{claude.doing}</em>}</span>
+                : <span>Claude Code is quiet</span>}
+            </div>
+          )}
           <div className="actions">
             {ctl ? (
               <>
@@ -657,7 +733,7 @@ export default function App() {
           <main className="content">
             {bridge && <AppBar s={s} />}
             {bridge && <FirmwareBar s={s} />}
-            {shown === "overview" && (ctl.via === "bridge" ? <><Readouts s={s} /><Connection s={s} /></> : <Install n="01" />)}
+            {shown === "overview" && (ctl.via === "bridge" ? <><Dashboard s={s} ctl={ctl} /><Connection s={s} /></> : <Install n="01" />)}
             {shown === "screen" && <Screen ctl={ctl} faces={(bridge && s.faces) || FACES} pick={pick} setPick={setPick} />}
             {shown === "reactions" && <Reactions s={s} />}
             {shown === "music" && <Music s={s} />}

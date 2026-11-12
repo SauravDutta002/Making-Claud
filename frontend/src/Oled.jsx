@@ -77,17 +77,30 @@ export default function Oled({ face = 69, dim = false }) {
 /** a still of one face, for the picker */
 export function Thumb({ face }) {
   const ref = useRef(null);
+  // plays the face's recording (10 fps) while it's on screen; a still frame otherwise
   useEffect(() => {
-    let alive = true;
+    let alive = true, raf = 0, last = 0, k = 0, seen = false, list = null;
+    const canvas = ref.current;
+    const ctx = canvas.getContext("2d");
+    const img = ctx.createImageData(W, H);
+    const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const draw = (t) => {
+      if (!alive || !seen || !list) { raf = 0; return; }
+      if (t - last >= 100) { last = t; paint(img, list[k % list.length]); ctx.putImageData(img, 0, 0); k += 2; }
+      raf = requestAnimationFrame(draw);
+    };
+    const io = new IntersectionObserver(([e]) => {
+      seen = e.isIntersecting;
+      if (seen && !raf && !still) raf = requestAnimationFrame(draw);
+    });
     loadFaces().then((faces) => {
-      const list = faces.get(face);
-      if (!alive || !list || !ref.current) return;
-      const ctx = ref.current.getContext("2d");
-      const img = ctx.createImageData(W, H);
-      paint(img, list[Math.min(40, list.length - 1)]);
-      ctx.putImageData(img, 0, 0);
+      list = faces.get(face);
+      if (!alive || !list) return;
+      k = Math.min(40, list.length - 1);
+      paint(img, list[k]); ctx.putImageData(img, 0, 0);
+      io.observe(canvas);
     }).catch(() => {});
-    return () => { alive = false; };
+    return () => { alive = false; io.disconnect(); cancelAnimationFrame(raf); };
   }, [face]);
   return <canvas ref={ref} width={W} height={H} className="thumb" aria-hidden="true" />;
 }
