@@ -42,7 +42,7 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 ALREADY_RUNNING = 3                # exit code: another Claude Buddy already runs on this computer
 
 try:
@@ -56,6 +56,7 @@ DEFAULT_SETTINGS = {
     "notify": True, "notify_apps": "slack,teams,discord,whatsapp,telegram,signal,zoom,outlook",
     "calendar": True, "ics": [], "away": True, "typing": True, "usage": True,
     "link": "auto",                # auto (USB if plugged in, else Bluetooth) | usb | ble
+    "auto_update": True,           # install new versions of Claude Buddy by itself
 }
 # faces the settings page can put on the screen (board scene numbers)
 FACES = [
@@ -987,6 +988,119 @@ class Firmware:
         threading.Thread(target=go, daemon=True).start()
 
 
+APP_REPO = "SauravDutta002/Making-Claud"
+APP_VERSION_URL = f"https://raw.githubusercontent.com/{APP_REPO}/main/pyproject.toml"
+APP_PACKAGE = f"claude-buddy @ https://github.com/{APP_REPO}/archive/refs/heads/main.zip"
+
+
+def find_uv():
+    for c in (shutil.which("uv"), os.path.expanduser("~/.local/bin/uv.exe"), os.path.expanduser("~/.local/bin/uv"),
+              os.path.expanduser("~/.cargo/bin/uv.exe"), os.path.expanduser("~/.cargo/bin/uv")):
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+class AppUpdates:
+    """Keeps Claude Buddy itself up to date: looks at the version on GitHub now and
+    then, and installs a newer one (the same way the install command does) when
+    Claude Code has been quiet for a while, then starts again. Your stats, streaks
+    and settings live in the data folder, so they're kept."""
+
+    CHECK_EVERY = 3 * 3600
+    QUIET_FOR = 10 * 60            # no Claude Code activity for this long before restarting
+
+    def __init__(self):
+        self.latest, self.state, self.msg = None, "idle", ""
+        # only an installed copy updates itself (not one run from a source folder)
+        self.can = bool(__package__) and find_uv() is not None
+        threading.Thread(target=self._check, daemon=True).start()
+
+    @property
+    def available(self):
+        return bool(self.latest) and vkey(self.latest) > vkey(VERSION)
+
+    def _check(self):
+        import urllib.request
+        time.sleep(60)
+        while True:
+            try:
+                req = urllib.request.Request(APP_VERSION_URL, headers={"User-Agent": "claude-buddy-bridge"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    text = r.read(50000).decode("utf-8", "ignore")
+                m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+                if m:
+                    if m.group(1) != self.latest and vkey(m.group(1)) > vkey(VERSION):
+                        say(f"Claude Buddy {m.group(1)} is out (you have {VERSION})", "ok")
+                    self.latest = m.group(1)
+            except Exception:
+                pass                       # offline: look again later
+            time.sleep(self.CHECK_EVERY)
+
+    def start(self):
+        """Install the new version and come back. On Windows a separate little script
+        does it (the running files can't be replaced from inside); elsewhere the
+        install runs here and Claude Buddy restarts itself."""
+        if self.state == "updating" or not self.can:
+            return
+        uv = find_uv()
+        self.state, self.msg = "updating", f"Updating Claude Buddy to {self.latest}"
+        say(f"updating Claude Buddy {VERSION} -> {self.latest}...", "info")
+        if sys.platform == "win32":
+            try:
+                self._windows(uv)
+            except Exception as e:
+                self.state, self.msg = "error", f"Update didn't start: {e}"
+                say(self.msg, "err")
+            return
+
+        def go():
+            r = subprocess.run([uv, "tool", "install", "--force", "--reinstall", "--python", "3.12", APP_PACKAGE],
+                               capture_output=True, text=True)
+            if r.returncode:
+                self.state, self.msg = "error", "Update failed: " + (r.stderr.strip().splitlines() or ["?"])[-1][:140]
+                say(self.msg, "err")
+                return
+            say("updated - restarting", "ok")
+            os.execv(sys.executable, [sys.executable, "-m", "claude_buddy.claude_bridge"] + sys.argv[1:])
+
+        threading.Thread(target=go, daemon=True).start()
+
+    def _windows(self, uv):
+        bin_dir = subprocess.run([uv, "tool", "dir", "--bin"], capture_output=True, text=True,
+                                 creationflags=0x08000000).stdout.strip()
+        log = os.path.join(DATA, "update.log")
+        script = os.path.join(DATA, "update.ps1")
+        q = lambda s: "'" + str(s).replace("'", "''") + "'"
+        with open(script, "w", encoding="utf-8-sig") as f:
+            f.write(f"""# written by Claude Buddy to update itself
+$ErrorActionPreference = 'Continue'
+& {{
+  Write-Output ("--- " + (Get-Date) + "  updating Claude Buddy")
+  Disable-ScheduledTask -TaskName 'Claude Buddy' -ErrorAction SilentlyContinue | Out-Null
+  Stop-ScheduledTask -TaskName 'Claude Buddy' -ErrorAction SilentlyContinue
+  Get-Process claude-buddy, claude-buddy-service -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  Get-CimInstance Win32_Process -Filter "Name like 'python%'" | Where-Object {{ $_.CommandLine -match 'claude_bridge' }} |
+    ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}
+  Start-Sleep 2
+  & {q(uv)} tool install --force --reinstall --python 3.12 {q(APP_PACKAGE)}
+  if ($LASTEXITCODE -eq 0) {{ & {q(os.path.join(bin_dir, 'claude-buddy-setup.exe'))} }}
+  Enable-ScheduledTask -TaskName 'Claude Buddy' -ErrorAction SilentlyContinue | Out-Null
+  Start-ScheduledTask -TaskName 'Claude Buddy' -ErrorAction SilentlyContinue
+  if (-not $?) {{ Start-Process -FilePath {q(os.path.join(bin_dir, 'claude-buddy-service.exe'))} }}
+  Write-Output ("--- " + (Get-Date) + "  done")
+}} *>> {q(log)}
+""")
+        cmd = f'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script}"'
+        # started through WMI, so it isn't closed together with Claude Buddy (and the task) it stops
+        ps = ("$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=" + q(cmd)
+              + "}; exit $r.ReturnValue")
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                           timeout=60, creationflags=0x08000000)
+        if r.returncode:
+            raise RuntimeError(f"WMI returned {r.returncode}")
+
+
 class AwayWatcher:
     """'Oh, you're back!' - no keyboard or mouse for AWAY_S, then input again.
     Reads the system's own idle timer (Windows GetLastInputInfo, macOS
@@ -1853,7 +1967,7 @@ def main():
             if k == "link":
                 if v in ("auto", "usb", "ble") and v != S[k] and k not in locked:
                     S[k], relink = v, True
-            elif isinstance(DEFAULT_SETTINGS[k], bool):
+            elif isinstance(DEFAULT_SETTINGS[k], bool) and k in S:
                 S[k] = bool(v)
             elif k == "lyrics_offset":
                 try:
@@ -1880,6 +1994,7 @@ def main():
         ui.tx += 1
 
     fw = Firmware()
+    app = AppUpdates()
     next_try = 0.0                 # next attempt to find the board
     beat_at = 0.0                  # last heartbeat to the board
     busy_said = None               # a USB port we said is busy (said once, not on every retry)
@@ -1898,6 +2013,9 @@ def main():
             say({"auto": "connection: automatic (USB, else Bluetooth)",
                  "usb": "connection: USB only", "ble": "connection: Bluetooth only"}[mode], "info")
             next_try, announced = 0.0, False
+        if (app.available and app.state != "updating" and app.can and S["auto_update"]
+                and fw.state != "flashing" and time.time() - ui.ev_at > app.QUIET_FOR):
+            app.start()                    # a new Claude Buddy: install it and come back
         if fw.finished:                    # a firmware update ended: the board restarts, reconnect
             fw.finished, next_try = False, time.time() + 2.5
         linked_now = False
@@ -2063,7 +2181,12 @@ def main():
                     if ser is not None:
                         out(line)
                 while not web.actions.empty():
-                    if web.actions.get() != "flash" or fw.state == "flashing":
+                    act = web.actions.get()
+                    if act == "update_app":
+                        if app.available and app.can and fw.state != "flashing":
+                            app.start()
+                        continue
+                    if act != "flash" or fw.state == "flashing":
                         continue
                     if ser is None or ui.link != "usb":
                         fw.state, fw.msg = "error", "Connect the board with a USB cable to update it."
@@ -2085,6 +2208,8 @@ def main():
                     web.state = {
                         "version": VERSION, "link": ui.link, "port": ui.port, "rssi": ui.rssi,
                         "linkMode": mode,
+                        "app": {"latest": app.latest, "update": app.available, "state": app.state,
+                                "msg": app.msg, "can": app.can},
                         "firmware": {"board": fw.board, "latest": fw.best[0] if fw.best else None,
                                      "update": fw.update, "state": fw.state, "pct": fw.pct, "msg": fw.msg},
                         "board": board_cfg if ser is not None else None,

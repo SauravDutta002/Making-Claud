@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { useBridge, sendLine, saveSettings, flashFirmware, HOSTED } from "./api.js";
+import { useBridge, sendLine, saveSettings, flashFirmware, updateApp, HOSTED } from "./api.js";
 import { useDevice, canUsb, canBle } from "./device.js";
 import Oled, { Thumb } from "./Oled.jsx";
 
@@ -387,7 +387,7 @@ function Setup() {
         <Row label="USB" hint="Plug it into the computer. Claude Buddy finds it by itself." />
         <Row label="Bluetooth" hint={`Power it from anywhere. Claude Buddy finds it and reconnects if the link drops. Don't pair it in your system's Bluetooth settings.`} />
       </Panel>
-      <Panel n="03" title="Update" hint="Run the install command again. It updates Claude Buddy and keeps your stats, streaks and settings. New board firmware then shows up on this page, with an Update button.">
+      <Panel n="03" title="Update" hint="Claude Buddy updates itself: when a new version is out it installs it while you're not working with Claude Code, and keeps your stats, streaks and settings. New board firmware shows up on this page with an Update button. Running the install command again also updates it.">
         <Cmd text={o.install} />
       </Panel>
       <Panel n="04" title="Commands" hint="Type these in a terminal once Claude Buddy is installed.">
@@ -421,11 +421,37 @@ function Connection({ s }) {
           ))}
         </div>
       </Row>
+      <Row label="Update automatically" hint={s.app && s.app.update
+        ? `Claude Buddy ${s.app.latest} is out. It updates when Claude Code has been quiet for 10 minutes.`
+        : `Claude Buddy ${s.version}${s.app && s.app.latest ? " (the newest)" : ""}. New versions install by themselves, while you're not working with Claude Code.`}>
+        <Toggle label="Update automatically" checked={!!s.settings.auto_update} onChange={(v) => saveSettings({ auto_update: v })} />
+      </Row>
       <Row label="Firmware" hint={fw.board == null ? "Connect the board to see its version."
         : fw.update ? `Version ${fw.latest} is ready to install.` : "Up to date."}>
         <span className="mono">{fw.board == null ? "–" : fw.board || "older"}{fw.latest && fw.board !== fw.latest ? ` → ${fw.latest}` : ""}</span>
       </Row>
     </Panel>
+  );
+}
+
+/* a new Claude Buddy: it installs itself (or now, with the button) */
+function AppBar({ s }) {
+  const a = s.app || {};
+  if (a.state === "updating")
+    return <div className="fwbar busy" role="status"><div><strong>Updating Claude Buddy to {a.latest}…</strong>
+      <small>It restarts by itself in about a minute; this page comes back on its own.</small></div></div>;
+  if (a.state === "error" && a.msg)
+    return <div className="fwbar err" role="alert"><div><strong>Claude Buddy didn't update</strong><small>{a.msg}</small></div>
+      <button className="btn primary" onClick={updateApp}>Try again</button></div>;
+  if (!a.update || !a.can) return null;
+  return (
+    <div className="fwbar">
+      <div>
+        <strong>Claude Buddy {a.latest} is out</strong>
+        <small>{s.settings.auto_update ? "It installs itself once Claude Code has been quiet for 10 minutes. Or now:" : "Automatic updates are off."}</small>
+      </div>
+      <button className="btn primary" onClick={updateApp}>Update now</button>
+    </div>
   );
 }
 
@@ -539,6 +565,8 @@ export default function App() {
       toast(`Connected ${how}`);
     } else if (was && was !== "flash") toast("Disconnected - looking for it…", "warn");
   }, [linkKey]);
+  const updating = useRef(false);                  // the last we heard: Claude Buddy was updating itself
+  if (bridge) updating.current = !!(s.app && s.app.state === "updating");
   const fwState = bridge && s.firmware ? s.firmware.state : "";
   const prevFw = useRef(fwState);
   useEffect(() => {
@@ -568,8 +596,9 @@ export default function App() {
       : "Plug it in with USB or switch it on, then connect. If Claude Buddy is running on this computer, the page finds it by itself.";
   } else {
     status = down ? "bad" : "wait";
-    title = down ? "Claude Buddy isn't running" : "Connecting…";
-    sub = down ? "It starts by itself when you log in, and again within a minute if it ever stops. You can also start it now; this page comes back by itself." : "";
+    title = down ? (updating.current ? "Updating Claude Buddy…" : "Claude Buddy isn't running") : "Connecting…";
+    sub = !down ? "" : updating.current ? "Installing the new version. It starts again by itself in about a minute; this page comes back on its own."
+      : "It starts by itself when you log in, and again within a minute if it ever stops. You can also start it now; this page comes back by itself.";
   }
 
   return (
@@ -626,6 +655,7 @@ export default function App() {
             ))}
           </nav>
           <main className="content">
+            {bridge && <AppBar s={s} />}
             {bridge && <FirmwareBar s={s} />}
             {shown === "overview" && (ctl.via === "bridge" ? <><Readouts s={s} /><Connection s={s} /></> : <Install n="01" />)}
             {shown === "screen" && <Screen ctl={ctl} faces={(bridge && s.faces) || FACES} pick={pick} setPick={setPick} />}

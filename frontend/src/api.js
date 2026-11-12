@@ -36,6 +36,8 @@ async function call(path, body) {
 export const sendLine = (line) => call("api/board", { line }).catch(() => {});
 /** Put the newest firmware on the board (over USB; progress shows in the state). */
 export const flashFirmware = () => call("api/firmware", { action: "flash" }).catch(() => {});
+/** Install the newest Claude Buddy now (it restarts by itself). */
+export const updateApp = () => call("api/firmware", { action: "update_app" }).catch(() => {});
 /** Change settings: { lyrics: false }, { lyrics_offset: 0.4 }, { link: "ble" } ... */
 export const saveSettings = (change) => call("api/settings", change).catch(() => {});
 

@@ -100,9 +100,9 @@ class WebApp:
                     app.changes.put(body)
                     return self._send(200, '{"ok":true}')
                 if self.path == "/api/firmware":
-                    if body.get("action") != "flash":
+                    if body.get("action") not in ("flash", "update_app"):
                         return self._send(400, '{"error":"bad request"}')
-                    app.actions.put("flash")
+                    app.actions.put(body["action"])
                     return self._send(200, '{"ok":true}')
                 if self.path == "/api/board":
                     line = str(body.get("line", ""))

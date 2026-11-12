@@ -119,8 +119,13 @@ pause, 3 taps skip to the next song, 4 taps go back.
 
 ## Updating
 
-**On any computer that already has Claude Buddy**, run the same install command
-again. It updates Claude Buddy and keeps your stats, streaks and settings.
+**Claude Buddy updates itself.** A few times a day it checks this repository for a
+newer version. When there is one, it waits until Claude Code has been quiet for 10
+minutes, installs it (the same way the install command does), and starts again,
+about half a minute later. Your stats, streaks and settings are kept. The settings
+page shows when a new version is out, with an **Update now** button, and the
+**Update automatically** switch turns this off. Running the install command again
+also updates it.
 
 **The board's firmware** updates from the settings page. The board reports its
 firmware version; when a newer one is available (shipped with Claude Buddy, or
