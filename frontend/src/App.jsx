@@ -569,7 +569,7 @@ export default function App() {
   } else {
     status = down ? "bad" : "wait";
     title = down ? "Claude Buddy isn't running" : "Connecting…";
-    sub = down ? "It starts by itself when you log in. To start it now, open Claude Buddy from the Start menu (or run claude-buddy-service); this page comes back by itself." : "";
+    sub = down ? "It starts by itself when you log in, and again within a minute if it ever stops. You can also start it now; this page comes back by itself." : "";
   }
 
   return (
@@ -602,6 +602,8 @@ export default function App() {
                 <button className="btn ghost" disabled={!linked} onClick={() => ctl.send("G:1")}>Play a game</button>
                 {ctl.via !== "bridge" && <button className="btn link" onClick={dev.disconnect}>Disconnect</button>}
               </>
+            ) : !HOSTED && down ? (
+              <a className="btn primary" href="claude-buddy://start">Start Claude Buddy</a>
             ) : HOSTED && (
               <>
                 <button className="btn primary" disabled={!canUsb || dev.busy} onClick={dev.connectUsb}>Connect over USB</button>

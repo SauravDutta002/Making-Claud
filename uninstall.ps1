@@ -4,6 +4,14 @@
 
 function Uninstall-ClaudeBuddy {
     $ErrorActionPreference = "Stop"
+    # Windows PowerShell 5.1 turns a program's error-stream text into a stop. uv says "already in PATH"
+    # (on stderr) when you update, so run such commands where only a real failure counts.
+    function Quiet { $old = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+                     try { & @args *> $null } catch { } finally { $ErrorActionPreference = $old } }
+    # the background task first, or its every-minute check would start Claude Buddy again
+    Stop-ScheduledTask -TaskName "Claude Buddy" -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName "Claude Buddy" -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item "HKCU:\Software\Classes\claude-buddy" -Recurse -Force -ErrorAction SilentlyContinue
     Get-Process claude-buddy, claude-buddy-service -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
         Where-Object { $_.CommandLine -match 'claude_bridge' } |
@@ -14,7 +22,7 @@ function Uninstall-ClaudeBuddy {
     if ($uv) {
         $bin = (& $uv tool dir --bin).Trim()
         if (Test-Path "$bin\claude-buddy-setup.exe") { & "$bin\claude-buddy-setup.exe" --remove }   # hooks out
-        & $uv tool uninstall claude-buddy 2>$null | Out-Null
+        Quiet $uv tool uninstall claude-buddy
     }
     foreach ($place in @([Environment]::GetFolderPath("Startup"), [Environment]::GetFolderPath("Programs"))) {
         Remove-Item (Join-Path $place "Claude Buddy.lnk") -Force -ErrorAction SilentlyContinue

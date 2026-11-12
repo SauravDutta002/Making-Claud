@@ -42,7 +42,7 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 ALREADY_RUNNING = 3                # exit code: another Claude Buddy already runs on this computer
 
 try:
@@ -1884,6 +1884,7 @@ def main():
     beat_at = 0.0                  # last heartbeat to the board
     busy_said = None               # a USB port we said is busy (said once, not on every retry)
     usb_probe = 0.0                # on Bluetooth in auto mode: next look for a USB cable
+    usb_seen = None                # ...and the port it saw last time (a fresh cable needs a moment)
     while True:
         mode = "ble" if a.ble else "usb" if a.usb else S["link"]
         if relink:                         # the connection setting changed
@@ -1945,7 +1946,8 @@ def main():
             usb_probe = time.time() + 5
             port = find_port()
             usb = None
-            if port:
+            settled, usb_seen = port is not None and port == usb_seen, port   # seen twice, 5 s apart
+            if settled:
                 try:
                     usb = open_serial(port, a.baud)
                 except (serial.SerialException, OSError):

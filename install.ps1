@@ -16,6 +16,10 @@ function Install-ClaudeBuddy {
     function Step($text) { Write-Host ""; Write-Host "==> $text" -ForegroundColor Yellow }
     function Done($text) { Write-Host "    $text" -ForegroundColor Green }
     function Note($text) { Write-Host "    $text" -ForegroundColor DarkGray }
+    # Windows PowerShell 5.1 turns a program's error-stream text into a stop. uv says "already in PATH"
+    # (on stderr) when you update, so run such commands where only a real failure counts.
+    function Quiet { $old = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+                     try { & @args *> $null } catch { } finally { $ErrorActionPreference = $old } }
 
     Write-Host ""
     Write-Host "  * Claude Buddy" -ForegroundColor DarkYellow
@@ -35,6 +39,7 @@ function Install-ClaudeBuddy {
     Done (& $uv --version)
 
     # a running bridge holds the board's port and its own files: stop it while we update
+    Stop-ScheduledTask -TaskName "Claude Buddy" -ErrorAction SilentlyContinue
     Get-Process claude-buddy, claude-buddy-service -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
         Where-Object { $_.CommandLine -match 'claude_bridge' } |
@@ -45,7 +50,7 @@ function Install-ClaudeBuddy {
     & $uv tool install --force --reinstall --python 3.12 $Pkg
     if ($LASTEXITCODE -ne 0) { throw "install failed - see the messages above." }
     $bin = (& $uv tool dir --bin).Trim()
-    & $uv tool update-shell 2>$null | Out-Null                  # claude-buddy on your PATH
+    Quiet $uv tool update-shell                                 # claude-buddy on your PATH
     Done "installed: $bin\claude-buddy.exe"
 
     # 3. Claude Code: hooks + status line (your settings are backed up first)
@@ -66,21 +71,54 @@ function Install-ClaudeBuddy {
         Note "to update its firmware later: plug it in over USB and run  claude-buddy-flash"
     }
 
-    # 5. start now and at every login: in the background, no window, restarting itself if it stops
+    # 5. run it as a background task: started at login, and started again within a minute
+    #    if it ever stops. No window, no admin rights needed.
     Step "Starting"
     $exe = "$bin\claude-buddy-service.exe"
     $shell = New-Object -ComObject WScript.Shell
-    foreach ($place in @([Environment]::GetFolderPath("Startup"), [Environment]::GetFolderPath("Programs"))) {
-        $lnk = $shell.CreateShortcut((Join-Path $place "Claude Buddy.lnk"))
-        $lnk.TargetPath = $exe
-        $lnk.WorkingDirectory = $env:USERPROFILE
-        $lnk.Description = "Claude Buddy (runs in the background)"
-        $lnk.Save()
-    }
+    $startup = Join-Path ([Environment]::GetFolderPath("Startup")) "Claude Buddy.lnk"
+    $lnk = $shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath("Programs")) "Claude Buddy.lnk"))
+    $lnk.TargetPath = $exe
+    $lnk.WorkingDirectory = $env:USERPROFILE
+    $lnk.Description = "Claude Buddy (runs in the background)"
+    $lnk.Save()
     $url = Join-Path ([Environment]::GetFolderPath("Programs")) "Claude Buddy Settings.url"
     Set-Content -Path $url -Value "[InternetShortcut]`r`nURL=http://localhost:47801/`r`n" -Encoding ASCII
-    Start-Process -FilePath $exe
-    Done "Claude Buddy is running in the background, and starts by itself when you log in"
+
+    # claude-buddy:// - lets the settings page start it with one click if it's ever off
+    $proto = "HKCU:\Software\Classes\claude-buddy"
+    New-Item -Path "$proto\shell\open\command" -Force | Out-Null
+    Set-ItemProperty -Path $proto -Name "(Default)" -Value "URL:Claude Buddy"
+    Set-ItemProperty -Path $proto -Name "URL Protocol" -Value ""
+    Set-ItemProperty -Path "$proto\shell\open\command" -Name "(Default)" -Value "`"$exe`""
+
+    $task = $false
+    try {
+        $me = "$env:USERDOMAIN\$env:USERNAME"
+        $triggers = @(
+            (New-ScheduledTaskTrigger -AtLogOn -User $me),
+            (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1))
+        )
+        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+                 -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew `
+                 -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+        Register-ScheduledTask -TaskName "Claude Buddy" -Force -Action (New-ScheduledTaskAction -Execute $exe) `
+            -Trigger $triggers -Settings $set -Description "Claude Buddy: the little screen that reacts to Claude Code" `
+            -Principal (New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited) | Out-Null
+        Start-ScheduledTask -TaskName "Claude Buddy"
+        Remove-Item $startup -Force -ErrorAction SilentlyContinue      # the task starts it at login now
+        $task = $true
+    } catch {
+        Note "couldn't create the background task ($($_.Exception.Message)) - using a startup shortcut instead"
+    }
+    if (-not $task) {
+        $lnk = $shell.CreateShortcut($startup)
+        $lnk.TargetPath = $exe
+        $lnk.WorkingDirectory = $env:USERPROFILE
+        $lnk.Save()
+        Start-Process -FilePath $exe
+    }
+    Done "Claude Buddy is running in the background: it starts when you log in, and again by itself if it ever stops"
     Done "status and settings: http://localhost:47801  (Start menu > Claude Buddy Settings)"
 
     Write-Host ""
