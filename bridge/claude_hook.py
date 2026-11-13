@@ -139,6 +139,15 @@ def todo_msg(tool, inp, session):
             "status": inp.get("status"), "text": text(inp)}
 
 
+def is_limit(d):
+    """StopFailure because you hit your usage / rate limit (not some other API error)."""
+    err = d.get("error") or d.get("error_type") or ""
+    if isinstance(err, dict):
+        err = err.get("type") or err.get("message") or ""
+    text = (str(err) + " " + str(d.get("error_details") or d.get("message") or "")).lower()
+    return "rate_limit" in text or "limit" in text or "usage" in text
+
+
 def main():
     try:
         d = json.load(sys.stdin)
@@ -157,7 +166,9 @@ def main():
     if ev == "PreToolUse":                          # (your prompt is never sent to the screen)
         send("T:" + clean(ticker(tool, inp)))
 
-    if ev in SIMPLE_EVENT:
+    if ev == "StopFailure" and is_limit(d):
+        send("E:limit")                             # out of usage -> the "limit hit" face
+    elif ev in SIMPLE_EVENT:
         send(f"E:{SIMPLE_EVENT[ev]}")
     elif ev in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
         phase = "pre" if ev == "PreToolUse" else "post"

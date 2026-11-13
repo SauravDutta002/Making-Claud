@@ -42,7 +42,7 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 ALREADY_RUNNING = 3                # exit code: another Claude Buddy already runs on this computer
 
 try:
@@ -1555,6 +1555,7 @@ EVENTS = {
     "test":    ("running tests",       YELLOW, "o", "_", " ..."),
     "bug":     ("tests passed!",       GREEN,  "^", "v", " !"),
     "fail":    ("something failed",    RED,    "x", "_", " !"),
+    "limit":   ("out of usage",        RED,    "x", "_", " !"),
     "pkg":     ("installing packages", YELLOW, "o", "_", " []"),
     "need":    ("needs you!",          RED,    "O", "o", " !!"),
     "done":    ("all done",            GREEN,  "^", "v", " *"),
@@ -2154,6 +2155,13 @@ def main():
                         stats.bump("tasks" if ev == "done" else "tests")
                         fresh += progress.record("tasks" if ev == "done" else "tests")
                         stats_changed = True
+                if line == "E:limit":              # usage limit hit: the board's "limit hit" face
+                    try:                           # (idle ends the turn; a full 5-hour bar shows it)
+                        _, wk, mins = (sticky.get("U") or "U:0,-1,-1")[2:].split(",")[:3]
+                    except ValueError:
+                        wk, mins = "-1", "-1"
+                    out("E:idle")
+                    line = sticky["U"] = f"U:100,{wk},{mins}"
                 if a.verbose:
                     say("> " + line, "tx")
                 out(line)

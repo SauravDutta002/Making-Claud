@@ -22,7 +22,7 @@ EVENTS = {
     "UserPromptSubmit": None, "PreToolUse": None,
     "PostToolUse": "Bash|PowerShell", "PostToolUseFailure": "Bash|PowerShell",
     "Notification": None, "PermissionRequest": None,
-    "Stop": None, "SubagentStop": None, "PreCompact": None,
+    "Stop": None, "StopFailure": None, "SubagentStop": None, "PreCompact": None,
     "SessionStart": None, "SessionEnd": None,
 }
 

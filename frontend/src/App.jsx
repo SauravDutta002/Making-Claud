@@ -197,9 +197,9 @@ function Install({ n = "02", title = "Make it react to Claude Code" }) {
 const EVENT_FACE = {
   think: 2, read: 4, type: 5, write: 47, search: 31, web: 8, bash: 30, ps: 30, build: 47,
   git: 57, plane: 42, merge: 58, test: 9, need: 10, done: 55, fail: 39, bug: 24, compact: 11,
-  pkg: 34, wait: 41, key: 44,
+  pkg: 34, wait: 41, key: 44, limit: 38,
 };
-const isActive = (c) => !!c && c.ago < 45 && !["idle", "key", "done"].includes(c.ev);
+const isActive = (c) => !!c && c.ago < 45 && !["idle", "key", "done", "limit"].includes(c.ev);
 
 function EqIcon({ on }) {
   return <span className={"eq" + (on ? " on" : "")} aria-hidden="true"><i /><i /><i /><i /></span>;
@@ -618,6 +618,7 @@ export default function App() {
   const busy = isActive(claude);
   // the drawing: a face you picked, else what Claude is doing, else music / the night sky
   const face = shown === "screen" && pick != null ? pick
+    : claude && claude.ev === "limit" && claude.ago < 3600 ? 38
     : busy && claude.ago < 20 && EVENT_FACE[claude.ev] != null ? EVENT_FACE[claude.ev]
     : bridge && s.music && s.music.state === 1 ? 70 : 69;
   const flashing = bridge && s.link === "flash";
@@ -697,6 +698,7 @@ export default function App() {
             <div className={"now" + (busy ? " busy" : "")}>
               <i aria-hidden="true" />
               {busy ? <span>Claude is <b>{claude.label}</b>{claude.doing && claude.doingAgo < 60 && <em>{claude.doing}</em>}</span>
+                : claude && claude.ev === "limit" && claude.ago < 3600 ? <span>Claude hit the <b>usage limit</b></span>
                 : <span>Claude Code is quiet</span>}
             </div>
           )}
