@@ -97,4 +97,12 @@ EOF
 fi
 
 done_ "settings: http://localhost:47801  (or run: claude-buddy-settings)"
+
+# say hello in the browser: the welcome page (and its "install the app" offer)
+i=0
+while [ $i -lt 30 ] && ! curl -fs -o /dev/null --max-time 2 http://localhost:47801/ 2>/dev/null; do sleep 1; i=$((i+1)); done
+if [ $i -lt 30 ]; then
+  if command -v open >/dev/null 2>&1 && [ "$(uname -s)" = "Darwin" ]; then open "http://localhost:47801/?welcome" 2>/dev/null || true
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "http://localhost:47801/?welcome" >/dev/null 2>&1 || true; fi
+fi
 printf '\n  \033[38;5;209mAll set. Restart Claude Code and watch the screen.\033[0m\n\n'

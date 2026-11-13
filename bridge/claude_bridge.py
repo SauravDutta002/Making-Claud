@@ -42,7 +42,7 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 ALREADY_RUNNING = 3                # exit code: another Claude Buddy already runs on this computer
 
 try:
@@ -1566,6 +1566,20 @@ EVENTS = {
 
 UI = None   # the Dashboard, once main() starts it
 
+_hooked = [0.0, None]
+
+
+def claude_hooked():
+    """Are our hooks in Claude Code's settings? (checked at most every 10 s)"""
+    if time.time() - _hooked[0] > 10:
+        try:
+            with open(os.path.join(os.path.expanduser("~"), ".claude", "settings.json"), encoding="utf-8-sig") as f:
+                _hooked[1] = "claude_hook" in f.read()
+        except OSError:
+            _hooked[1] = False
+        _hooked[0] = time.time()
+    return _hooked[1]
+
 
 def say(msg, kind="info"):
     """Log a line: into the dashboard's activity feed, or plain stdout."""
@@ -2215,7 +2229,7 @@ def main():
                     u = ui._nums(sticky.get("U"), 3)
                     web.state = {
                         "version": VERSION, "link": ui.link, "port": ui.port, "rssi": ui.rssi,
-                        "linkMode": mode,
+                        "linkMode": mode, "hooks": claude_hooked(),
                         "claude": {"ev": ui.ev, "label": EVENTS.get(ui.ev, (ui.ev,))[0],
                                    "ago": int(time.time() - ui.ev_at),
                                    "doing": getattr(ui, "doing", "") or "",

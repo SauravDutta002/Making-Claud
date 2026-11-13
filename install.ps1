@@ -121,6 +121,16 @@ function Install-ClaudeBuddy {
     Done "Claude Buddy is running in the background: it starts when you log in, and again by itself if it ever stops"
     Done "status and settings: http://localhost:47801  (Start menu > Claude Buddy Settings)"
 
+    # say hello in the browser: the welcome page (and its "install the app" offer)
+    $up = $false
+    for ($i = 0; $i -lt 30 -and -not $up; $i++) {
+        try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://localhost:47801/" | Out-Null; $up = $true }
+        catch { Start-Sleep -Seconds 1 }
+    }
+    if ($up) {
+        try { Start-Process "http://localhost:47801/?welcome"; Done "opened the welcome page in your browser" } catch { }
+    }
+
     Write-Host ""
     Write-Host "  All set. Restart Claude Code and watch the screen." -ForegroundColor DarkYellow
     Write-Host ""
