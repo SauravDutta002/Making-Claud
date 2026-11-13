@@ -39,11 +39,16 @@ function Install-ClaudeBuddy {
     Done (& $uv --version)
 
     # a running bridge holds the board's port and its own files: stop it while we update
-    Stop-ScheduledTask -TaskName "Claude Buddy" -ErrorAction SilentlyContinue
-    Get-Process claude-buddy, claude-buddy-service -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
-        Where-Object { $_.CommandLine -match 'claude_bridge' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # (and pause its task, which would otherwise start it again within a minute)
+    function Stop-Buddy {
+        try { Disable-ScheduledTask -TaskName "Claude Buddy" -ErrorAction Stop | Out-Null } catch { }
+        Stop-ScheduledTask -TaskName "Claude Buddy" -ErrorAction SilentlyContinue
+        Get-Process claude-buddy, claude-buddy-service -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
+            Where-Object { $_.CommandLine -match 'claude_bridge|claude_buddy\.(claude_bridge|service)' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    Stop-Buddy
 
     # 2. the claude-buddy commands (Python 3.12 comes with them)
     Step "Installing Claude Buddy"
@@ -63,6 +68,7 @@ function Install-ClaudeBuddy {
     if ($port) {
         $answer = Read-Host "    Found the board on $port. Install the latest firmware on it? [Y/n]"
         if ($answer -notmatch '^[nN]') {
+            Stop-Buddy; Start-Sleep -Seconds 1                   # make sure nothing holds the port
             & "$bin\claude-buddy-flash.exe" --port $port
             if ($LASTEXITCODE -ne 0) { Note "flashing didn't work - replug the board and run this again" }
         }
@@ -121,15 +127,15 @@ function Install-ClaudeBuddy {
     Done "Claude Buddy is running in the background: it starts when you log in, and again by itself if it ever stops"
     Done "status and settings: http://localhost:47801  (Start menu > Claude Buddy Settings)"
 
-    # say hello in the browser: the welcome page (and its "install the app" offer)
-    $up = $false
-    for ($i = 0; $i -lt 30 -and -not $up; $i++) {
-        try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://localhost:47801/" | Out-Null; $up = $true }
+    # say hello in the browser: the welcome page (and its "install the app" offer).
+    # Give Claude Buddy a moment to come up; the page also waits for it by itself.
+    Note "opening the welcome page..."
+    for ($i = 0; $i -lt 40; $i++) {
+        try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 2 "http://127.0.0.1:47801/" | Out-Null; break }
         catch { Start-Sleep -Seconds 1 }
     }
-    if ($up) {
-        try { Start-Process "http://localhost:47801/?welcome"; Done "opened the welcome page in your browser" } catch { }
-    }
+    try { Start-Process "http://localhost:47801/?welcome"; Done "opened the welcome page in your browser" }
+    catch { Note "open http://localhost:47801/?welcome in your browser" }
 
     Write-Host ""
     Write-Host "  All set. Restart Claude Code and watch the screen." -ForegroundColor DarkYellow
