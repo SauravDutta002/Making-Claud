@@ -53,7 +53,10 @@ export function useBridge() {
       let wait = 1000;
       try {
         const s = await call("api/state");
-        if (alive.current) { setState(s); setDown(false); }
+        // just after Claude Buddy starts, the state is still empty for a moment:
+        // wait for the full picture instead of drawing half of it
+        if (alive.current && s && s.version) { setState(s); setDown(false); }
+        else wait = 400;
       } catch {
         if (alive.current) setDown(true);
         wait = 3000;                           // not running: look again every few seconds

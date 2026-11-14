@@ -15,8 +15,26 @@ if (import.meta.env.PROD && "serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
 }
 
+// if anything ever trips while drawing, start the page over by itself (a few
+// times) rather than leaving a blank screen until someone refreshes
+class Recover extends React.Component {
+  state = { n: 0, broken: false };
+  static getDerivedStateFromError() { return { broken: true }; }
+  componentDidCatch(err) {
+    console.error(err);
+    if (this.state.n < 5) setTimeout(() => this.setState((s) => ({ n: s.n + 1, broken: false })), 800);
+  }
+  render() {
+    if (!this.state.broken) return <App key={this.state.n} />;
+    return this.state.n < 5 ? null : (
+      <div className="crash"><p>Something went wrong on this page.</p>
+        <button className="btn primary" onClick={() => location.reload()}>Reload</button></div>
+    );
+  }
+}
+
 createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <App />
+    <Recover />
   </React.StrictMode>
 );

@@ -457,4 +457,5 @@ html:has(.welcome:not(.out)) { overflow: hidden; }
 .linkish { padding: 0; border: 0; background: none; color: inherit; font: inherit; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
 .linkish:hover { color: var(--ink); }
 
+.crash { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 14px; color: var(--ink-2); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

@@ -42,7 +42,7 @@ import time
 from collections import deque
 
 UDP_HOST, UDP_PORT = "127.0.0.1", 47800
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 ALREADY_RUNNING = 3                # exit code: another Claude Buddy already runs on this computer
 
 try:
