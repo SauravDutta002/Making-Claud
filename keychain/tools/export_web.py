@@ -2,7 +2,7 @@
 export_web.py - packs the keychain's screens (from frames.h) for the remote app,
 so its previews play exactly what the hardware shows.
 
-    python tools/export_web.py      -> web/public/screens.bin
+    python tools/export_web.py      -> frontend/public/screens.bin
 
 Format (gzipped): b"KC1", count (1 byte); per screen: name length (1) + name,
 frame count (2, little-endian), per frame its delay in ms (2); then every
@@ -39,7 +39,7 @@ def main():
             cur = frames[first + k]
             data += bytes(a ^ b for a, b in zip(cur, prev))
             prev = cur
-    out = os.path.join(ROOT, "web", "public", "screens.bin")
+    out = os.path.join(ROOT, "frontend", "public", "screens.bin")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "wb") as f:
         f.write(gzip.compress(bytes(head + data), 9))
