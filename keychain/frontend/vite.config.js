@@ -1,10 +1,10 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// The built app goes to ../app (served by tools/preview.py at /app, or upload
-// that folder to any https host - Bluetooth on a phone needs https).
+// Locally the built app goes to ../app (served by tools/preview.py at /app).
+// On Vercel (the hosted, https version for phones) it goes to dist/.
 export default defineConfig({
   plugins: [react()],
   base: "./",
-  build: { outDir: "../app", emptyOutDir: true, assetsInlineLimit: 0 },
+  build: { outDir: process.env.VERCEL ? "dist" : "../app", emptyOutDir: true, assetsInlineLimit: 0 },
 });

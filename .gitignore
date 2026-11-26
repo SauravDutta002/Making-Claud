@@ -13,3 +13,7 @@ bridge/progress.json
 # the settings page's build tools (the built page is in bridge/web/)
 frontend/node_modules/
 frontend/dist/
+
+# the keychain remote's build tools (its built app is in keychain/app/)
+keychain/frontend/node_modules/
+keychain/frontend/dist/
