@@ -5,6 +5,7 @@ import { useKeychain, canBluetooth } from "./ble.js";
 import { useSpotify, spotifyLogin, spotifyLogout, spotifyRedirect, savedClientId } from "./spotify.js";
 import { useLastfm, savedLastfm, saveLastfm, forgetLastfm } from "./lastfm.js";
 import { useNowPlaying, useBeat, openNotificationAccess, isNativeApp } from "./nowplaying.js";
+import { useLatestFirmware, downloadFirmware, flashUsb, newer, canUsb } from "./firmware.js";
 
 const TABS = [["screens", "Screens"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
 const PLAYER = "Record player";
@@ -293,6 +294,90 @@ function Music({ kc, sp, lf, np, beat, relinkLastfm, manual, setManual, sendManu
   );
 }
 
+/* ------------------------------------------------------------ firmware updates */
+
+// one update at a time, shared by the banner and the Settings section
+function useFirmware(kc, toast) {
+  const latest = useLatestFirmware();
+  const [job, setJob] = useState(null);           // { how, pct, step } while it runs; { err } if it failed
+  const linked = kc.link === "on";
+  const known = linked && kc.count > 0;           // the keychain has told us about itself (F: comes before K:)
+  const version = kc.fw?.version || (known ? "1.x" : "");
+  const canBle = known && !!kc.fw?.ota;
+  const update = !!latest && known && (!kc.fw || newer(latest.version, kc.fw.version));
+
+  async function run(how, work) {
+    let lock = null;
+    try { lock = await navigator.wakeLock?.request("screen"); } catch {}   // keep the phone awake meanwhile
+    setJob({ how, pct: 0, step: "Downloading the firmware…" });
+    try {
+      await work((pct) => setJob((j) => ({ ...j, pct, step: how === "ble" ? "Sending it over Bluetooth…" : j.step })),
+                 (step) => setJob((j) => ({ ...j, step })));
+      setJob(null);
+      toast(`Keychain updated to ${latest.version}`);
+    } catch (e) {
+      if (e?.name === "NotFoundError") setJob(null);   // closed the port picker
+      else setJob({ how, err: e?.message || "Something went wrong" });
+    } finally { lock?.release?.().catch(() => {}); }
+  }
+  const viaBle = () => run("ble", async (pct) => kc.updateFirmware(await downloadFirmware(latest), latest.md5, pct));
+  const viaUsb = () => run("usb", (pct, step) => flashUsb(latest, pct, step));
+  return { latest, job, version, update, canBle, known, viaBle, viaUsb, clear: () => setJob(null) };
+}
+
+function FwProgress({ job }) {
+  const pct = Math.round((job.pct || 0) * 100);
+  return <div className="fwprog"><div className="meter"><i style={{ width: pct + "%" }} /></div><span>{pct}%</span></div>;
+}
+
+// the Claude Buddy-style banner on top: "New firmware for your keychain"
+function FirmwareBar({ fw }) {
+  const { job, latest } = fw;
+  if (job && !job.err)
+    return (
+      <div className="fwbar busy" role="status">
+        <div><strong>Updating the keychain…</strong>
+          <small>{job.step} {job.how === "ble" ? "Keep the phone close and this app open." : "Keep the cable plugged in."} It restarts when it's done.</small></div>
+        <FwProgress job={job} />
+      </div>
+    );
+  if (job?.err)
+    return <div className="fwbar err" role="alert"><div><strong>Keychain not updated</strong><small>{job.err} Your keychain still works as before.</small></div>
+      <button className="btn ghost" onClick={fw.clear}>OK</button></div>;
+  if (!fw.update) return null;
+  return (
+    <div className="fwbar">
+      <div>
+        <strong>New firmware for your keychain: {latest.version}</strong>
+        <small>{fw.canBle ? `It's on ${fw.version}. Over Bluetooth, about a minute.`
+          : `It's on ${fw.version}, which can't update over Bluetooth yet: update it once with the USB cable${canUsb ? "" : " from a computer (Chrome or Edge)"}.`}</small>
+      </div>
+      <div className="actions">
+        {fw.canBle && <button className="btn primary" onClick={fw.viaBle}>Update over Bluetooth</button>}
+        {canUsb && <button className={"btn " + (fw.canBle ? "ghost" : "primary")} onClick={fw.viaUsb}>Update with USB cable</button>}
+      </div>
+    </div>
+  );
+}
+
+function FirmwarePanel({ kc, fw }) {
+  const busy = fw.job && !fw.job.err;
+  const linked = kc.link === "on";
+  return (
+    <section className="panel">
+      <div className="panel-head"><h2>Firmware</h2>{fw.known && !fw.update && <span className="pill ok">Up to date</span>}</div>
+      <Row title="On the keychain" hint={linked ? (fw.known ? "" : "Asking it…") : "Connect to see it"}>
+        <span className="mono">{fw.version || "-"}</span></Row>
+      <Row title="Newest" hint={fw.latest ? `Released ${fw.latest.built}` : "Looking…"}><span className="mono">{fw.latest?.version || "-"}</span></Row>
+      <Row title="Over Bluetooth" hint={fw.canBle ? "The app sends it to the keychain. Keep the phone close." : linked ? "Needs firmware 2.0 or newer: update once with the cable." : "Connect to the keychain first."}>
+        <button className="btn primary sm" disabled={!fw.canBle || busy || !fw.latest} onClick={fw.viaBle}>Update</button></Row>
+      <Row title="With the USB cable" hint={canUsb ? "Plug the keychain into this computer. Works on any keychain, even one that's never been updated." : "On a computer, in Chrome or Edge."}>
+        <button className="btn ghost sm" disabled={!canUsb || busy || !fw.latest} onClick={fw.viaUsb}>Update</button></Row>
+      {busy && <FwProgress job={fw.job} />}
+    </section>
+  );
+}
+
 function Settings({ kc }) {
   const off = kc.link !== "on";
   return (
@@ -343,6 +428,7 @@ export default function App() {
   const [lfVersion, setLfVersion] = useState(0);
   const lf = useLastfm(lfVersion);
   const np = useNowPlaying();
+  const fw = useFirmware(kc, toast);
   // the beat -> keychain, ~8x a second while a song plays (A:<0-99>, as Claude Buddy's bridge sends)
   const beatAt = useRef(0), linkedRef = useRef(false), playingRef = useRef(false);
   const beat = useBeat((level) => {
@@ -451,9 +537,10 @@ export default function App() {
 
       <main className="content">
         <UpdateBanner />
+        <FirmwareBar fw={fw} />
         {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} />}
         {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} beat={beat} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
-        {tab === "settings" && <Settings kc={kc} />}
+        {tab === "settings" && <><Settings kc={kc} /><FirmwarePanel kc={kc} fw={fw} /></>}
         {tab === "help" && <Help />}
       </main>
 

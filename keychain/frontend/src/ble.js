@@ -9,11 +9,12 @@ import { BleClient } from "@capacitor-community/bluetooth-le";
 const NUS = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";   // we write here
 const TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";   // the keychain notifies here
+const OTA = "6e400004-b5a3-f393-e0a9-e50e24dcca9e";  // firmware updates go here (firmware 2.0+)
 const native = Capacitor.isNativePlatform();
 
 export const canBluetooth = native || (typeof navigator !== "undefined" && !!navigator.bluetooth);
 
-/* ---- the two transports: pick(), open(dev, onData, onDrop) -> { write(bytes), close() } ---- */
+/* ---- the two transports: pick(), open(dev, onData, onDrop) -> { write(bytes), ota(bytes)|null, close() } ---- */
 const web = {
   async pick() {
     const d = await navigator.bluetooth.requestDevice({ filters: [{ services: [NUS] }, { namePrefix: "Snoopy" }], optionalServices: [NUS] });
@@ -40,7 +41,8 @@ const web = {
     const tx = await svc.getCharacteristic(TX);
     await tx.startNotifications();
     tx.addEventListener("characteristicvaluechanged", (e) => onData(new TextDecoder().decode(e.target.value)));
-    return { write: (b) => rx.writeValueWithoutResponse(b), close: () => d.gatt.disconnect() };
+    const ota = await svc.getCharacteristic(OTA).catch(() => null);      // older firmware: no Bluetooth updates
+    return { write: (b) => rx.writeValueWithoutResponse(b), ota: ota && ((b) => ota.writeValueWithResponse(b)), close: () => d.gatt.disconnect() };
   },
 };
 
@@ -67,6 +69,7 @@ const nat = {
     await BleClient.startNotifications(dev.id, NUS, TX, (dv) => onData(new TextDecoder().decode(dv)));
     return {
       write: (b) => BleClient.writeWithoutResponse(dev.id, NUS, RX, new DataView(b.buffer, b.byteOffset, b.byteLength)),
+      ota: (b) => BleClient.write(dev.id, NUS, OTA, new DataView(b.buffer, b.byteOffset, b.byteLength)),
       close: () => BleClient.disconnect(dev.id),
     };
   },
@@ -74,13 +77,18 @@ const nat = {
 const T = native ? nat : web;
 
 export function useKeychain(onEvent) {
-  const [state, setState] = useState({ link: "off", name: "", screen: 0, count: 0, bri: 5, vol: 3, snd: true, names: [] });
+  const [state, setState] = useState({ link: "off", name: "", screen: 0, count: 0, bri: 5, vol: 3, snd: true, names: [], fw: null });
+  const waiters = useRef([]);                    // someone waiting for a line from the keychain (updates)
   const link = useRef(null), dev = useRef(null), buf = useRef(""), queue = useRef(Promise.resolve());
   const wanted = useRef(false);                  // stay connected: reconnect by itself if the link drops
   const evt = useRef(onEvent); evt.current = onEvent;
 
   function onLine(line) {
-    if (line.startsWith("K:")) {
+    for (const w of waiters.current.slice()) if (w.test(line)) { waiters.current.splice(waiters.current.indexOf(w), 1); w.done(line); }
+    if (line.startsWith("F:")) {                 // F:<version>,ota
+      const [version, ...rest] = line.slice(2).split(",");
+      setState((s) => ({ ...s, fw: { version, ota: rest.includes("ota") } }));
+    } else if (line.startsWith("K:")) {
       const [screen, count, bri, vol, snd] = line.slice(2).split(",").map(Number);
       setState((s) => ({ ...s, screen, count, bri, vol, snd: !!snd, names: Array.from({ length: count }, (_, i) => s.names[i] || "") }));
     } else if (line.startsWith("N:")) {
@@ -118,7 +126,7 @@ export function useKeychain(onEvent) {
   async function attach(d) {
     dev.current = d;
     try { localStorage.setItem("kc-device", d.id); localStorage.setItem("kc-name", d.name || ""); } catch {}
-    setState((s) => ({ ...s, link: "connecting", name: d.name }));
+    setState((s) => ({ ...s, link: "connecting", name: d.name, fw: null }));
     link.current = await T.open(d, onData, onDrop);
     setState((s) => ({ ...s, link: "on" }));
     evt.current?.("connected", d.name);
@@ -164,6 +172,39 @@ export function useKeychain(onEvent) {
     else if (!(await resume())) await connect();  // the browser forgot: one tap picks it again
   }
 
+  /** wait for a line from the keychain that starts with one of the prefixes */
+  function waitLine(prefixes, ms) {
+    return new Promise((res, rej) => {
+      const w = { test: (l) => prefixes.some((p) => l.startsWith(p)), done: (l) => { clearTimeout(t); res(l); } };
+      const t = setTimeout(() => { waiters.current.splice(waiters.current.indexOf(w), 1); rej(new Error("The keychain didn't answer")); }, ms);
+      waiters.current.push(w);
+    });
+  }
+
+  /** update the firmware over Bluetooth: bin = Uint8Array, md5 = hex; onProgress(0..1) */
+  async function updateFirmware(bin, md5, onProgress) {
+    const l = link.current;
+    if (!l) throw new Error("Connect to the keychain first");
+    if (!l.ota) throw new Error("This keychain's firmware can't update over Bluetooth yet: update it once with the USB cable");
+    const ready = waitLine(["U:ready", "U:err"], 20000);
+    await send(`U:${bin.length},${md5}`);
+    const r = await ready;
+    if (r.startsWith("U:err")) throw new Error("The keychain said: " + r.slice(6));
+    const piece = Math.max(20, Math.min(500, +r.split(",")[1] || 20));
+    try {
+      for (let i = 0; i < bin.length; i += piece) {
+        if (!link.current) throw new Error("The connection dropped. Nothing changed: try again");
+        await l.ota(bin.slice(i, i + piece));
+        onProgress?.(Math.min(1, (i + piece) / bin.length));
+      }
+    } catch (e) { send("U:abort"); throw e; }
+    const ok = waitLine(["U:ok", "U:err"], 30000);
+    await send("U:end");
+    const fin = await ok;
+    if (fin.startsWith("U:err")) throw new Error("The keychain said: " + fin.slice(6));
+    // it restarts now on the new firmware, and the app reconnects by itself
+  }
+
   function disconnect() { wanted.current = false; const l = link.current; link.current = null; l?.close(); setState((s) => ({ ...s, link: "off" })); }
 
   // optimistic local updates, so the controls feel instant
@@ -184,5 +225,5 @@ export function useKeychain(onEvent) {
   }, []);
   let lastName = "";
   try { lastName = localStorage.getItem("kc-name") || ""; } catch {}
-  return { ...state, lastName, connect, reconnect, disconnect, send, act };
+  return { ...state, lastName, connect, reconnect, disconnect, send, act, updateFirmware };
 }

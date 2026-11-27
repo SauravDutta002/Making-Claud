@@ -217,3 +217,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    import pack_frames                    # the packed copy the firmware uses
+    pack_frames.main()

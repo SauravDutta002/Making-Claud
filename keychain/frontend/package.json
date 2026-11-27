@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "build:android": "vite build --outDir dist && cap sync android"
+    "build:android": "vite build --outDir dist && node -e \"require('fs').rmSync('dist/firmware',{recursive:true,force:true})\" && cap sync android"
   },
   "dependencies": {
     "@capacitor-community/bluetooth-le": "6.0.1",
@@ -16,6 +16,7 @@
     "@capacitor/core": "6.2.0",
     "@fontsource/jetbrains-mono": "5.1.0",
     "@fontsource/space-grotesk": "5.1.0",
+    "esptool-js": "0.6.1",
     "react": "18.3.1",
     "react-dom": "18.3.1"
   },

@@ -36,9 +36,11 @@
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
-#include "frames.h"
+#include <Update.h>
+#include "frames_z.h"                // made from frames.h by tools/pack_frames.py
 
 /* ---------------- make it yours ---------------- */
+#define FW_VERSION   "2.0.0"   // bump it for each release: the app offers the update (tools/release_fw.py)
 #define CAPTION      ""      // a little name in the corner, e.g. "NNAN" ("" = none)
 #define SLEEP_MIN    5       // sleep after this many minutes untouched (0 = never)
 #define FLIP         0       // 1 = screen mounted upside down
@@ -260,13 +262,35 @@ void drawCaption() {
 uint16_t frameIdx = 0;
 uint32_t frameAt = 0;
 
+/* frames_z.h keeps only what changes from one frame to the next (packed):
+   the picture on screen lives here, and each step applies the next changes */
+uint8_t  kcBuf[1024];
+int16_t  bufAnim = -1, bufFrame = -1;
+
+void applyFrame(uint16_t g) {                  // XOR frame g's packed changes into kcBuf
+  uint32_t i = pgm_read_dword(&KC_ZOFF[g]);
+  uint16_t o = 0;
+  while (o < 1024) {
+    uint8_t c = pgm_read_byte(&KC_Z[i++]);
+    if (c < 128) { for (uint16_t k = 0; k <= c && o < 1024; k++) kcBuf[o++] ^= pgm_read_byte(&KC_Z[i++]); }
+    else { uint8_t v = pgm_read_byte(&KC_Z[i++]); for (uint16_t k = 0; k < (uint16_t)(c - 126) && o < 1024; k++) kcBuf[o++] ^= v; }
+  }
+}
+
+const uint8_t* frameBits(uint8_t a, uint16_t f) {
+  const KcAnim& an = KC_ANIMS[a];
+  if (bufAnim != a || (int16_t)f < bufFrame) { memset(kcBuf, 0, sizeof(kcBuf)); bufAnim = a; bufFrame = -1; }   // start over from frame 0
+  while (bufFrame < (int16_t)f) applyFrame(an.first + ++bufFrame);
+  return kcBuf;
+}
+
 void drawCustom(uint8_t a) {
   const KcAnim& an = KC_ANIMS[a];
   if (an.count == 0) return;
   uint32_t now = millis();
   uint16_t ms = pgm_read_word(&KC_DELAY[an.first + frameIdx % an.count]);
   if (now - frameAt >= ms) { frameIdx = (frameIdx + 1) % an.count; frameAt = now; }
-  display.drawBitmap(0, 0, KC_FRAMES[an.first + frameIdx % an.count], SCREEN_WIDTH, SCREEN_HEIGHT, C_WHITE);
+  display.drawBitmap(0, 0, frameBits(a, frameIdx % an.count), SCREEN_WIDTH, SCREEN_HEIGHT, C_WHITE);
 }
 
 /* ============================================================
@@ -440,7 +464,7 @@ void grooveRing(int cx, int cy, int r, float ang) {   // dashes travelling round
 
 void drawPlayer(uint32_t f) {
   const int RX = 64;
-  if (musicOn) discAngle += 0.05f + musicSmooth * 0.0006f;   // a little faster when it's louder
+  if (musicOn) discAngle += 0.07f;
   char song[44], artist[44] = "";
   strncpy(song, musicTitle[0] ? musicTitle : "music", sizeof(song) - 1);
   song[sizeof(song) - 1] = 0;
@@ -472,7 +496,6 @@ void drawPlayer(uint32_t f) {
   const int cx = 30, cy = 32;                             // the record
   display.drawCircle(cx, cy, 28, C_WHITE);
   display.drawCircle(cx, cy, 27, C_WHITE);
-  if (musicOn && beatGlow > 0.3f) display.drawCircle(cx, cy, 29, C_WHITE);   // the beat: the rim swells
   grooveRing(cx, cy, 24, discAngle);
   grooveRing(cx, cy, 20, discAngle);
   grooveRing(cx, cy, 16, discAngle);
@@ -572,6 +595,7 @@ void drawEqualizer(uint32_t f) {
 #define NUS_SERVICE  "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_RX       "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX       "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_OTA      "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"   // firmware updates
 QueueHandle_t bleQ = NULL;
 volatile bool bleConnected = false;
 BLECharacteristic* bleTx = NULL;
@@ -583,22 +607,53 @@ class BleRx : public BLECharacteristicCallbacks {
     for (size_t i = 0; i < v.length(); i++) { char c = v[i]; xQueueSend(bleQ, &c, 0); }
   }
 };
+/* ============================================================
+   UPDATE OVER BLUETOOTH - the app sends the new firmware:
+     U:<size>,<md5>    -> U:ready,<piece size>   (or U:err,<why>)
+     then the firmware itself, in pieces, written to the OTA characteristic
+     U:end             -> U:ok, and it restarts on the new firmware
+     U:abort           -> stops (the old firmware stays)
+   The new copy goes next to the running one; a bad or cut-off copy is never
+   started (its md5 is checked), so the keychain can't be broken this way.
+   ============================================================ */
+volatile bool otaOn = false, otaFail = false, otaDrop = false;
+volatile uint32_t otaGot = 0;
+uint32_t otaSize = 0, otaRebootAt = 0;
+BLEServer* bleSrv = NULL;
+
+void bleSpeed(bool fast) {                    // fast while updating; gentle on the battery otherwise
+  if (!bleSrv || !bleConnected) return;
+  bleSrv->updateConnParams(bleSrv->getConnId(), fast ? 6 : 24, fast ? 12 : 40, 0, 400);   // 1.25 ms steps
+}
+
+class OtaRx : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* ch) override {
+    if (!otaOn || otaFail) return;
+    size_t n = ch->getLength();
+    if (Update.write(ch->getData(), n) != n) otaFail = true;
+    else otaGot += n;
+  }
+};
+
 class BleConn : public BLEServerCallbacks {
   void onConnect(BLEServer* srv) override    { bleConnected = true; }
-  void onDisconnect(BLEServer* srv) override { bleConnected = false; BLEDevice::startAdvertising(); }
+  void onDisconnect(BLEServer* srv) override { bleConnected = false; if (otaOn) otaDrop = true; BLEDevice::startAdvertising(); }
 };
 
 void bleInit() {
   bleQ = xQueueCreate(1024, 1);
   BLEDevice::init(BLE_NAME);
-  BLEDevice::setMTU(185);
+  BLEDevice::setMTU(517);                         // big pieces: a quicker update
   BLEServer* srv = BLEDevice::createServer();
+  bleSrv = srv;
   srv->setCallbacks(new BleConn());
   BLEService* svc = srv->createService(NUS_SERVICE);
   BLECharacteristic* rx = svc->createCharacteristic(NUS_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   rx->setCallbacks(new BleRx());
   bleTx = svc->createCharacteristic(NUS_TX, BLECharacteristic::PROPERTY_NOTIFY);
   bleTx->addDescriptor(new BLE2902());
+  BLECharacteristic* ota = svc->createCharacteristic(NUS_OTA, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  ota->setCallbacks(new OtaRx());
   svc->start();
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(NUS_SERVICE);
@@ -618,6 +673,7 @@ void sendLine(const char* line) {                 // back to the app / bridge
 
 void sendInfo() {
   char b[64];
+  sendLine("F:" FW_VERSION ",ota");                  // which firmware, and that it can update over Bluetooth
   snprintf(b, sizeof(b), "K:%u,%u,%u,%u,%u", screen, SCREENS, briIndex, volIndex, soundOn ? 1 : 0);
   sendLine(b);
   for (uint8_t i = 0; i < SCREENS; i++) {
@@ -628,6 +684,8 @@ void sendInfo() {
 }
 
 void goToScreen(uint8_t n);
+extern bool menuOpen;
+void closeMenu();
 void handleLine(char* line) {
   if (strlen(line) < 2 || line[1] != ':') return;
   char* v = line + 2;
@@ -647,6 +705,35 @@ void handleLine(char* line) {
       musicLevel = constrain(atoi(v), 0, 99); levelAt = millis();
       if (musicLevel > musicAvg + 14 && millis() - beatAt > 180) beatAt = millis();
       musicAvg = musicAvg * 0.9f + musicLevel * 0.1f;
+      break;
+    }
+    case 'U': {
+      char b[64];
+      if (!strcmp(v, "abort")) { if (otaOn) Update.abort(); otaOn = false; bleSpeed(false); break; }
+      if (!strcmp(v, "end")) {
+        if (!otaOn) { sendLine("U:err,not started"); break; }
+        otaOn = false;
+        if (otaFail || otaGot != otaSize) {
+          Update.abort(); bleSpeed(false);
+          snprintf(b, sizeof(b), "U:err,got %lu of %lu", (unsigned long)otaGot, (unsigned long)otaSize); sendLine(b); break;
+        }
+        if (!Update.end(true)) { bleSpeed(false); snprintf(b, sizeof(b), "U:err,%s", Update.errorString()); sendLine(b); break; }
+        sendLine("U:ok");
+        otaRebootAt = millis() + 800;                     // restart on the new firmware
+        break;
+      }
+      unsigned long size = 0; char md5[40] = "";
+      sscanf(v, "%lu,%39s", &size, md5);
+      if (Update.isRunning()) Update.abort();
+      otaOn = false; otaFail = false; otaGot = 0; otaSize = size;
+      if (!size || !Update.begin(size)) { snprintf(b, sizeof(b), "U:err,%s", size ? Update.errorString() : "no size"); sendLine(b); break; }
+      if (strlen(md5) == 32) Update.setMD5(md5);
+      if (menuOpen) closeMenu();
+      otaOn = true;
+      bleSpeed(true);
+      uint16_t mtu = bleSrv ? bleSrv->getPeerMTU(bleSrv->getConnId()) : 23;
+      snprintf(b, sizeof(b), "U:ready,%u", (unsigned)constrain((int)mtu - 3, 20, 500));
+      sendLine(b);
       break;
     }
     case 'Q': {
@@ -1001,9 +1088,28 @@ void autoMusic() {
   }
 }
 
+void drawOta() {                                  // "Updating" and a progress bar
+  display.clearDisplay();
+  txtC(8, otaRebootAt ? "Updated!" : "Updating...");
+  txtC(20, otaRebootAt ? "restarting" : "keep the phone close");
+  uint32_t pct = otaSize ? (uint32_t)((uint64_t)otaGot * 100 / otaSize) : 0;
+  display.drawRoundRect(14, 36, 100, 10, 3, C_WHITE);
+  display.fillRoundRect(16, 38, (int)(96 * pct / 100), 6, 2, C_WHITE);
+  char b[8]; snprintf(b, sizeof(b), "%lu%%", (unsigned long)pct);
+  txtC(52, b);
+}
+
 void loop() {
   static uint32_t last = 0;
   uint32_t now = millis();
+  if (otaDrop) { otaDrop = false; if (otaOn) { Update.abort(); otaOn = false; toast("update stopped"); } }
+  if (otaRebootAt && (int32_t)(now - otaRebootAt) >= 0) ESP.restart();
+  if (otaOn || otaRebootAt) {                             // updating: just the progress
+    serialUpdate();
+    lastTouch = now;
+    if (now - last >= 100) { last = now; drawOta(); display.display(); }
+    return;
+  }
   touchUpdate();
   serialUpdate();
   soundUpdate();

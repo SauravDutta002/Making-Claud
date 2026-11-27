@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "size": 946528,
+  "md5": "1ebca43f6ee887a027f223e52419afc2",
+  "built": "2026-11-27",
+  "files": [
+    {
+      "file": "bootloader.bin",
+      "address": 0
+    },
+    {
+      "file": "partitions.bin",
+      "address": 32768
+    },
+    {
+      "file": "boot_app0.bin",
+      "address": 57344
+    },
+    {
+      "file": "keychain.bin",
+      "address": 65536
+    }
+  ]
+}
