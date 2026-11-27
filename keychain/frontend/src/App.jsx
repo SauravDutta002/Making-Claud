@@ -354,9 +354,13 @@ export default function App() {
 
   // Spotify -> keychain: new song, play/pause, or every 15 s to keep the progress in step
   const sent = useRef({ key: "", at: 0 });
+  useEffect(() => { sent.current = { key: "", at: 0 }; }, [linked]);   // (re)connected: tell it again
   useEffect(() => {
     const t = track;
-    if (!t) return;
+    if (!t) {                                    // the music stopped: the keychain goes back to its screen
+      if (linked && sent.current.key) { kc.send("M:0,"); sent.current = { key: "", at: 0 }; }
+      return;
+    }
     setSong({ song: `${t.title} - ${t.artist}`, playing: t.playing });
     if (!linked) return;
     const key = t.title + t.artist + t.playing;

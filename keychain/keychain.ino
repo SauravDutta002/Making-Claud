@@ -367,6 +367,12 @@ uint32_t sceneFrame = 0;
 char     musicTitle[44] = "Lo-fi Nights - Snoopy";
 bool     musicOn = true;                  // playing (the record turns)
 bool     bridgeMusic = false;             // a bridge has sent something
+uint8_t  musicState  = 0;                 // from the app: 0 nothing, 1 playing, 2 paused
+uint32_t musicAt     = 0;                 // when the app last told us
+uint32_t manualAt    = 0;                 // you changed screen yourself: the music backs off for a while
+bool     newSong     = false;             // a different song started since then
+bool     autoPlayer  = false;             // the music brought the record player up
+uint8_t  beforeMusic = 0;                 // ...and this is where we were
 uint32_t trackPos = 0, trackDur = 180, trackAt = 0;
 float    discAngle = 0;
 
@@ -540,7 +546,9 @@ void handleLine(char* line) {
     case 'M': {
       bridgeMusic = true;
       musicOn = v[0] == '1';
+      musicState = v[0] - '0'; musicAt = millis();
       char* p = strchr(v, ',');
+      if (p && strncmp(musicTitle, p + 1, sizeof(musicTitle) - 1) != 0) newSong = true;
       if (p) { strncpy(musicTitle, p + 1, sizeof(musicTitle) - 1); musicTitle[sizeof(musicTitle) - 1] = 0; }
       if (v[0] == '0') musicTitle[0] = 0;
       break;
@@ -552,6 +560,7 @@ void handleLine(char* line) {
       break;
     }
     case 'S':
+      manualAt = millis(); newSong = false;
       if (v[0] == '+') nextScreen();
       else goToScreen((uint8_t)atoi(v));
       break;
@@ -827,7 +836,7 @@ void touchUpdate() {
   if (down && now - downAt > 650) held = true;          // a long press isn't a tap
   if (!down && wasDown && !held) { taps++; upAt = now; }
   if (!down && taps && now - upAt > 320) {
-    if (taps == 1) { sndTap(); nextScreen(); }          // tap: next screen
+    if (taps == 1) { sndTap(); nextScreen(); manualAt = now; newSong = false; }   // tap: next screen
     else openMenu();                                    // double tap: SETTINGS
     taps = 0;
   }
@@ -867,6 +876,29 @@ void setup() {
   lastTouch = millis();
 }
 
+/* music from the phone, like the Claude face: a song starts -> the record
+   player comes up (shutters), paused -> it stays, stopped -> back to where
+   you were. Change screen yourself and it leaves you alone for 45 s (or
+   until the next song). */
+void autoMusic() {
+  if (!BUILTIN_PLAYER || menuOpen || transAt) return;
+  uint32_t now = millis();
+  if (screen == PLAYER_SCREEN) newSong = false;
+  bool on = (musicState == 1 && now - musicAt < 60000UL)          // the app re-sends every 15 s while playing
+         || (musicState == 2 && now - musicAt < 300000UL);        // paused a long time: the music's over
+  if (on) {
+    bool backOff = manualAt && now - manualAt < 45000UL && !newSong;
+    if (musicState == 1 && !backOff && screen != PLAYER_SCREEN) {
+      if (!autoPlayer) beforeMusic = screen;
+      autoPlayer = true; newSong = false;
+      goToScreen(PLAYER_SCREEN);
+    }
+  } else if (autoPlayer) {
+    autoPlayer = false;
+    if (screen == PLAYER_SCREEN) goToScreen(beforeMusic);
+  }
+}
+
 void loop() {
   static uint32_t last = 0;
   uint32_t now = millis();
@@ -874,6 +906,7 @@ void loop() {
   serialUpdate();
   soundUpdate();
   musicUpdate();
+  autoMusic();
   if (bleConnected) lastTouch = now;                     // the phone app is connected: stay awake
   if (SLEEP_MIN > 0 && now - lastTouch > SLEEP_MIN * 60000UL) goToSleep();
   if (now - last < 25) return;                            // about 40 fps
