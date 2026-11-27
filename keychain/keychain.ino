@@ -40,12 +40,13 @@
 #include "frames_z.h"                // made from frames.h by tools/pack_frames.py
 
 /* ---------------- make it yours ---------------- */
-#define FW_VERSION   "2.0.0"   // bump it for each release: the app offers the update (tools/release_fw.py)
+#define FW_VERSION   "2.1.0"   // bump it for each release: the app offers the update (tools/release_fw.py)
 #define CAPTION      ""      // a little name in the corner, e.g. "NNAN" ("" = none)
 #define SLEEP_MIN    5       // sleep after this many minutes untouched (0 = never)
 #define FLIP         0       // 1 = screen mounted upside down
 #define BUILTIN_RIDE 0       // 0 = only your own animations
 #define BUILTIN_PLAYER 1     // the record player (like the Claude face's), after your animations
+#define BUILTIN_PICTURE 1    // "My picture": what you draw or pick in the app, after the record player
 
 /* ---------------- hardware ---------------- */
 #define SCREEN_WIDTH  128
@@ -69,8 +70,17 @@ const uint8_t  VOL_COUNT = sizeof(VOL_LEVELS) / sizeof(VOL_LEVELS[0]);
 uint8_t volIndex = 3;
 bool    soundOn  = true;
 uint8_t screen   = 0;
-const uint8_t SCREENS = (KC_ANIM_COUNT + BUILTIN_RIDE + BUILTIN_PLAYER) ? KC_ANIM_COUNT + BUILTIN_RIDE + BUILTIN_PLAYER : 1;
-const uint8_t PLAYER_SCREEN = KC_ANIM_COUNT + BUILTIN_RIDE;     // (only if BUILTIN_PLAYER)
+const uint8_t SCREENS = (KC_ANIM_COUNT + BUILTIN_RIDE + BUILTIN_PLAYER + BUILTIN_PICTURE)
+                        ? KC_ANIM_COUNT + BUILTIN_RIDE + BUILTIN_PLAYER + BUILTIN_PICTURE : 1;
+const uint8_t PLAYER_SCREEN = KC_ANIM_COUNT + BUILTIN_RIDE;                     // (only if BUILTIN_PLAYER)
+const uint8_t PICTURE_SCREEN = KC_ANIM_COUNT + BUILTIN_RIDE + BUILTIN_PLAYER;   // (only if BUILTIN_PICTURE)
+
+/* MY PICTURE - drawn or picked in the app, shown the moment it arrives.
+   The app sends only the bytes that changed: [offset hi, offset lo, bytes...]
+   to the picture characteristic; "P:save" keeps it (it survives sleep). */
+uint8_t  picBuf[1024];
+bool     picSet = false;
+volatile bool picNew = false;
 
 uint32_t lastTouch = 0;
 uint32_t toastUntil = 0;
@@ -574,6 +584,7 @@ void drawEqualizer(uint32_t f) {
 #define NUS_RX       "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX       "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_OTA      "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"   // firmware updates
+#define NUS_PIC      "6E400005-B5A3-F393-E0A9-E50E24DCCA9E"   // My picture, live
 QueueHandle_t bleQ = NULL;
 volatile bool bleConnected = false;
 BLECharacteristic* bleTx = NULL;
@@ -613,6 +624,20 @@ class OtaRx : public BLECharacteristicCallbacks {
   }
 };
 
+class PicRx : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* ch) override {
+    size_t n = ch->getLength();
+    const uint8_t* d = ch->getData();
+    if (n < 3) return;
+    uint16_t off = (d[0] << 8) | d[1];
+    if (off >= sizeof(picBuf)) return;
+    size_t len = n - 2;
+    if (off + len > sizeof(picBuf)) len = sizeof(picBuf) - off;
+    memcpy(picBuf + off, d + 2, len);
+    picSet = true; picNew = true;
+  }
+};
+
 class BleConn : public BLEServerCallbacks {
   void onConnect(BLEServer* srv) override    { bleConnected = true; }
   void onDisconnect(BLEServer* srv) override { bleConnected = false; if (otaOn) otaDrop = true; BLEDevice::startAdvertising(); }
@@ -632,6 +657,8 @@ void bleInit() {
   bleTx->addDescriptor(new BLE2902());
   BLECharacteristic* ota = svc->createCharacteristic(NUS_OTA, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   ota->setCallbacks(new OtaRx());
+  BLECharacteristic* pic = svc->createCharacteristic(NUS_PIC, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pic->setCallbacks(new PicRx());
   svc->start();
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(NUS_SERVICE);
@@ -657,7 +684,8 @@ void sendInfo() {
   snprintf(b, sizeof(b), "K:%u,%u,%u,%u,%u", screen, SCREENS, briIndex, volIndex, soundOn ? 1 : 0);
   sendLine(b);
   for (uint8_t i = 0; i < SCREENS; i++) {
-    const char* n = i < KC_ANIM_COUNT ? KC_ANIMS[i].name : (BUILTIN_PLAYER && i == PLAYER_SCREEN ? "Record player" : "Night ride");
+    const char* n = i < KC_ANIM_COUNT ? KC_ANIMS[i].name : (BUILTIN_PLAYER && i == PLAYER_SCREEN) ? "Record player"
+                  : (BUILTIN_PICTURE && i == PICTURE_SCREEN) ? "My picture" : "Night ride";
     snprintf(b, sizeof(b), "N:%u,%s", i, n);
     sendLine(b);
   }
@@ -719,6 +747,10 @@ void handleLine(char* line) {
       sendLine(b);
       break;
     }
+    case 'P':                                         // My picture: keep it / wipe it
+      if (!strcmp(v, "save")) { prefs.begin("keychain", false); prefs.putBytes("pic", picBuf, sizeof(picBuf)); prefs.end(); }
+      else if (!strcmp(v, "clear")) { memset(picBuf, 0, sizeof(picBuf)); picSet = false; prefs.begin("keychain", false); prefs.remove("pic"); prefs.end(); }
+      break;
     case 'Q': {
       int ps = 0, d = 0;
       sscanf(v, "%d,%d", &ps, &d);
@@ -759,6 +791,10 @@ void serialUpdate() {
 void drawScreen() {
   display.clearDisplay();
   if (screen < KC_ANIM_COUNT) drawCustom(screen);
+  else if (BUILTIN_PICTURE && screen == PICTURE_SCREEN) {
+    if (picSet) display.drawBitmap(0, 0, picBuf, SCREEN_WIDTH, SCREEN_HEIGHT, C_WHITE);
+    else { txtC(22, "My picture"); txtC(36, "draw it in the app"); }
+  }
   else if (BUILTIN_PLAYER && screen == PLAYER_SCREEN) { if (eqView) drawEqualizer(sceneFrame); else drawPlayer(sceneFrame); }
   else drawRide(sceneFrame);
   drawCaption();
@@ -1031,6 +1067,7 @@ void setup() {
   volIndex = prefs.getUChar("vol", 3);
   if (volIndex >= VOL_COUNT) volIndex = 3;
   soundOn  = prefs.getBool("snd", true);
+  picSet   = BUILTIN_PICTURE && prefs.getBytes("pic", picBuf, sizeof(picBuf)) == sizeof(picBuf);
   prefs.end();
   if (screen >= SCREENS) screen = 0;
   if (briIndex >= BRI_COUNT) briIndex = 5;
@@ -1153,6 +1190,11 @@ void loop() {
   serialUpdate();
   soundUpdate();
   musicUpdate();
+  if (BUILTIN_PICTURE && picNew) {
+    manualAt = now; newSong = false;
+    if (screen == PICTURE_SCREEN && !transAt) picNew = false;
+    else if (!transAt) { goToScreen(PICTURE_SCREEN); picNew = false; }
+  }
   autoMusic();
   if (bleConnected) lastTouch = now;                     // the phone app is connected: stay awake
   if (SLEEP_MIN > 0 && now - lastTouch > SLEEP_MIN * 60000UL) goToSleep();

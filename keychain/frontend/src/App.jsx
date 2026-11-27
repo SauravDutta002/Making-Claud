@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import Screen from "./Screen.jsx";
+import Draw from "./Draw.jsx";
 import { loadScreens } from "./screens.js";
 import { useKeychain, canBluetooth } from "./ble.js";
 import { useSpotify, spotifyLogin, spotifyLogout, spotifyRedirect, savedClientId } from "./spotify.js";
@@ -7,8 +8,14 @@ import { useLastfm, savedLastfm, saveLastfm, forgetLastfm } from "./lastfm.js";
 import { useNowPlaying, useBeat, openNotificationAccess, isNativeApp } from "./nowplaying.js";
 import { useLatestFirmware, downloadFirmware, flashUsb, newer, canUsb } from "./firmware.js";
 
-const TABS = [["screens", "Screens"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
+const TABS = [["screens", "Screens"], ["draw", "Draw"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
 const PLAYER = "Record player";
+const PICTURE = "My picture";
+
+// the picture on the board, kept on this device too
+function loadPicture() {
+  try { const t = localStorage.getItem("kc-picture"); return t ? Uint8Array.from(atob(t), (c) => c.charCodeAt(0)) : null; } catch { return null; }
+}
 // the Android app: built by GitHub on every push (.github/workflows/keychain-android.yml)
 const ANDROID_APP = "https://github.com/SauravDutta002/Making-Claud/releases/download/keychain-android/KeychainRemote.apk";
 const ANDROID_PAGE = "https://github.com/SauravDutta002/Making-Claud/releases/tag/keychain-android";
@@ -68,7 +75,7 @@ function Logo() {
 
 // the keychain, drawn from its CAD model: case, hanging loop with its hole, the
 // screen window playing what the keychain shows, and the real measurements
-function Keychain({ index, player, dim }) {
+function Keychain({ index, player, picture, dim }) {
   return (
     <figure className={"device kc-fig" + (dim ? " off" : "")} aria-hidden="true">
       <div className="kc">
@@ -76,7 +83,7 @@ function Keychain({ index, player, dim }) {
         <div className="kc-case">
           <i className="screw a" /><i className="screw b" /><i className="screw c" /><i className="screw d" />
           <div className="kc-window">
-            <Screen index={index} player={player} />
+            <Screen index={index} player={player} picture={picture} />
           </div>
           <span className="print">SNOOPY · KEYCHAIN</span>
           <i className="pad" />
@@ -88,6 +95,7 @@ function Keychain({ index, player, dim }) {
 
 const ICONS = {
   screens: <path d="M4 6h7v6H4zM13 6h7v6h-7zM4 14h7v4H4zM13 14h7v4h-7z" />,
+  draw: <path d="M5 19l1-4L16 5l3 3L9 18l-4 1zM14 7l3 3" />,
   music: <><circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="2.4" /></>,
   settings: <><path d="M5 7h14M5 12h14M5 17h14" /><circle cx="9" cy="7" r="1.8" /><circle cx="15" cy="12" r="1.8" /><circle cx="8" cy="17" r="1.8" /></>,
   help: <><circle cx="12" cy="12" r="8" /><path d="M9.6 9.6a2.5 2.5 0 1 1 3.3 2.4c-.6.3-.9.8-.9 1.5M12 16.5v.2" /></>,
@@ -162,7 +170,7 @@ const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart
 
 /* ------------------------------------------------------------ the tabs */
 
-function Screens({ names, current, onPick, linked }) {
+function Screens({ names, current, onPick, linked, picture }) {
   return (
     <section className="panel">
       <div className="panel-head"><h2>Screens</h2><span className="mono">{names.length}</span></div>
@@ -170,7 +178,8 @@ function Screens({ names, current, onPick, linked }) {
       <div className="kc-grid">
         {names.map((name, i) => (
           <button key={i} className={"kc-tile" + (i === current ? " cur" : "")} onClick={() => onPick(i)}>
-            <span className="kc-thumb"><Screen index={i} player={name === PLAYER ? { song: "Lo-fi Nights - Snoopy", playing: true } : null} className="thumb" /></span>
+            <span className="kc-thumb"><Screen index={i} player={name === PLAYER ? { song: "Lo-fi Nights - Snoopy", playing: true } : null}
+                    picture={name === PICTURE ? picture || new Uint8Array(1024) : null} className="thumb" /></span>
             <span className="kc-tile-name"><span className="num">{String(i + 1).padStart(2, "0")}</span>{name}</span>
           </button>
         ))}
@@ -445,8 +454,15 @@ export default function App() {
   const [preview, setPreview] = useState(0);
   const [manual, setManual] = useState("");
   const [song, setSong] = useState(null);                 // what the record player is showing
+  const [picture, setPictureState] = useState(loadPicture);
+  const picSave = useRef(0);
+  function setPicture(b) {
+    setPictureState(b);
+    clearTimeout(picSave.current);
+    picSave.current = setTimeout(() => { try { localStorage.setItem("kc-picture", btoa(String.fromCharCode(...b))); } catch {} }, 600);
+  }
 
-  useEffect(() => { loadScreens().then((l) => setLocalNames([...l.map((s) => s.name), PLAYER])).catch(() => {}); }, []);
+  useEffect(() => { loadScreens().then((l) => setLocalNames([...l.map((s) => s.name), PLAYER, PICTURE])).catch(() => {}); }, []);
 
   const linked = kc.link === "on";
   linkedRef.current = linked; playingRef.current = !!track?.playing;
@@ -491,6 +507,7 @@ export default function App() {
   const showPlayer = () => playerIndex >= 0 && kc.act.show(playerIndex);
   const isPlayer = names[current] === PLAYER;
   const playerArgs = isPlayer ? song || { song: "Lo-fi Nights - Snoopy", playing: true } : null;
+  const pictureArgs = names[current] === PICTURE ? picture || new Uint8Array(1024) : null;
 
   function linkButtons(small) {
     const sm = small ? " sm" : "";
@@ -528,7 +545,7 @@ export default function App() {
 
       {tab === "screens" ? (
       <section className="stage">
-        <Keychain index={current} player={playerArgs} dim={!linked} />
+        <Keychain index={current} player={playerArgs} picture={pictureArgs} dim={!linked} />
         <div className="stage-text">
           <span className={"eyebrow " + (linked ? "ok" : "")}>{linked ? "● Live" : "○ Standby"}</span>
           <h1>{title}</h1>
@@ -541,7 +558,7 @@ export default function App() {
       ) : (
       // the other tabs: a slim bar with the live screen, so the page is about the tab
       <section className={"mini" + (linked ? "" : " off")}>
-        <a className="mini-screen" href="#screens" aria-label="Screens"><Screen index={current} player={playerArgs} /></a>
+        <a className="mini-screen" href="#screens" aria-label="Screens"><Screen index={current} player={playerArgs} picture={pictureArgs} /></a>
         <div className="mini-text">
           <span className={"eyebrow " + (linked ? "ok" : "")}>{linked ? "● Live" : kc.link === "connecting" ? "○ Connecting…" : "○ Standby"}</span>
           <b>{song && isPlayer ? song.song : names[current] || "Keychain"}</b>
@@ -560,7 +577,8 @@ export default function App() {
       <main className="content">
         <UpdateBanner />
         <FirmwareBar fw={fw} />
-        {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} />}
+        {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} picture={picture} />}
+        {tab === "draw" && <Draw kc={kc} picture={picture} setPicture={setPicture} />}
         {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} beat={beat} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
         {tab === "settings" && <><Settings kc={kc} /><FirmwarePanel kc={kc} fw={fw} /></>}
         {tab === "help" && <Help />}

@@ -29,7 +29,7 @@
   .tabs { display: none; }
   .foot { display: none; }
   .content { padding-bottom: 96px; }
-  .dock { display: grid; grid-template-columns: repeat(4, 1fr); position: fixed; z-index: 20; left: 12px; right: 12px;
+  .dock { display: grid; grid-template-columns: repeat(5, 1fr); position: fixed; z-index: 20; left: 12px; right: 12px;
     bottom: max(12px, env(safe-area-inset-bottom)); padding: 6px; border-radius: 22px;
     background: color-mix(in srgb, var(--paper) 88%, transparent); backdrop-filter: blur(14px);
     border: 1px solid var(--line); box-shadow: 0 10px 30px rgba(0, 0, 0, .14); }
@@ -118,4 +118,27 @@
   .mini-screen { width: 104px; padding: 4px; }
   .mini-text b { font-size: 15.5px; }
   .mini-text .eyebrow { font-size: 10px; }
+}
+
+/* ---------- the blackboard */
+.board { display: block; width: 100%; aspect-ratio: 2 / 1; image-rendering: pixelated; background: #000; cursor: crosshair;
+  border: 2px solid var(--shell-line); border-radius: 10px; touch-action: none; user-select: none;
+  box-shadow: 5px 5px 0 color-mix(in srgb, var(--shell-line) 12%, transparent); }
+.board-tools, .photo-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; }
+.board-tools .grow { flex: 1; }
+.seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line-2); border-radius: 999px; }
+.seg button { border: 0; background: transparent; color: var(--ink-2); font: 500 13.5px var(--f-sans, inherit); padding: 6px 13px;
+  border-radius: 999px; cursor: pointer; display: grid; place-items: center; min-height: 30px; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
+.seg.sizes button { width: 34px; padding: 0; }
+.seg.sizes i { display: block; border-radius: 50%; background: currentColor; }
+.photo-opts { padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--bg); }
+.photo-opts label { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--ink-2); }
+.photo-opts input[type="range"] { width: 120px; accent-color: var(--accent); }
+.photo-opts .check input { accent-color: var(--accent); }
+label.btn { cursor: pointer; }
+@media (max-width: 560px) {
+  .board-tools .grow { display: none; }
+  .photo-opts input[type="range"] { width: 100%; }
+  .photo-opts label:not(.check) { width: 100%; display: grid; grid-template-columns: 82px 1fr; }
 }

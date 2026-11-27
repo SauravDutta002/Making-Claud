@@ -10,6 +10,7 @@ const NUS = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";   // we write here
 const TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";   // the keychain notifies here
 const OTA = "6e400004-b5a3-f393-e0a9-e50e24dcca9e";  // firmware updates go here (firmware 2.0+)
+const PIC = "6e400005-b5a3-f393-e0a9-e50e24dcca9e";  // My picture, live (firmware 2.1+)
 const native = Capacitor.isNativePlatform();
 
 export const canBluetooth = native || (typeof navigator !== "undefined" && !!navigator.bluetooth);
@@ -42,7 +43,9 @@ const web = {
     await tx.startNotifications();
     tx.addEventListener("characteristicvaluechanged", (e) => onData(new TextDecoder().decode(e.target.value)));
     const ota = await svc.getCharacteristic(OTA).catch(() => null);      // older firmware: no Bluetooth updates
-    return { piece: 180, write: (b) => rx.writeValueWithoutResponse(b), ota: ota && ((b) => ota.writeValueWithResponse(b)), close: () => d.gatt.disconnect() };
+    const pic = await svc.getCharacteristic(PIC).catch(() => null);      // older firmware: no pictures
+    return { piece: 180, write: (b) => rx.writeValueWithoutResponse(b), ota: ota && ((b) => ota.writeValueWithResponse(b)),
+             pic: pic && ((b) => pic.writeValueWithoutResponse(b)), close: () => d.gatt.disconnect() };
   },
 };
 
@@ -69,11 +72,14 @@ const nat = {
     await BleClient.startNotifications(dev.id, NUS, TX, (dv) => onData(new TextDecoder().decode(dv)));
     // how big a piece the link takes (Android drops anything bigger): 20 bytes unless the phone got more
     const mtu = await BleClient.getMtu(dev.id).catch(() => 23);
+    const svcs = await BleClient.getServices(dev.id).catch(() => []);
+    const hasPic = svcs.some((sv) => sv.characteristics?.some((c) => c.uuid.toLowerCase() === PIC));
     return {
       piece: Math.max(20, Math.min(500, mtu - 3)),
       fast: (on) => BleClient.requestConnectionPriority(dev.id, on ? 1 : 0).catch(() => {}),   // HIGH while updating
       write: (b) => BleClient.writeWithoutResponse(dev.id, NUS, RX, new DataView(b.buffer, b.byteOffset, b.byteLength)),
       ota: (b) => BleClient.write(dev.id, NUS, OTA, new DataView(b.buffer, b.byteOffset, b.byteLength)),
+      pic: hasPic ? (b) => BleClient.writeWithoutResponse(dev.id, NUS, PIC, new DataView(b.buffer, b.byteOffset, b.byteLength)) : null,
       close: () => BleClient.disconnect(dev.id),
     };
   },
@@ -133,7 +139,7 @@ export function useKeychain(onEvent) {
     try { localStorage.setItem("kc-device", d.id); localStorage.setItem("kc-name", d.name || ""); } catch {}
     setState((s) => ({ ...s, link: "connecting", name: d.name, fw: null }));
     link.current = await T.open(d, onData, onDrop);
-    setState((s) => ({ ...s, link: "on" }));
+    setState((s) => ({ ...s, link: "on", pic: !!link.current?.pic }));
     evt.current?.("connected", d.name);
     await send("I:");
   }
@@ -211,6 +217,23 @@ export function useKeychain(onEvent) {
     // it restarts now on the new firmware, and the app reconnects by itself
   }
 
+  /** My picture: send the changed spans [{ off, bytes }] (in link-sized pieces), in order with the lines */
+  function sendPicture(spans) {
+    const l = link.current;
+    if (!l?.pic) return Promise.resolve(false);
+    const n = Math.max(1, (l.piece || 20) - 2);
+    queue.current = queue.current.then(async () => {
+      for (const { off, bytes } of spans)
+        for (let i = 0; i < bytes.length; i += n) {
+          const part = bytes.subarray(i, i + n), o = off + i, pkt = new Uint8Array(part.length + 2);
+          pkt[0] = o >> 8; pkt[1] = o & 255; pkt.set(part, 2);
+          await link.current?.pic?.(pkt);
+        }
+      return true;
+    }).catch(() => false);
+    return queue.current;
+  }
+
   function disconnect() { wanted.current = false; const l = link.current; link.current = null; l?.close(); setState((s) => ({ ...s, link: "off" })); }
 
   // optimistic local updates, so the controls feel instant
@@ -231,5 +254,5 @@ export function useKeychain(onEvent) {
   }, []);
   let lastName = "";
   try { lastName = localStorage.getItem("kc-name") || ""; } catch {}
-  return { ...state, lastName, connect, reconnect, disconnect, send, act, updateFirmware };
+  return { ...state, lastName, connect, reconnect, disconnect, send, act, updateFirmware, sendPicture };
 }

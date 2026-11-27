@@ -3,10 +3,10 @@
 import React, { useEffect, useRef } from "react";
 import { W, H, Bits, loadScreens, drawPlayer } from "./screens.js";
 
-export default function Screen({ index, player, className = "oled", still = false }) {
+export default function Screen({ index, player, picture, className = "oled", still = false }) {
   const ref = useRef(null);
-  const want = useRef({ index, player });
-  want.current = { index, player };
+  const want = useRef({ index, player, picture });
+  want.current = { index, player, picture };
 
   useEffect(() => {
     let raf = 0, alive = true, last = 0, k = 0, f = 0, shown = -2, acc = 0, seen = true;
@@ -19,10 +19,11 @@ export default function Screen({ index, player, className = "oled", still = fals
     function draw(t) {
       if (!alive || !seen) { raf = 0; return; }
       const dt = Math.min(200, t - (last || t)); last = t;
-      const { index: i, player: p } = want.current;
+      const { index: i, player: p, picture: pic } = want.current;
       if (i !== shown) { shown = i; k = 0; f = 0; acc = 0; }
       d.clear();
-      if (p) { if (!reduce) f += dt / 25; drawPlayer(d, Math.floor(f), p.song, p.playing); }
+      if (pic) d.frame(pic);
+      else if (p) { if (!reduce) f += dt / 25; drawPlayer(d, Math.floor(f), p.song, p.playing); }
       else if (list && list[i]) {
         const s = list[i];
         if (!reduce) { acc += dt; let ms = s.delays[k] || 70; while (acc >= ms) { acc -= ms; k = (k + 1) % s.count; ms = s.delays[k] || 70; } }
