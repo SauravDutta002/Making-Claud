@@ -465,13 +465,19 @@ export default function App() {
     }
     setSong({ song: `${t.title} - ${t.artist}`, playing: t.playing });
     if (!linked) return;
-    const key = t.title + t.artist + t.playing;
-    if (key !== sent.current.key || Date.now() - sent.current.at > 15000) {
-      sent.current = { key, at: Date.now() };
+    const key = t.title + t.artist + t.playing, now = Date.now(), c = sent.current;
+    const fresh = key !== c.key;
+    if (fresh || now - c.at > 15000) {                     // the song, and playing / paused
+      Object.assign(c, { key, at: now });
       kc.send(`M:${t.playing ? 1 : 2},${t.title} - ${t.artist}`.slice(0, 90));
+    }
+    // the progress bar: again whenever the phone's position drifts from what the keychain counts (a seek, a pause)
+    const expect = (c.pos || 0) + (c.playing ? (now - (c.posAt || now)) / 1000 : 0);
+    if (fresh || Math.abs(t.pos - expect) > 2.5 || now - (c.posAt || 0) > 15000) {
+      Object.assign(c, { pos: t.pos, posAt: now, playing: t.playing });
       kc.send(`Q:${Math.round(t.pos)},${Math.round(t.dur)}`);
     }
-  }, [track?.title, track?.artist, track?.playing, Math.floor((track?.pos || 0) / 15), linked]);
+  }, [track?.title, track?.artist, track?.playing, Math.round(track?.pos || 0), linked]);
 
   function sendManual(play) {
     const text = (manual.trim() || song?.song || "").slice(0, 80);
@@ -486,6 +492,24 @@ export default function App() {
   const isPlayer = names[current] === PLAYER;
   const playerArgs = isPlayer ? song || { song: "Lo-fi Nights - Snoopy", playing: true } : null;
 
+  function linkButtons(small) {
+    const sm = small ? " sm" : "";
+    if (linked) return (
+      <>
+        <button className={"btn primary" + sm} onClick={kc.act.next}>{small ? "Next" : "Next screen"}</button>
+        {!small && <button className="btn link" onClick={kc.disconnect}>Disconnect</button>}
+      </>
+    );
+    const busy = !canBluetooth || kc.link === "connecting";
+    if (kc.lastName) return (
+      <>
+        <button className={"btn primary" + sm} disabled={busy} onClick={kc.reconnect}>
+          {kc.link === "connecting" ? "Reconnecting…" : small ? "Reconnect" : `Reconnect to ${kc.lastName}`}</button>
+        {!small && <button className="btn link" onClick={kc.connect}>Another keychain</button>}
+      </>
+    );
+    return <button className={"btn primary" + sm} disabled={busy} onClick={kc.connect}>Connect</button>;
+  }
   const title = linked ? "Connected" : kc.link === "connecting" ? "Connecting…" : "Keychain";
   const sub = linked ? `Showing ${names[current] || "…"}.`
     : canBluetooth ? "Tap the keychain to wake it, then connect over Bluetooth."
@@ -502,6 +526,7 @@ export default function App() {
         </span>
       </header>
 
+      {tab === "screens" ? (
       <section className="stage">
         <Keychain index={current} player={playerArgs} dim={!linked} />
         <div className="stage-text">
@@ -510,24 +535,21 @@ export default function App() {
           <p>{sub}</p>
           {names[current] && <div className={"now" + (linked ? " busy" : "")}><i /><span>{linked ? "Showing" : "Preview"} · <b>{names[current]}</b></span></div>}
           {song && isPlayer && <div className="now"><i /><span>♪ <b>{song.song}</b></span></div>}
-          <div className="actions">
-            {linked ? (
-              <>
-                <button className="btn primary" onClick={kc.act.next}>Next screen</button>
-                <button className="btn link" onClick={kc.disconnect}>Disconnect</button>
-              </>
-            ) : (
-              kc.lastName
-                ? <>
-                    <button className="btn primary" disabled={!canBluetooth || kc.link === "connecting"} onClick={kc.reconnect}>
-                      {kc.link === "connecting" ? "Reconnecting…" : `Reconnect to ${kc.lastName}`}</button>
-                    <button className="btn link" onClick={kc.connect}>Another keychain</button>
-                  </>
-                : <button className="btn primary" disabled={!canBluetooth || kc.link === "connecting"} onClick={kc.connect}>Connect</button>
-            )}
-          </div>
+          <div className="actions">{linkButtons(false)}</div>
         </div>
       </section>
+      ) : (
+      // the other tabs: a slim bar with the live screen, so the page is about the tab
+      <section className={"mini" + (linked ? "" : " off")}>
+        <a className="mini-screen" href="#screens" aria-label="Screens"><Screen index={current} player={playerArgs} /></a>
+        <div className="mini-text">
+          <span className={"eyebrow " + (linked ? "ok" : "")}>{linked ? "● Live" : kc.link === "connecting" ? "○ Connecting…" : "○ Standby"}</span>
+          <b>{song && isPlayer ? song.song : names[current] || "Keychain"}</b>
+          <small>{song && isPlayer ? (song.playing ? "Playing on the keychain" : "Paused") : linked ? `On ${kc.name || "your keychain"}` : "Not connected"}</small>
+        </div>
+        <div className="actions">{linkButtons(true)}</div>
+      </section>
+      )}
 
       <nav className="tabs" aria-label="Sections">
         {TABS.map(([id, name], i) => (

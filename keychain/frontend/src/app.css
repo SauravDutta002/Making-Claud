@@ -101,3 +101,21 @@
 .steps-list li > span { display: inline; }
 .steps-list code { word-break: break-all; }
 @media (max-width: 560px) { .commands div { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
+
+/* ---------- the slim bar on every tab but Screens: the live screen, what's on, connect */
+.mini { width: min(var(--wrap), calc(100% - 32px)); margin: 24px auto 0; display: flex; align-items: center; gap: 16px;
+  padding: 12px 18px 12px 12px; background: var(--paper); border: 1px solid var(--line); border-radius: 18px; }
+.mini-screen { flex: none; width: 140px; padding: 5px; background: #000; border: 2px solid var(--shell-line); border-radius: 6px;
+  box-shadow: 4px 4px 0 color-mix(in srgb, var(--shell-line) 12%, transparent); }
+.mini-screen .oled { display: block; width: 100%; aspect-ratio: 2 / 1; image-rendering: pixelated; transition: opacity .4s; }
+.mini.off .mini-screen .oled { opacity: .5; }
+.mini-text { flex: 1; display: grid; gap: 3px; min-width: 0; }
+.mini-text b { font-size: 18px; font-weight: 700; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini-text small { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini .actions { margin: 0; flex: none; flex-wrap: nowrap; }
+@media (max-width: 560px) {
+  .mini { margin-top: 12px; gap: 12px; padding: 10px 12px 10px 10px; border-radius: 16px; }
+  .mini-screen { width: 104px; padding: 4px; }
+  .mini-text b { font-size: 15.5px; }
+  .mini-text .eyebrow { font-size: 10px; }
+}

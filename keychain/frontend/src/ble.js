@@ -42,7 +42,7 @@ const web = {
     await tx.startNotifications();
     tx.addEventListener("characteristicvaluechanged", (e) => onData(new TextDecoder().decode(e.target.value)));
     const ota = await svc.getCharacteristic(OTA).catch(() => null);      // older firmware: no Bluetooth updates
-    return { write: (b) => rx.writeValueWithoutResponse(b), ota: ota && ((b) => ota.writeValueWithResponse(b)), close: () => d.gatt.disconnect() };
+    return { piece: 180, write: (b) => rx.writeValueWithoutResponse(b), ota: ota && ((b) => ota.writeValueWithResponse(b)), close: () => d.gatt.disconnect() };
   },
 };
 
@@ -67,7 +67,11 @@ const nat = {
     await nat.init();
     await BleClient.connect(dev.id, () => onDrop());
     await BleClient.startNotifications(dev.id, NUS, TX, (dv) => onData(new TextDecoder().decode(dv)));
+    // how big a piece the link takes (Android drops anything bigger): 20 bytes unless the phone got more
+    const mtu = await BleClient.getMtu(dev.id).catch(() => 23);
     return {
+      piece: Math.max(20, Math.min(500, mtu - 3)),
+      fast: (on) => BleClient.requestConnectionPriority(dev.id, on ? 1 : 0).catch(() => {}),   // HIGH while updating
       write: (b) => BleClient.writeWithoutResponse(dev.id, NUS, RX, new DataView(b.buffer, b.byteOffset, b.byteLength)),
       ota: (b) => BleClient.write(dev.id, NUS, OTA, new DataView(b.buffer, b.byteOffset, b.byteLength)),
       close: () => BleClient.disconnect(dev.id),
@@ -110,7 +114,8 @@ export function useKeychain(onEvent) {
     if (!link.current) return Promise.resolve(false);
     const data = new TextEncoder().encode(line + "\n");
     queue.current = queue.current.then(async () => {
-      for (let i = 0; i < data.length; i += 180) await link.current?.write(data.slice(i, i + 180));
+      const n = link.current?.piece || 20;
+      for (let i = 0; i < data.length; i += n) await link.current?.write(data.slice(i, i + n));
       return true;
     }).catch(() => false);
     return queue.current;
@@ -190,14 +195,15 @@ export function useKeychain(onEvent) {
     await send(`U:${bin.length},${md5}`);
     const r = await ready;
     if (r.startsWith("U:err")) throw new Error("The keychain said: " + r.slice(6));
-    const piece = Math.max(20, Math.min(500, +r.split(",")[1] || 20));
+    const piece = Math.max(20, Math.min(l.piece || 20, +r.split(",")[1] || 20));   // what both ends can take
+    l.fast?.(true);
     try {
       for (let i = 0; i < bin.length; i += piece) {
         if (!link.current) throw new Error("The connection dropped. Nothing changed: try again");
         await l.ota(bin.slice(i, i + piece));
         onProgress?.(Math.min(1, (i + piece) / bin.length));
       }
-    } catch (e) { send("U:abort"); throw e; }
+    } catch (e) { send("U:abort"); l.fast?.(false); throw e; }
     const ok = waitLine(["U:ok", "U:err"], 30000);
     await send("U:end");
     const fin = await ok;

@@ -511,6 +511,11 @@ void drawPlayer(uint32_t f) {
     display.drawLine(cx - dx + 1, cy - dy, cx + dx + 1, cy + dy, C_BLACK);
   }
   display.fillCircle(cx, cy, 1, C_WHITE);
+  if (!musicOn && bridgeMusic) {                          // paused: || on the label
+    display.fillCircle(cx, cy, 10, C_WHITE);
+    display.fillRect(cx - 4, cy - 5, 3, 11, C_BLACK);
+    display.fillRect(cx + 1, cy - 5, 3, 11, C_BLACK);
+  }
   display.fillCircle(60, 6, 3, C_WHITE);                  // tonearm: needle down while playing
   display.fillCircle(60, 6, 1, C_BLACK);
   int ex = musicOn ? 55 : 62, ey = musicOn ? 24 : 27;
@@ -521,62 +526,35 @@ void drawPlayer(uint32_t f) {
   display.fillRect(tx - 2, ty - 1, 4, 3, C_WHITE);
 }
 
-/* the equalizer, Snoopy style: a ring of rays round a heart that beats with
-   the song. The ring turns slowly (a little faster when it's louder), each ray
-   leaves a peak dot that drifts back down, two notes float up at the sides and
-   the song glides along the bottom. All eased: nothing flashes. */
-void eqHeart(int cx, int cy, float s) {
-  int r = (int)(s * 0.55f);
-  display.fillCircle(cx - r, cy - r / 2, r, C_WHITE);
-  display.fillCircle(cx + r, cy - r / 2, r, C_WHITE);
-  display.fillTriangle(cx - 2 * r, cy - r / 2 + 1, cx + 2 * r, cy - r / 2 + 1, cx, cy + 2 * r, C_WHITE);
-}
-
-void eqNote(int x, int y) {
-  display.fillCircle(x, y + 6, 2, C_WHITE);
-  display.drawFastVLine(x + 2, y, 7, C_WHITE);
-  display.drawLine(x + 2, y, x + 5, y + 2, C_WHITE);
-  display.drawLine(x + 2, y + 1, x + 5, y + 3, C_WHITE);
-}
-
+/* the equalizer - the Claude face's: 14 bars that snap to the song's real
+   loudness, the bass kicking on each beat, a soft fall and a peak cap */
 void drawEqualizer(uint32_t f) {
-  const int CX = 64, CY = 27, IN = 11, N = 32, MAXL = 14;
-  static float bar[N], peak[N], spin = 0;
+  static float bar[14];
   float lv = levelAt && millis() - levelAt < 1500 ? musicLevel : musicSmooth;
-  if (musicOn) spin += 0.004f + musicSmooth * 0.00008f;
-  for (uint8_t i = 0; i < N; i++) {
-    float target = 0;
-    if (musicOn) {
-      float shape = (0.4f + 0.6f * (sinf(f * 0.23f + i * 1.3f) * 0.5f + 0.5f)) * (0.6f + 0.4f * sinf(i * 0.7f + f * 0.05f));
-      target = lv * 0.16f * (shape + beatPulse() * 0.35f);
+  for (uint8_t i = 0; i < 14; i++) {
+    float target;
+    if (musicOn) {                                  // the loudness, spread over the bands
+      float shape = 0.45f + 0.55f * (sinf(f * 0.31f + i * 1.7f) * 0.5f + 0.5f);
+      float bass  = i < 4 ? beatPulse() * 0.5f : 0;
+      target = lv * 0.46f * (shape + bass);
+    } else {                                        // paused: a slow idle ripple
+      float a = sinf(f * 0.12f + i * 0.9f) + sinf(f * 0.05f + i * 2.1f) * 0.6f;
+      target = fabsf(a) * 4;
     }
-    bar[i] = target > bar[i] ? bar[i] + (target - bar[i]) * 0.6f : bar[i] * 0.85f;   // quick up, soft fall
-    if (bar[i] > MAXL) bar[i] = MAXL;
-    peak[i] = bar[i] > peak[i] ? bar[i] : peak[i] - 0.25f;
-    if (peak[i] < 0) peak[i] = 0;
-    float a = spin + i * 2 * PI / N, c = cosf(a), sn = sinf(a);
-    int len = 1 + (int)bar[i];
-    display.drawLine(CX + (int)lroundf(c * IN), CY + (int)lroundf(sn * IN),
-                     CX + (int)lroundf(c * (IN + len)), CY + (int)lroundf(sn * (IN + len)), C_WHITE);
-    float pr = IN + peak[i] + 3;
-    display.drawPixel(CX + (int)lroundf(c * pr), CY + (int)lroundf(sn * pr), C_WHITE);
+    bar[i] = target > bar[i] ? target : bar[i] * 0.82f;   // fast attack, smooth fall
+    int h = 4 + (int)bar[i];
+    if (h > 46) h = 46;
+    display.fillRect(4 + i * 9, 52 - h, 7, h, C_WHITE);
+    display.drawFastHLine(4 + i * 9, 52 - h - 2, 7, C_WHITE);   // peak cap
   }
-  eqHeart(CX, CY, 5.5f + beatGlow * 2.5f);              // Snoopy's heart, beating with the song
-  if (musicOn) {                                        // notes floating up at the sides
-    for (uint8_t k = 0; k < 2; k++) {
-      int y = 46 - (int)((f / 2 + k * 18) % 40);
-      int x = (k ? 108 : 12) + (int)(sinf(f * 0.05f + k * 2) * 2);
-      eqNote(x, y);
-    }
-  }
-  display.fillRect(0, 55, 128, 9, C_BLACK);             // the song along the bottom
-  const char* t = musicTitle[0] ? musicTitle : "music";
+  display.drawFastHLine(0, 53, 128, C_WHITE);
+  const char* t = musicTitle[0] ? musicTitle : "music";   // the song under it
   int w = (int)strlen(t) * 6;
-  if (w <= 120) txt((128 - w) / 2, 56, t);
+  if (w <= 124) txt((128 - w) / 2, 56, t);
   else {
     int span = w + 30, off = (int)((f / 3) % span);
-    txt(4 - off, 56, t);
-    txt(4 - off + span, 56, t);
+    txt(2 - off, 56, t);
+    txt(2 - off + span, 56, t);
   }
 }
 
@@ -673,7 +651,9 @@ void sendLine(const char* line) {                 // back to the app / bridge
 
 void sendInfo() {
   char b[64];
-  sendLine("F:" FW_VERSION ",ota");                  // which firmware, and that it can update over Bluetooth
+  // which firmware, that it can update over Bluetooth, and the link's packet size (MTU)
+  snprintf(b, sizeof(b), "F:" FW_VERSION ",ota,%u", (unsigned)(bleConnected && bleSrv ? bleSrv->getPeerMTU(bleSrv->getConnId()) : 0));
+  sendLine(b);
   snprintf(b, sizeof(b), "K:%u,%u,%u,%u,%u", screen, SCREENS, briIndex, volIndex, soundOn ? 1 : 0);
   sendLine(b);
   for (uint8_t i = 0; i < SCREENS; i++) {
@@ -693,7 +673,10 @@ void handleLine(char* line) {
   switch (line[0]) {
     case 'M': {
       bridgeMusic = true;
-      musicOn = v[0] == '1';
+      bool play = v[0] == '1';
+      if (musicOn && !play) { trackPos += (millis() - trackAt) / 1000; trackAt = millis(); }   // paused: freeze the bar here
+      else if (!musicOn && play) trackAt = millis();                                           // playing again: carry on
+      musicOn = play;
       musicState = v[0] - '0'; musicAt = millis();
       char* p = strchr(v, ',');
       if (p && strncmp(musicTitle, p + 1, sizeof(musicTitle) - 1) != 0) newSong = true;
@@ -764,7 +747,11 @@ void serialUpdate() {
   }
   char c;
   while (bleQ && xQueueReceive(bleQ, &c, 0)) {
-    if (c == '\n' || c == '\r') { ble[nb] = 0; handleLine(ble); nb = 0; }
+    if (c == '\n' || c == '\r') {
+      ble[nb] = 0;
+      if (nb && ble[0] != 'A') { Serial.print("< "); Serial.println(ble); }   // what the app sent, on USB (not the beat)
+      handleLine(ble); nb = 0;
+    }
     else if (nb < sizeof(ble) - 1) ble[nb++] = c;
   }
 }
@@ -1088,15 +1075,67 @@ void autoMusic() {
   }
 }
 
-void drawOta() {                                  // "Updating" and a progress bar
+/* the update screen: a ring that fills as the firmware comes in, the
+   percentage inside it, and the phone sending little packets to the chip.
+   Done: a full ring with a tick, then it restarts. All smooth, no blinking. */
+void otaRing(int cx, int cy, int r, float p) {
+  for (int a = 0; a < 360; a += 3) {                     // the track: a dotted circle
+    float t = (a - 90) * DEG_TO_RAD;
+    display.drawPixel(cx + (int)lroundf(cosf(t) * r), cy + (int)lroundf(sinf(t) * r), C_WHITE);
+  }
+  int end = (int)(360 * p);
+  for (int a = 0; a <= end; a++) {                        // the filled part: 3 px thick
+    float t = (a - 90) * DEG_TO_RAD, c = cosf(t), sn = sinf(t);
+    for (int k = -1; k <= 1; k++) display.drawPixel(cx + (int)lroundf(c * (r + k)), cy + (int)lroundf(sn * (r + k)), C_WHITE);
+  }
+  if (p > 0 && p < 1) {                                  // a round head on the end
+    float t = (end - 90) * DEG_TO_RAD;
+    display.fillCircle(cx + (int)lroundf(cosf(t) * r), cy + (int)lroundf(sinf(t) * r), 2, C_WHITE);
+  }
+}
+
+void drawOta() {
+  static uint32_t f = 0;
+  f++;
   display.clearDisplay();
-  txtC(8, otaRebootAt ? "Updated!" : "Updating...");
-  txtC(20, otaRebootAt ? "restarting" : "keep the phone close");
-  uint32_t pct = otaSize ? (uint32_t)((uint64_t)otaGot * 100 / otaSize) : 0;
-  display.drawRoundRect(14, 36, 100, 10, 3, C_WHITE);
-  display.fillRoundRect(16, 38, (int)(96 * pct / 100), 6, 2, C_WHITE);
-  char b[8]; snprintf(b, sizeof(b), "%lu%%", (unsigned long)pct);
-  txtC(52, b);
+  bool done = otaRebootAt != 0;
+  float p = done ? 1 : (otaSize ? (float)otaGot / otaSize : 0);
+  const int cx = 31, cy = 32;
+  otaRing(cx, cy, 24, p);
+  if (done) {                                           // a tick
+    display.drawLine(cx - 9, cy, cx - 3, cy + 6, C_WHITE);  display.drawLine(cx - 9, cy + 1, cx - 3, cy + 7, C_WHITE);
+    display.drawLine(cx - 3, cy + 6, cx + 9, cy - 6, C_WHITE); display.drawLine(cx - 3, cy + 7, cx + 9, cy - 5, C_WHITE);
+  } else {
+    char b[6]; snprintf(b, sizeof(b), "%d", (int)(p * 100));
+    display.setTextSize(2); display.setTextColor(C_WHITE);
+    int w = (int)strlen(b) * 12;
+    display.setCursor(cx - w / 2 - 2, cy - 7); display.print(b);
+    display.setTextSize(1);
+    display.setCursor(cx + w / 2 - 1, cy - 7); display.print("%");
+  }
+
+  const int X = 64;                                       // the right side
+  txt(X, 6, done ? "UPDATED" : "UPDATING");
+  display.drawFastHLine(X, 16, done ? 42 : 48, C_WHITE);
+  // phone -> packets -> chip
+  display.drawRoundRect(X, 25, 9, 15, 2, C_WHITE);        // the phone
+  display.drawFastHLine(X + 3, 37, 3, C_WHITE);
+  display.drawRect(X + 46, 27, 11, 11, C_WHITE);          // the chip, with its pins
+  display.fillRect(X + 49, 30, 5, 5, C_WHITE);
+  for (int k = 0; k < 3; k++) {
+    display.drawFastHLine(X + 43, 29 + k * 3, 3, C_WHITE);
+    display.drawFastHLine(X + 57, 29 + k * 3, 3, C_WHITE);
+  }
+  if (!done) {
+    for (int x = X + 12; x < X + 42; x += 3) display.drawPixel(x, 32, C_WHITE);   // the line between them
+    for (int k = 0; k < 3; k++) {                         // packets gliding along it
+      int px = X + 12 + (int)((f * 1.2f + k * 10) ) % 30;
+      display.fillRect(px, 31, 3, 3, C_WHITE);
+    }
+  } else {
+    display.drawFastHLine(X + 12, 32, 30, C_WHITE);
+  }
+  txt(X, 48, done ? "restarting" : "stay close");
 }
 
 void loop() {
@@ -1107,7 +1146,7 @@ void loop() {
   if (otaOn || otaRebootAt) {                             // updating: just the progress
     serialUpdate();
     lastTouch = now;
-    if (now - last >= 100) { last = now; drawOta(); display.display(); }
+    if (now - last >= 40) { last = now; drawOta(); display.display(); }
     return;
   }
   touchUpdate();
