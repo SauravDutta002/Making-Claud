@@ -102,3 +102,10 @@
   .kc-fig { padding: 40px 44px 46px; }
   .kc-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 }
+
+/* numbered steps: the text flows as one paragraph (bold words never become columns), at any width */
+.steps-list li { display: block; position: relative; padding: 10px 0 10px 40px; }
+.steps-list li::before { position: absolute; left: 0; top: 12px; padding: 0; }
+.steps-list li > span { display: inline; }
+.steps-list code { word-break: break-all; }
+@media (max-width: 560px) { .commands div { grid-template-columns: minmax(0, 1fr); gap: 2px; } }
