@@ -40,7 +40,7 @@
 #include "frames_z.h"                // made from frames.h by tools/pack_frames.py
 
 /* ---------------- make it yours ---------------- */
-#define FW_VERSION   "2.1.0"   // bump it for each release: the app offers the update (tools/release_fw.py)
+#define FW_VERSION   "2.1.1"   // bump it for each release: the app offers the update (tools/release_fw.py)
 #define CAPTION      ""      // a little name in the corner, e.g. "NNAN" ("" = none)
 #define SLEEP_MIN    5       // sleep after this many minutes untouched (0 = never)
 #define FLIP         0       // 1 = screen mounted upside down
@@ -553,19 +553,11 @@ void drawEqualizer(uint32_t f) {
     }
     bar[i] = target > bar[i] ? target : bar[i] * 0.82f;   // fast attack, smooth fall
     int h = 4 + (int)bar[i];
-    if (h > 46) h = 46;
-    display.fillRect(4 + i * 9, 52 - h, 7, h, C_WHITE);
-    display.drawFastHLine(4 + i * 9, 52 - h - 2, 7, C_WHITE);   // peak cap
+    if (h > 52) h = 52;
+    display.fillRect(4 + i * 9, 59 - h, 7, h, C_WHITE);
+    display.drawFastHLine(4 + i * 9, 59 - h - 2, 7, C_WHITE);   // peak cap
   }
-  display.drawFastHLine(0, 53, 128, C_WHITE);
-  const char* t = musicTitle[0] ? musicTitle : "music";   // the song under it
-  int w = (int)strlen(t) * 6;
-  if (w <= 124) txt((128 - w) / 2, 56, t);
-  else {
-    int span = w + 30, off = (int)((f / 3) % span);
-    txt(2 - off, 56, t);
-    txt(2 - off + span, 56, t);
-  }
+  display.drawFastHLine(0, 60, 128, C_WHITE);
 }
 
 /* ============================================================
@@ -749,7 +741,7 @@ void handleLine(char* line) {
     }
     case 'P':                                         // My picture: keep it / wipe it
       if (!strcmp(v, "save")) { prefs.begin("keychain", false); prefs.putBytes("pic", picBuf, sizeof(picBuf)); prefs.end(); }
-      else if (!strcmp(v, "clear")) { memset(picBuf, 0, sizeof(picBuf)); picSet = false; prefs.begin("keychain", false); prefs.remove("pic"); prefs.end(); }
+      else if (!strcmp(v, "clear")) { memset(picBuf, 0, sizeof(picBuf)); picSet = true; prefs.begin("keychain", false); prefs.putBytes("pic", picBuf, sizeof(picBuf)); prefs.end(); }
       break;
     case 'Q': {
       int ps = 0, d = 0;

@@ -77,14 +77,19 @@ export default function Draw({ kc, picture, setPicture }) {
   useEffect(paint, []);
   useEffect(() => { sent.current = null; if (live) push(); }, [live]);   // (re)connected: send the whole picture once
 
-  function push() {                                          // the changes since last time -> keychain (and the app)
+  const busy = useRef(false), again = useRef(false);
+  async function push() {                                    // what changed since what the keychain HAS -> keychain
     timer.current = 0;
     const b = pack(d.current.b);
     setPicture(b);
     if (!live) return;
+    if (busy.current) { again.current = true; return; }      // one at a time; the next one catches up on everything
+    busy.current = true;
     const ch = changes(b, sent.current);
-    if (ch.length) kc.sendPicture(ch);
-    sent.current = b;
+    const ok = !ch.length || (await kc.sendPicture(ch));
+    sent.current = ok ? b : null;                            // something got lost: the whole picture next time
+    busy.current = false;
+    if (again.current || !ok) { again.current = false; setTimeout(push, ok ? 0 : 300); }
   }
   function changed(keep = true) {
     paint();
@@ -113,7 +118,7 @@ export default function Draw({ kc, picture, setPicture }) {
   const onMove = (e) => { if (down.current) stroke(e); };
   const onUp = () => { down.current = false; last.current = null; };
 
-  function clearAll() { d.current.clear(); setPhoto(null); changed(); }
+  function clearAll() { d.current.clear(); setPhoto(null); changed(false); if (live) kc.send("P:clear"); }
 
   async function pickPhoto(e) {
     const f = e.target.files?.[0];

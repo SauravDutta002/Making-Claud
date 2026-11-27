@@ -40,7 +40,7 @@ function GetAndroid() {                      // only on the web: the app itself 
 }
 
 // in the Android app: is a newer build on GitHub? (release notes say "build N")
-function UpdateBanner() {
+function useAppUpdate() {                       // 0, or the newer build number on GitHub
   const [next, setNext] = useState(0);
   useEffect(() => {
     if (!isNativeApp || !__BUILD__) return;
@@ -50,13 +50,37 @@ function UpdateBanner() {
         if (n > __BUILD__) setNext(n);
       }).catch(() => {});
   }, []);
-  if (!next) return null;
+  return next;
+}
+
+// the pop-up: what's new (the app, the keychain's firmware), with the buttons right there
+function UpdateDialog({ appNext, fw, onClose }) {
+  const fwBusy = fw.job && !fw.job.err;
   return (
-    <section className="panel update-banner">
-      <div className="panel-head"><h2>Update available</h2><span className="pill ok">New</span></div>
-      <p className="lead">A newer version of the app is out. Download it and install it over this one - your settings stay.</p>
-      <div className="actions"><a className="btn primary" href={ANDROID_APP} target="_blank" rel="noopener">Download update</a></div>
-    </section>
+    <div className="modal" role="dialog" aria-modal="true" aria-labelledby="upd-title" onClick={(e) => e.target === e.currentTarget && !fwBusy && onClose()}>
+      <div className="modal-card">
+        <span className="eyebrow ok">● New</span>
+        <h2 id="upd-title">Update available</h2>
+        {!!appNext && (
+          <div className="upd-row">
+            <div><b>The app</b><small>A newer version is out (build {appNext}). Install it over this one: your settings stay.</small></div>
+            <a className="btn primary sm" href={ANDROID_APP} target="_blank" rel="noopener">Download</a>
+          </div>
+        )}
+        {fw.update && (
+          <div className="upd-row">
+            <div><b>Keychain firmware {fw.latest.version}</b>
+              <small>{fwBusy ? fw.job.step : fw.canBle ? `It's on ${fw.version}. Over Bluetooth, about a minute.` : `It's on ${fw.version}: update it once with the USB cable from a computer.`}</small>
+              {fwBusy && <FwProgress job={fw.job} />}
+              {fw.job?.err && <small className="err">{fw.job.err}</small>}</div>
+            {!fwBusy && (fw.canBle
+              ? <button className="btn primary sm" onClick={fw.viaBle}>Update</button>
+              : canUsb && <button className="btn primary sm" onClick={fw.viaUsb}>Update with cable</button>)}
+          </div>
+        )}
+        <div className="actions"><button className="btn ghost" disabled={fwBusy} onClick={onClose}>{fwBusy ? "Updating…" : "Later"}</button></div>
+      </div>
+    </div>
   );
 }
 
@@ -438,13 +462,25 @@ export default function App() {
   const lf = useLastfm(lfVersion);
   const np = useNowPlaying();
   const fw = useFirmware(kc, toast);
+  const appNext = useAppUpdate();
+  const updates = (appNext ? 1 : 0) + (fw.update ? 1 : 0);
+  const [showUpd, setShowUpd] = useState(false);
+  // pops up by itself once for each new version (then the button on top stays)
+  const updKey = `${appNext}|${fw.update ? fw.latest.version : ""}`;
+  useEffect(() => {
+    if (!updates) return;
+    let seen = "";
+    try { seen = localStorage.getItem("kc-upd-seen") || ""; } catch {}
+    if (seen !== updKey) { setShowUpd(true); try { localStorage.setItem("kc-upd-seen", updKey); } catch {} }
+  }, [updKey]);
+  useEffect(() => { if (fw.job && !fw.job.err) setShowUpd(true); }, [!!fw.job]);
   // the beat -> keychain, ~8x a second while a song plays (A:<0-99>, as Claude Buddy's bridge sends)
   const beatAt = useRef(0), linkedRef = useRef(false), playingRef = useRef(false);
   const beat = useBeat((level) => {
     const now = Date.now();
     if (!linkedRef.current || !playingRef.current || now - beatAt.current < 120) return;
     beatAt.current = now;
-    kc.send("A:" + level);
+    kc.send("A:" + level, true);
   });
   const track = np.track || lf.track || sp.track;
   const tab = useTab();
@@ -538,6 +574,7 @@ export default function App() {
         <a className="logo" href="#screens"><Logo /><span>Keychain <b>Remote</b></span></a>
         <span className={"led " + (linked ? "ok" : kc.link === "connecting" ? "wait" : "")}><i />{linked ? "Bluetooth" : kc.link === "connecting" ? "Connecting" : "Not connected"}</span>
         <span className="end">
+          {updates > 0 && <button className="btn primary sm upd-btn" onClick={() => setShowUpd(true)}><i />Update{updates > 1 ? "s" : ""}</button>}
           {install && <button className="btn ghost sm" onClick={install}>Install app</button>}
           <button className="theme" onClick={flipTheme} aria-label="Theme">{theme === "dark" ? "☀" : "☾"}</button>
         </span>
@@ -575,8 +612,7 @@ export default function App() {
       </nav>
 
       <main className="content">
-        <UpdateBanner />
-        <FirmwareBar fw={fw} />
+        {fw.job && <FirmwareBar fw={fw} />}
         {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} picture={picture} />}
         {tab === "draw" && <Draw kc={kc} picture={picture} setPicture={setPicture} />}
         {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} beat={beat} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
@@ -592,6 +628,8 @@ export default function App() {
           </a>
         ))}
       </nav>
+
+      {showUpd && updates > 0 && <UpdateDialog appNext={appNext} fw={fw} onClose={() => setShowUpd(false)} />}
 
       <div className="toasts" aria-live="polite">{toasts.map((t) => <div key={t.id} className={"toast " + t.kind}>{t.text}</div>)}</div>
       <footer className="foot"><span>Keychain Remote · talks to your keychain over Bluetooth, nothing leaves your phone</span></footer>

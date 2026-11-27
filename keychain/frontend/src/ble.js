@@ -44,8 +44,8 @@ const web = {
     tx.addEventListener("characteristicvaluechanged", (e) => onData(new TextDecoder().decode(e.target.value)));
     const ota = await svc.getCharacteristic(OTA).catch(() => null);      // older firmware: no Bluetooth updates
     const pic = await svc.getCharacteristic(PIC).catch(() => null);      // older firmware: no pictures
-    return { piece: 180, write: (b) => rx.writeValueWithoutResponse(b), ota: ota && ((b) => ota.writeValueWithResponse(b)),
-             pic: pic && ((b) => pic.writeValueWithoutResponse(b)), close: () => d.gatt.disconnect() };
+    return { piece: 180, write: (b) => rx.writeValueWithoutResponse(b), sure: (b) => rx.writeValueWithResponse(b),
+             ota: ota && ((b) => ota.writeValueWithResponse(b)), pic: pic && ((b) => pic.writeValueWithResponse(b)), close: () => d.gatt.disconnect() };
   },
 };
 
@@ -78,8 +78,9 @@ const nat = {
       piece: Math.max(20, Math.min(500, mtu - 3)),
       fast: (on) => BleClient.requestConnectionPriority(dev.id, on ? 1 : 0).catch(() => {}),   // HIGH while updating
       write: (b) => BleClient.writeWithoutResponse(dev.id, NUS, RX, new DataView(b.buffer, b.byteOffset, b.byteLength)),
+      sure: (b) => BleClient.write(dev.id, NUS, RX, new DataView(b.buffer, b.byteOffset, b.byteLength)),
       ota: (b) => BleClient.write(dev.id, NUS, OTA, new DataView(b.buffer, b.byteOffset, b.byteLength)),
-      pic: hasPic ? (b) => BleClient.writeWithoutResponse(dev.id, NUS, PIC, new DataView(b.buffer, b.byteOffset, b.byteLength)) : null,
+      pic: hasPic ? (b) => BleClient.write(dev.id, NUS, PIC, new DataView(b.buffer, b.byteOffset, b.byteLength)) : null,
       close: () => BleClient.disconnect(dev.id),
     };
   },
@@ -115,15 +116,25 @@ export function useKeychain(onEvent) {
     }
   }
 
-  /** send one line (queued, split into BLE-sized pieces) */
-  function send(line) {
+  /** send one line (queued, split into BLE-sized pieces). The keychain confirms each piece and it's tried
+   *  again if Android drops it (it does, when busy) - except `lossy` ones (the beat): a lost one doesn't matter. */
+  const beatBusy = useRef(false);
+  function send(line, lossy = false) {
     if (!link.current) return Promise.resolve(false);
+    if (lossy) {                                  // the beat never queues up behind itself: skip one instead
+      if (beatBusy.current) return Promise.resolve(false);
+      beatBusy.current = true;
+    }
     const data = new TextEncoder().encode(line + "\n");
     queue.current = queue.current.then(async () => {
-      const n = link.current?.piece || 20;
-      for (let i = 0; i < data.length; i += n) await link.current?.write(data.slice(i, i + n));
+      const l = link.current, n = l?.piece || 20;
+      for (let i = 0; i < data.length; i += n) {
+        const part = data.slice(i, i + n);
+        if (lossy || !l.sure) { await l.write(part); continue; }
+        try { await l.sure(part); } catch { await new Promise((r) => setTimeout(r, 60)); await link.current.sure(part); }
+      }
       return true;
-    }).catch(() => false);
+    }).catch(() => false).finally(() => { if (lossy) beatBusy.current = false; });
     return queue.current;
   }
 
@@ -227,7 +238,8 @@ export function useKeychain(onEvent) {
         for (let i = 0; i < bytes.length; i += n) {
           const part = bytes.subarray(i, i + n), o = off + i, pkt = new Uint8Array(part.length + 2);
           pkt[0] = o >> 8; pkt[1] = o & 255; pkt.set(part, 2);
-          await link.current?.pic?.(pkt);
+          try { await link.current.pic(pkt); }
+          catch { await new Promise((r) => setTimeout(r, 60)); await link.current.pic(pkt); }   // once more, then give up
         }
       return true;
     }).catch(() => false);
