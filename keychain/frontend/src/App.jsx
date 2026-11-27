@@ -4,9 +4,24 @@ import { loadScreens } from "./screens.js";
 import { useKeychain, canBluetooth } from "./ble.js";
 import { useSpotify, spotifyLogin, spotifyLogout, spotifyRedirect, savedClientId } from "./spotify.js";
 import { useLastfm, savedLastfm, saveLastfm, forgetLastfm } from "./lastfm.js";
+import { useNowPlaying, openNotificationAccess, isNativeApp } from "./nowplaying.js";
 
 const TABS = [["screens", "Screens"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
 const PLAYER = "Record player";
+// the Android app: built by GitHub on every push (.github/workflows/keychain-android.yml)
+const ANDROID_APP = "https://github.com/SauravDutta002/Making-Claud/releases/tag/keychain-android";
+
+function GetAndroid() {                      // only on the web: the app itself doesn't need it
+  if (isNativeApp) return null;
+  return (
+    <section className="panel android-cta">
+      <div className="panel-head"><h2>Get the Android app</h2></div>
+      <p className="lead">It shows what's playing in <b>YouTube, YouTube Music, Spotify</b> or any app, and stays connected to your keychain by itself.</p>
+      <div className="actions"><a className="btn primary" href={ANDROID_APP} target="_blank" rel="noopener">Download for Android</a></div>
+      <p className="hint">Opens the Releases page: tap <b>KeychainRemote.apk</b>, then install it.</p>
+    </section>
+  );
+}
 
 /* ------------------------------------------------------------ small pieces */
 
@@ -132,12 +147,32 @@ function Screens({ names, current, onPick, linked }) {
   );
 }
 
-function Music({ kc, sp, lf, relinkLastfm, manual, setManual, sendManual, showPlayer }) {
+function PhoneMusic({ np }) {
+  return (
+    <section className="panel">
+      <div className="panel-head"><h2>Music on this phone</h2>{np.granted && <span className="pill ok">On</span>}</div>
+      {np.granted ? (
+        <p className="lead">Whatever plays on this phone - YouTube, YouTube Music, Spotify, any app - shows on the keychain by itself.
+          {np.track?.app && <> Now: <b>{np.track.app}</b>.</>}</p>
+      ) : (
+        <>
+          <p className="lead">Let the app see what's playing on this phone, from any app (YouTube, YouTube Music, Spotify...). Android calls this
+            <b> Notification access</b>; the app only reads the song, never your notifications.</p>
+          <div className="actions"><button className="btn primary" onClick={openNotificationAccess}>Allow access</button></div>
+          <p className="hint">In the list, switch on <b>Keychain Remote</b>, then come back.</p>
+        </>
+      )}
+    </section>
+  );
+}
+
+function Music({ kc, sp, lf, np, relinkLastfm, manual, setManual, sendManual, showPlayer }) {
   const [cid, setCid] = useState(savedClientId());
   const [lfUser, setLfUser] = useState(savedLastfm().user);
   const [lfKey, setLfKey] = useState(savedLastfm().key);
-  const t = lf.track || sp.track;
-  const source = lf.track ? "Last.fm" : sp.track ? "Spotify" : lf.linked ? "Last.fm" : sp.linked ? "Spotify" : "";
+  const t = np.track || lf.track || sp.track;
+  const source = np.track ? np.track.app || "Phone" : lf.track ? "Last.fm" : sp.track ? "Spotify"
+    : np.granted ? "Phone" : lf.linked ? "Last.fm" : sp.linked ? "Spotify" : "";
   return (
     <>
       <section className="panel">
@@ -146,7 +181,7 @@ function Music({ kc, sp, lf, relinkLastfm, manual, setManual, sendManual, showPl
           {t?.art ? <img src={t.art} alt="" className="np-art" /> : <div className={"np-disc" + (t?.playing ? " spin" : "")} />}
           <div className="np-text">
             <b>{t ? t.title : source ? "Nothing playing" : "Link your music"}</b>
-            <small>{t ? t.artist : source ? "Play a song in Spotify: it shows here and on the keychain." : "Set up Last.fm below (free) and your Spotify songs show up by themselves."}</small>
+            <small>{t ? t.artist : source ? "Play something: it shows here and on the keychain." : isNativeApp ? "Allow access below and anything you play shows up by itself." : "Set up Last.fm below (free) and your Spotify songs show up by themselves."}</small>
             {t && t.dur > 0 && (
               <div className="np-prog"><span>{mmss(Math.min(t.pos, t.dur))}</span><div className="meter"><i style={{ width: `${Math.min(100, (100 * t.pos) / t.dur)}%` }} /></div><span>{mmss(t.dur)}</span></div>
             )}
@@ -156,6 +191,9 @@ function Music({ kc, sp, lf, relinkLastfm, manual, setManual, sendManual, showPl
         {(lf.error || sp.error) && <p className="note err">{lf.error || sp.error}</p>}
       </section>
 
+      {isNativeApp && <PhoneMusic np={np} />}
+      <GetAndroid />
+      {!isNativeApp && <>
       <section className="panel">
         <div className="panel-head"><h2>Follow Spotify (free)</h2>{lf.linked && <span className="pill ok">Linked</span>}</div>
         <p className="lead">Works with the normal Spotify app, no Premium: Spotify tells Last.fm what you play, and this reads it.</p>
@@ -204,6 +242,7 @@ function Music({ kc, sp, lf, relinkLastfm, manual, setManual, sendManual, showPl
           )}
         </details>
       </section>
+      </>}
       <section className="panel">
         <div className="panel-head"><h2>Or type a song</h2></div>
         <div className="inline">
@@ -234,6 +273,7 @@ function Settings({ kc }) {
 function Help() {
   return (
     <>
+      <GetAndroid />
       <section className="panel">
         <div className="panel-head"><h2>Connect</h2></div>
         <ol className="steps-list">
@@ -266,7 +306,8 @@ export default function App() {
   const sp = useSpotify();
   const [lfVersion, setLfVersion] = useState(0);
   const lf = useLastfm(lfVersion);
-  const track = lf.track || sp.track;
+  const np = useNowPlaying();
+  const track = np.track || lf.track || sp.track;
   const tab = useTab();
   const [theme, flipTheme] = useTheme();
   const install = useInstall();
@@ -361,7 +402,7 @@ export default function App() {
 
       <main className="content">
         {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} />}
-        {tab === "music" && <Music kc={kc} sp={sp} lf={lf} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
+        {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
         {tab === "settings" && <Settings kc={kc} />}
         {tab === "help" && <Help />}
       </main>

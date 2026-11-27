@@ -1,0 +1,64 @@
+# Builds the Keychain Remote Android app (keychain/frontend) on every push that
+# touches it, and publishes the APK as the "Keychain Remote (Android)" release:
+# open github.com/<you>/<repo>/releases on your phone and tap KeychainRemote.apk.
+name: Keychain Android app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "keychain/frontend/**"
+      - ".github/workflows/keychain-android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write          # to publish the APK as a release
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: keychain/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: keychain/frontend/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Web app -> Android project
+        run: |
+          npm ci
+          npm run build:android
+
+      - name: Build the APK
+        working-directory: keychain/frontend/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/KeychainRemote.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KeychainRemote-apk
+          path: KeychainRemote.apk
+
+      - name: Publish as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: keychain-android
+          name: Keychain Remote (Android)
+          body: |
+            The Keychain Remote app for Android, built from `${{ github.sha }}` (build ${{ github.run_number }}).
+            On your phone: tap **KeychainRemote.apk** below, open it, allow installing from this source, install.
+            In the app: Now playing > Allow access, so it shows what YouTube / YouTube Music / Spotify are playing.
+          files: KeychainRemote.apk
+          make_latest: false

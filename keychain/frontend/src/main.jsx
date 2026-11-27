@@ -11,7 +11,7 @@ import App from "./App.jsx";
 import { isSpotifyPopup } from "./spotify.js";
 
 // installable: opens like an app from the home screen, and works offline
-if (import.meta.env.PROD && "serviceWorker" in navigator) {
+if (import.meta.env.PROD && "serviceWorker" in navigator && !window.Capacitor?.isNativePlatform?.()) {
   window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
 }
 

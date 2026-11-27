@@ -1,0 +1,9 @@
+{
+  "appId": "com.snoopy.keychain",
+  "appName": "Keychain Remote",
+  "webDir": "dist",
+  "android": { "backgroundColor": "#ece9e2" },
+  "plugins": {
+    "BluetoothLe": { "displayStrings": { "scanning": "Looking for your keychain…", "cancel": "Cancel", "availableDevices": "Keychains nearby", "noDeviceFound": "No keychain found. Tap it to wake it." } }
+  }
+}
