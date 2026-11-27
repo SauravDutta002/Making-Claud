@@ -9,7 +9,8 @@ import { useNowPlaying, openNotificationAccess, isNativeApp } from "./nowplaying
 const TABS = [["screens", "Screens"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
 const PLAYER = "Record player";
 // the Android app: built by GitHub on every push (.github/workflows/keychain-android.yml)
-const ANDROID_APP = "https://github.com/SauravDutta002/Making-Claud/releases/tag/keychain-android";
+const ANDROID_APP = "https://github.com/SauravDutta002/Making-Claud/releases/download/keychain-android/KeychainRemote.apk";
+const ANDROID_PAGE = "https://github.com/SauravDutta002/Making-Claud/releases/tag/keychain-android";
 
 function GetAndroid() {                      // only on the web: the app itself doesn't need it
   if (isNativeApp) return null;
@@ -17,8 +18,15 @@ function GetAndroid() {                      // only on the web: the app itself 
     <section className="panel android-cta">
       <div className="panel-head"><h2>Get the Android app</h2></div>
       <p className="lead">It shows what's playing in <b>YouTube, YouTube Music, Spotify</b> or any app, and stays connected to your keychain by itself.</p>
-      <div className="actions"><a className="btn primary" href={ANDROID_APP} target="_blank" rel="noopener">Download for Android</a></div>
-      <p className="hint">Opens the Releases page: tap <b>KeychainRemote.apk</b>, then install it.</p>
+      <div className="actions">
+        <a className="btn primary" href={ANDROID_APP} download>Download for Android</a>
+        <a className="btn link" href={ANDROID_PAGE} target="_blank" rel="noopener">Release page</a>
+      </div>
+      <ol className="steps-list">
+        <li><span>Open this page in <b>Chrome</b> (not the GitHub app) and tap <b>Download for Android</b>.</span></li>
+        <li><span>When it's downloaded, open <b>Files &gt; Downloads &gt; KeychainRemote.apk</b> and tap <b>Install</b>.</span></li>
+        <li><span>If Android asks, allow installing from <b>Files</b>. If Play Protect warns, tap <b>Install anyway</b>.</span></li>
+      </ol>
     </section>
   );
 }
