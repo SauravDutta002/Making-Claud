@@ -3,6 +3,7 @@ import Screen from "./Screen.jsx";
 import { loadScreens } from "./screens.js";
 import { useKeychain, canBluetooth } from "./ble.js";
 import { useSpotify, spotifyLogin, spotifyLogout, spotifyRedirect, savedClientId } from "./spotify.js";
+import { useLastfm, savedLastfm, saveLastfm, forgetLastfm } from "./lastfm.js";
 
 const TABS = [["screens", "Screens"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
 const PLAYER = "Record player";
@@ -131,45 +132,77 @@ function Screens({ names, current, onPick, linked }) {
   );
 }
 
-function Music({ kc, sp, manual, setManual, sendManual, showPlayer }) {
+function Music({ kc, sp, lf, relinkLastfm, manual, setManual, sendManual, showPlayer }) {
   const [cid, setCid] = useState(savedClientId());
-  const t = sp.track;
+  const [lfUser, setLfUser] = useState(savedLastfm().user);
+  const [lfKey, setLfKey] = useState(savedLastfm().key);
+  const t = lf.track || sp.track;
+  const source = lf.track ? "Last.fm" : sp.track ? "Spotify" : lf.linked ? "Last.fm" : sp.linked ? "Spotify" : "";
   return (
     <>
       <section className="panel">
-        <div className="panel-head"><h2>Now playing</h2>{sp.linked && <span className="pill ok">Spotify</span>}</div>
+        <div className="panel-head"><h2>Now playing</h2>{source && <span className="pill ok">{source}</span>}</div>
         <div className="np-card">
           {t?.art ? <img src={t.art} alt="" className="np-art" /> : <div className={"np-disc" + (t?.playing ? " spin" : "")} />}
           <div className="np-text">
-            <b>{t ? t.title : sp.linked ? "Nothing playing" : "Connect Spotify"}</b>
-            <small>{t ? t.artist : sp.linked ? "Play something in Spotify: it shows here and on the keychain." : "and the keychain's record player shows your song."}</small>
+            <b>{t ? t.title : source ? "Nothing playing" : "Link your music"}</b>
+            <small>{t ? t.artist : source ? "Play a song in Spotify: it shows here and on the keychain." : "Set up Last.fm below (free) and your Spotify songs show up by themselves."}</small>
             {t && t.dur > 0 && (
-              <div className="np-prog"><span>{mmss(t.pos)}</span><div className="meter"><i style={{ width: `${(100 * t.pos) / t.dur}%` }} /></div><span>{mmss(t.dur)}</span></div>
+              <div className="np-prog"><span>{mmss(Math.min(t.pos, t.dur))}</span><div className="meter"><i style={{ width: `${Math.min(100, (100 * t.pos) / t.dur)}%` }} /></div><span>{mmss(t.dur)}</span></div>
             )}
           </div>
         </div>
-        <div className="actions">
-          {sp.linked
-            ? <button className="btn ghost" onClick={() => { spotifyLogout(); location.reload(); }}>Disconnect Spotify</button>
-            : <button className="btn primary" disabled={!cid} onClick={() => spotifyLogin(cid)}>Connect Spotify</button>}
-          <button className="btn ghost" disabled={kc.link !== "on"} onClick={showPlayer}>Show record player</button>
-        </div>
-        {!sp.linked && (
-          <details className="setup" open={!cid}>
-            <summary>Set up Spotify (once)</summary>
+        <div className="actions"><button className="btn ghost" disabled={kc.link !== "on"} onClick={showPlayer}>Show record player</button></div>
+        {(lf.error || sp.error) && <p className="note err">{lf.error || sp.error}</p>}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head"><h2>Follow Spotify (free)</h2>{lf.linked && <span className="pill ok">Linked</span>}</div>
+        <p className="lead">Works with the normal Spotify app, no Premium: Spotify tells Last.fm what you play, and this reads it.</p>
+        {lf.linked ? (
+          <div className="actions">
+            <span className="mono">{savedLastfm().user}</span>
+            <button className="btn link" onClick={() => { forgetLastfm(); setLfUser(""); setLfKey(""); relinkLastfm(); }}>Unlink</button>
+          </div>
+        ) : (
+          <>
             <ol className="steps-list">
-              <li>Open <b>developer.spotify.com/dashboard</b> and create an app.</li>
-              <li>In its settings, under <b>Redirect URIs</b>, add exactly:
-                <span className="inline"><code>{spotifyRedirect()}</code>
-                  <button className="btn ghost sm" onClick={() => navigator.clipboard?.writeText(spotifyRedirect())}>Copy</button></span>
-                and tick <b>Web API</b>. Save.</li>
-              <li>Paste the app's <b>Client ID</b> below, then tap <b>Connect Spotify</b>.</li>
+              <li><span>Make a free account at <b>last.fm</b>.</span></li>
+              <li><span>In the <b>Spotify app</b>: Settings &gt; Apps &gt; <b>Last.fm</b> &gt; Connect (or on last.fm: Settings &gt; Applications &gt; Spotify Scrobbling).</span></li>
+              <li><span>Get a free API key at <b>last.fm/api/account/create</b> (any app name).</span></li>
+              <li><span>Fill in both below and tap <b>Link</b>.</span></li>
             </ol>
-            <input className="field" value={cid} onChange={(e) => setCid(e.target.value.trim())} placeholder="Spotify Client ID" />
-            {location.hostname === "localhost" && <p className="note err">Spotify doesn't allow "localhost". Open this app at http://127.0.0.1:{location.port}{location.pathname} instead.</p>}
-          </details>
+            <div className="inline">
+              <input className="field" value={lfUser} onChange={(e) => setLfUser(e.target.value)} placeholder="Last.fm username" />
+              <input className="field" value={lfKey} onChange={(e) => setLfKey(e.target.value)} placeholder="API key" />
+              <button className="btn primary" disabled={!lfUser.trim() || !lfKey.trim()} onClick={() => { saveLastfm(lfUser, lfKey); relinkLastfm(); }}>Link</button>
+            </div>
+          </>
         )}
-        {sp.error && <p className="note err">{sp.error}</p>}
+      </section>
+
+      <section className="panel">
+        <details className="setup">
+          <summary>Spotify Premium? Link Spotify directly instead</summary>
+          <div className="actions" style={{ marginTop: 10 }}>
+            {sp.linked
+              ? <button className="btn ghost" onClick={() => { spotifyLogout(); location.reload(); }}>Disconnect Spotify</button>
+              : <button className="btn primary" disabled={!cid} onClick={() => spotifyLogin(cid)}>Connect Spotify</button>}
+          </div>
+          {!sp.linked && (
+            <>
+              <ol className="steps-list">
+                <li><span>Open <b>developer.spotify.com/dashboard</b> and create an app (needs Premium).</span></li>
+                <li><span>Under <b>Redirect URIs</b> add exactly:
+                  <span className="inline"><code>{spotifyRedirect()}</code>
+                    <button className="btn ghost sm" onClick={() => navigator.clipboard?.writeText(spotifyRedirect())}>Copy</button></span>
+                  and tick <b>Web API</b>.</span></li>
+                <li><span>Paste its <b>Client ID</b>, then tap <b>Connect Spotify</b>.</span></li>
+              </ol>
+              <input className="field" value={cid} onChange={(e) => setCid(e.target.value.trim())} placeholder="Spotify Client ID" />
+            </>
+          )}
+        </details>
       </section>
       <section className="panel">
         <div className="panel-head"><h2>Or type a song</h2></div>
@@ -179,7 +212,7 @@ function Music({ kc, sp, manual, setManual, sendManual, showPlayer }) {
           <button className="btn primary" disabled={kc.link !== "on" || !manual.trim()} onClick={() => sendManual(true)}>Play</button>
           <button className="btn ghost" disabled={kc.link !== "on"} onClick={() => sendManual(false)}>Pause</button>
         </div>
-        <p className="hint">Music from other apps can't be read by a web page, so type it here.</p>
+        <p className="hint">Playing something else (YouTube, a radio app)? Type it here.</p>
       </section>
     </>
   );
@@ -204,9 +237,9 @@ function Help() {
       <section className="panel">
         <div className="panel-head"><h2>Connect</h2></div>
         <ol className="steps-list">
-          <li>Tap the keychain to wake it.</li>
-          <li>Press <b>Connect</b> and pick <b>Snoopy Keychain</b>.</li>
-          <li>Use <b>Chrome</b> on Android or a computer. On iPhone, use the <b>Bluefy</b> browser.</li>
+          <li><span>Tap the keychain to wake it.</span></li>
+          <li><span>Press <b>Connect</b> and pick <b>Snoopy Keychain</b>.</span></li>
+          <li><span>Use <b>Chrome</b> on Android or a computer. On iPhone, use the <b>Bluefy</b> browser.</span></li>
         </ol>
       </section>
       <section className="panel">
@@ -231,6 +264,9 @@ export default function App() {
     if (what === "error") toast(arg || "Couldn't connect", "warn");
   });
   const sp = useSpotify();
+  const [lfVersion, setLfVersion] = useState(0);
+  const lf = useLastfm(lfVersion);
+  const track = lf.track || sp.track;
   const tab = useTab();
   const [theme, flipTheme] = useTheme();
   const install = useInstall();
@@ -249,7 +285,7 @@ export default function App() {
   // Spotify -> keychain: new song, play/pause, or every 15 s to keep the progress in step
   const sent = useRef({ key: "", at: 0 });
   useEffect(() => {
-    const t = sp.track;
+    const t = track;
     if (!t) return;
     setSong({ song: `${t.title} - ${t.artist}`, playing: t.playing });
     if (!linked) return;
@@ -259,7 +295,7 @@ export default function App() {
       kc.send(`M:${t.playing ? 1 : 2},${t.title} - ${t.artist}`.slice(0, 90));
       kc.send(`Q:${Math.round(t.pos)},${Math.round(t.dur)}`);
     }
-  }, [sp.track, linked]);
+  }, [track?.title, track?.artist, track?.playing, Math.floor((track?.pos || 0) / 15), linked]);
 
   function sendManual(play) {
     const text = (manual.trim() || song?.song || "").slice(0, 80);
@@ -325,7 +361,7 @@ export default function App() {
 
       <main className="content">
         {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} />}
-        {tab === "music" && <Music kc={kc} sp={sp} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
+        {tab === "music" && <Music kc={kc} sp={sp} lf={lf} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
         {tab === "settings" && <Settings kc={kc} />}
         {tab === "help" && <Help />}
       </main>
