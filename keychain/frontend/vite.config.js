@@ -6,5 +6,6 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   plugins: [react()],
   base: "./",
+  define: { __BUILD__: JSON.stringify(Number(process.env.GITHUB_RUN_NUMBER || 0)) },
   build: { outDir: process.env.VERCEL ? "dist" : "../app", emptyOutDir: true, assetsInlineLimit: 0 },
 });

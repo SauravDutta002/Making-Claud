@@ -47,10 +47,18 @@ const web = {
 let bleReady = null;
 const nat = {
   init() { return (bleReady ||= BleClient.initialize({ androidNeverForLocation: true })); },
-  async pick() {
+  async pick() {                                  // no list to pick from: find the keychain and take it
     await nat.init();
-    const d = await BleClient.requestDevice({ services: [NUS], namePrefix: "Snoopy", optionalServices: [NUS] });
-    return { id: d.deviceId, name: d.name || "Keychain" };
+    const d = await new Promise((res, rej) => {
+      let done = false;
+      const end = (f, v) => { if (done) return; done = true; clearTimeout(t); BleClient.stopLEScan().catch(() => {}); f(v); };
+      const t = setTimeout(() => end(rej, new Error("Keychain not found - tap it to wake it, then try again.")), 10000);
+      BleClient.requestLEScan({ allowDuplicates: false }, (r) => {
+        const name = r.localName || r.device?.name || "";
+        if (name.startsWith("Snoopy") || (r.uuids || []).some((u) => u.toLowerCase() === NUS)) end(res, { ...r.device, name: name || r.device.name });
+      }).catch((e) => end(rej, e));
+    });
+    return { id: d.deviceId, name: d.name || "Snoopy Keychain" };
   },
   async known(id) { await nat.init(); return { id, name: localStorage.getItem("kc-name") || "Keychain" }; },
   async open(dev, onData, onDrop) {

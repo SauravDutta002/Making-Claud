@@ -31,6 +31,27 @@ function GetAndroid() {                      // only on the web: the app itself 
   );
 }
 
+// in the Android app: is a newer build on GitHub? (release notes say "build N")
+function UpdateBanner() {
+  const [next, setNext] = useState(0);
+  useEffect(() => {
+    if (!isNativeApp || !__BUILD__) return;
+    fetch("https://api.github.com/repos/SauravDutta002/Making-Claud/releases/tags/keychain-android")
+      .then((r) => r.json()).then((rel) => {
+        const n = +((rel.body || "").match(/build (\d+)/) || [])[1];
+        if (n > __BUILD__) setNext(n);
+      }).catch(() => {});
+  }, []);
+  if (!next) return null;
+  return (
+    <section className="panel update-banner">
+      <div className="panel-head"><h2>Update available</h2><span className="pill ok">New</span></div>
+      <p className="lead">A newer version of the app is out. Download it and install it over this one - your settings stay.</p>
+      <div className="actions"><a className="btn primary" href={ANDROID_APP} target="_blank" rel="noopener">Download update</a></div>
+    </section>
+  );
+}
+
 /* ------------------------------------------------------------ small pieces */
 
 function Logo() {
@@ -409,6 +430,7 @@ export default function App() {
       </nav>
 
       <main className="content">
+        <UpdateBanner />
         {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} />}
         {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
         {tab === "settings" && <Settings kc={kc} />}
