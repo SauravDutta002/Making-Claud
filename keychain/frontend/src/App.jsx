@@ -155,14 +155,18 @@ function Music({ kc, sp, manual, setManual, sendManual, showPlayer }) {
           <button className="btn ghost" disabled={kc.link !== "on"} onClick={showPlayer}>Show record player</button>
         </div>
         {!sp.linked && (
-          <details className="setup">
+          <details className="setup" open={!cid}>
             <summary>Set up Spotify (once)</summary>
             <ol className="steps-list">
               <li>Open <b>developer.spotify.com/dashboard</b> and create an app.</li>
-              <li>Add this Redirect URI: <code>{spotifyRedirect()}</code></li>
-              <li>Paste the app's Client ID:</li>
+              <li>In its settings, under <b>Redirect URIs</b>, add exactly:
+                <span className="inline"><code>{spotifyRedirect()}</code>
+                  <button className="btn ghost sm" onClick={() => navigator.clipboard?.writeText(spotifyRedirect())}>Copy</button></span>
+                and tick <b>Web API</b>. Save.</li>
+              <li>Paste the app's <b>Client ID</b> below, then tap <b>Connect Spotify</b>.</li>
             </ol>
             <input className="field" value={cid} onChange={(e) => setCid(e.target.value.trim())} placeholder="Spotify Client ID" />
+            {location.hostname === "localhost" && <p className="note err">Spotify doesn't allow "localhost". Open this app at http://127.0.0.1:{location.port}{location.pathname} instead.</p>}
           </details>
         )}
         {sp.error && <p className="note err">{sp.error}</p>}
@@ -301,7 +305,13 @@ export default function App() {
                 <button className="btn link" onClick={kc.disconnect}>Disconnect</button>
               </>
             ) : (
-              <button className="btn primary" disabled={!canBluetooth || kc.link === "connecting"} onClick={kc.connect}>Connect</button>
+              kc.lastName
+                ? <>
+                    <button className="btn primary" disabled={!canBluetooth || kc.link === "connecting"} onClick={kc.reconnect}>
+                      {kc.link === "connecting" ? "Reconnecting…" : `Reconnect to ${kc.lastName}`}</button>
+                    <button className="btn link" onClick={kc.connect}>Another keychain</button>
+                  </>
+                : <button className="btn primary" disabled={!canBluetooth || kc.link === "connecting"} onClick={kc.connect}>Connect</button>
             )}
           </div>
         </div>

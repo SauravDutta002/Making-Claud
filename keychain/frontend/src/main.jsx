@@ -8,6 +8,7 @@ import "@fontsource/jetbrains-mono/500.css";
 import "./base.css";
 import "./app.css";
 import App from "./App.jsx";
+import { isSpotifyPopup } from "./spotify.js";
 
 // installable: opens like an app from the home screen, and works offline
 if (import.meta.env.PROD && "serviceWorker" in navigator) {
@@ -31,4 +32,6 @@ class Recover extends React.Component {
   }
 }
 
-createRoot(document.getElementById("root")).render(<React.StrictMode><Recover /></React.StrictMode>);
+createRoot(document.getElementById("root")).render(isSpotifyPopup
+  ? <div className="crash"><p>Spotify connected. This window closes by itself.</p></div>
+  : <React.StrictMode><Recover /></React.StrictMode>);
