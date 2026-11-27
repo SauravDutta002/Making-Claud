@@ -33,14 +33,14 @@
 #include <Adafruit_SH110X.h>
 #include <Preferences.h>
 #include "esp_sleep.h"
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLE2902.h>
+#include "src/BLE/BLEDevice.h"   // the fixed copy (see src/BLE/README.md)
+#include "src/BLE/BLEServer.h"
+#include "src/BLE/BLE2902.h"
 #include <Update.h>
 #include "frames_z.h"                // made from frames.h by tools/pack_frames.py
 
 /* ---------------- make it yours ---------------- */
-#define FW_VERSION   "2.1.2"   // bump it for each release: the app offers the update (tools/release_fw.py)
+#define FW_VERSION   "2.1.3"   // bump it for each release: the app offers the update (tools/release_fw.py)
 #define CAPTION      ""      // a little name in the corner, e.g. "NNAN" ("" = none)
 #define SLEEP_MIN    5       // sleep after this many minutes untouched (0 = never)
 #define FLIP         0       // 1 = screen mounted upside down

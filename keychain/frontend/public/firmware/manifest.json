@@ -1,8 +1,8 @@
 {
-  "version": "2.1.2",
-  "size": 948528,
-  "md5": "99b11ca3bde0c55472f61ae7bd62e480",
-  "built": "2026-11-27",
+  "version": "2.1.3",
+  "size": 948192,
+  "md5": "85d355d78aa2c8760f2021f97330c63c",
+  "built": "2026-11-28",
   "files": [
     {
       "file": "bootloader.bin",
