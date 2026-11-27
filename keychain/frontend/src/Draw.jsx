@@ -3,6 +3,7 @@
 // Only the bytes that changed travel over Bluetooth, so it keeps up live.
 import React, { useEffect, useRef, useState } from "react";
 import { W, H, Bits } from "./screens.js";
+import { newer } from "./firmware.js";
 
 /** pixels (1 per byte) <-> the keychain's picture (1 bit per pixel, rows, high bit first) */
 export function pack(px) {
@@ -80,14 +81,16 @@ export default function Draw({ kc, picture, setPicture }) {
   // leaving Draw: the keychain goes back to the face it was on, and the board starts fresh next time
   const kcNow = useRef(kc); kcNow.current = kc;
   const before = useRef(kc.screen);
+  const drew = useRef(false);
   useEffect(() => () => {
     clearTimeout(timer.current); clearTimeout(saveTimer.current);
-    const k = kcNow.current, blank = new Uint8Array(1024);
-    setPicture(blank);
-    if (k.link !== "on" || !k.pic) return;
-    const pic = k.names.indexOf("My picture");
+    setPicture(new Uint8Array(1024));
+    const k = kcNow.current;
+    if (!drew.current || k.link !== "on" || !k.pic) return;
+    if (newer(k.fw?.version, "2.1.1")) { k.send("P:done"); return; }   // the keychain goes back: the record if a song plays, else its face
+    const pic = k.names.indexOf("My picture");                       // older firmware: wipe it and go back ourselves
     k.send("P:clear");
-    if (k.screen === pic) k.act.show(before.current !== pic ? before.current : 0);
+    k.act.show(before.current !== pic ? before.current : 0);
   }, []);
 
   const busy = useRef(false), again = useRef(false);
@@ -105,6 +108,7 @@ export default function Draw({ kc, picture, setPicture }) {
     if (again.current || !ok) { again.current = false; setTimeout(push, ok ? 0 : 300); }
   }
   function changed(keep = true) {
+    drew.current = true;
     paint();
     if (!timer.current) timer.current = setTimeout(push, 45);  // ~20 updates a second, whatever the finger does
     if (keep) { clearTimeout(saveTimer.current); saveTimer.current = setTimeout(() => live && kc.send("P:save"), 1500); }

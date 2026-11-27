@@ -40,7 +40,7 @@
 #include "frames_z.h"                // made from frames.h by tools/pack_frames.py
 
 /* ---------------- make it yours ---------------- */
-#define FW_VERSION   "2.1.1"   // bump it for each release: the app offers the update (tools/release_fw.py)
+#define FW_VERSION   "2.1.2"   // bump it for each release: the app offers the update (tools/release_fw.py)
 #define CAPTION      ""      // a little name in the corner, e.g. "NNAN" ("" = none)
 #define SLEEP_MIN    5       // sleep after this many minutes untouched (0 = never)
 #define FLIP         0       // 1 = screen mounted upside down
@@ -81,6 +81,8 @@ const uint8_t PICTURE_SCREEN = KC_ANIM_COUNT + BUILTIN_RIDE + BUILTIN_PLAYER;   
 uint8_t  picBuf[1024];
 bool     picSet = false;
 volatile bool picNew = false;
+uint8_t  beforePic = 0;                    // the screen we were on when the drawing began
+bool     screenMoved = false;              // the screen changed: tell the app (so its preview follows)
 
 uint32_t lastTouch = 0;
 uint32_t toastUntil = 0;
@@ -668,6 +670,12 @@ void sendLine(const char* line) {                 // back to the app / bridge
   }
 }
 
+void sendScreen() {                               // K: only - which screen, and the settings
+  char b[40];
+  snprintf(b, sizeof(b), "K:%u,%u,%u,%u,%u", screen, SCREENS, briIndex, volIndex, soundOn ? 1 : 0);
+  sendLine(b);
+}
+
 void sendInfo() {
   char b[64];
   // which firmware, that it can update over Bluetooth, and the link's packet size (MTU)
@@ -685,6 +693,8 @@ void sendInfo() {
 
 void goToScreen(uint8_t n);
 extern bool menuOpen;
+extern uint32_t transAt;
+extern uint8_t transTo;
 void closeMenu();
 void handleLine(char* line) {
   if (strlen(line) < 2 || line[1] != ':') return;
@@ -740,6 +750,16 @@ void handleLine(char* line) {
       break;
     }
     case 'P':                                         // My picture: keep it / wipe it
+      if (!strcmp(v, "done")) {
+        memset(picBuf, 0, sizeof(picBuf)); picSet = true; picNew = false;
+        prefs.begin("keychain", false); prefs.putBytes("pic", picBuf, sizeof(picBuf)); prefs.end();
+        manualAt = 0;
+        bool song = musicState == 1 && millis() - musicAt < 60000UL;
+        uint8_t back = beforePic < SCREENS && beforePic != PICTURE_SCREEN ? beforePic : 0;
+        if (BUILTIN_PLAYER && song) { beforeMusic = back; autoPlayer = true; goToScreen(PLAYER_SCREEN); }
+        else if (screen == PICTURE_SCREEN || (transAt && transTo == PICTURE_SCREEN)) goToScreen(back);
+        break;
+      }
       if (!strcmp(v, "save")) { prefs.begin("keychain", false); prefs.putBytes("pic", picBuf, sizeof(picBuf)); prefs.end(); }
       else if (!strcmp(v, "clear")) { memset(picBuf, 0, sizeof(picBuf)); picSet = true; prefs.begin("keychain", false); prefs.putBytes("pic", picBuf, sizeof(picBuf)); prefs.end(); }
       break;
@@ -841,6 +861,7 @@ void drawTransition() {
     musicStart(screen);
     frameIdx = 0; frameAt = millis(); sceneFrame = 0;
     transSaved = false;
+    screenMoved = true;
     eqView = viewFlip = false; viewAt = millis();     // a new screen: the player starts on its record
   }
   if (t >= T_CLOSE && viewFlip) { eqView = !eqView; viewFlip = false; viewAt = millis(); }
@@ -1182,10 +1203,11 @@ void loop() {
   serialUpdate();
   soundUpdate();
   musicUpdate();
+  if (screenMoved && !transAt) { screenMoved = false; if (bleConnected) sendScreen(); }
   if (BUILTIN_PICTURE && picNew) {
     manualAt = now; newSong = false;
     if (screen == PICTURE_SCREEN && !transAt) picNew = false;
-    else if (!transAt) { goToScreen(PICTURE_SCREEN); picNew = false; }
+    else if (!transAt) { beforePic = screen; goToScreen(PICTURE_SCREEN); picNew = false; }
   }
   autoMusic();
   if (bleConnected) lastTouch = now;                     // the phone app is connected: stay awake
