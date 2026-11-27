@@ -41,17 +41,29 @@ function GetAndroid() {                      // only on the web: the app itself 
 }
 
 // in the Android app: is a newer build on GitHub? (release notes say "build N")
-function useAppUpdate() {                       // 0, or the newer build number on GitHub
-  const [next, setNext] = useState(0);
+// the Android app: which build this is, the newest on GitHub, and 0 / the newer one
+function useAppUpdate(tick = 0) {
+  const [newest, setNewest] = useState(0);
   useEffect(() => {
     if (!isNativeApp || !__BUILD__) return;
-    fetch("https://api.github.com/repos/SauravDutta002/Making-Claud/releases/tags/keychain-android")
-      .then((r) => r.json()).then((rel) => {
-        const n = +((rel.body || "").match(/build (\d+)/) || [])[1];
-        if (n > __BUILD__) setNext(n);
-      }).catch(() => {});
-  }, []);
-  return next;
+    fetch("https://api.github.com/repos/SauravDutta002/Making-Claud/releases/tags/keychain-android", { cache: "no-store" })
+      .then((r) => r.json()).then((rel) => setNewest(+((rel.body || "").match(/build (\d+)/) || [])[1] || 0))
+      .catch(() => {});
+  }, [tick]);
+  return { build: __BUILD__, newest, next: newest > __BUILD__ ? newest : 0 };
+}
+
+function Versions({ kc, fw, app, onCheck }) {
+  return (
+    <section className="panel">
+      <div className="panel-head"><h2>Versions</h2>{!app.next && !fw.update && (app.newest || fw.known) && <span className="pill ok">Up to date</span>}</div>
+      <Row title="This app" hint={isNativeApp ? (app.newest ? `Newest: build ${app.newest}` : "Checking…") : "The website: always the newest"}>
+        <span className="mono">{isNativeApp ? `build ${app.build || "dev"}` : "web"}</span></Row>
+      <Row title="Keychain firmware" hint={fw.latest ? `Newest: ${fw.latest.version}` : "Checking…"}>
+        <span className="mono">{fw.version || (kc.link === "on" ? "…" : "connect to see")}</span></Row>
+      <div className="actions"><button className="btn ghost sm" onClick={onCheck}>Check for updates</button></div>
+    </section>
+  );
 }
 
 // the pop-up: what's new (the app, the keychain's firmware), with the buttons right there
@@ -331,8 +343,8 @@ function Music({ kc, sp, lf, np, beat, relinkLastfm, manual, setManual, sendManu
 /* ------------------------------------------------------------ firmware updates */
 
 // one update at a time, shared by the banner and the Settings section
-function useFirmware(kc, toast) {
-  const latest = useLatestFirmware();
+function useFirmware(kc, toast, tick) {
+  const latest = useLatestFirmware(tick);
   const [job, setJob] = useState(null);           // { how, pct, step } while it runs; { err } if it failed
   const linked = kc.link === "on";
   const known = linked && kc.count > 0;           // the keychain has told us about itself (F: comes before K:)
@@ -462,8 +474,21 @@ export default function App() {
   const [lfVersion, setLfVersion] = useState(0);
   const lf = useLastfm(lfVersion);
   const np = useNowPlaying();
-  const fw = useFirmware(kc, toast);
-  const appNext = useAppUpdate();
+  const [checkTick, setCheckTick] = useState(0);
+  const fw = useFirmware(kc, toast, checkTick);
+  const app = useAppUpdate(checkTick);
+  const appNext = app.next;
+  const checking = useRef(false);
+  function checkUpdates() { checking.current = true; setCheckTick((t) => t + 1); }
+  // after "Check for updates": the pop-up if there's something, else say so
+  useEffect(() => {
+    if (!checking.current) return;
+    const t = setTimeout(() => {
+      checking.current = false;
+      if (app.next || fw.update) setShowUpd(true); else toast("Everything is up to date");
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [checkTick, app.newest, fw.latest]);
   const updates = (appNext ? 1 : 0) + (fw.update ? 1 : 0);
   const [showUpd, setShowUpd] = useState(false);
   // pops up by itself once for each new version (then the button on top stays)
@@ -617,7 +642,7 @@ export default function App() {
         {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} picture={picture} />}
         {tab === "draw" && <Draw kc={kc} picture={picture} setPicture={setPicture} />}
         {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} beat={beat} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
-        {tab === "settings" && <><Settings kc={kc} /><FirmwarePanel kc={kc} fw={fw} /></>}
+        {tab === "settings" && <><Settings kc={kc} /><FirmwarePanel kc={kc} fw={fw} /><Versions kc={kc} fw={fw} app={app} onCheck={checkUpdates} /></>}
         {tab === "help" && <Help />}
       </main>
 

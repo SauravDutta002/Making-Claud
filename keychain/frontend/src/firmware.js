@@ -18,11 +18,11 @@ export function newer(a, b) {
 }
 
 /** the newest firmware on the website: { version, size, md5, built, files } | null */
-export function useLatestFirmware() {
+export function useLatestFirmware(tick = 0) {
   const [m, setM] = useState(null);
   useEffect(() => {
     fetch(BASE + "manifest.json", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).then(setM).catch(() => {});
-  }, []);
+  }, [tick]);
   return m;
 }
 

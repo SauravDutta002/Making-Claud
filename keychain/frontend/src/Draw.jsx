@@ -75,7 +75,20 @@ export default function Draw({ kc, picture, setPicture }) {
 
   const paint = () => { const c = canvas.current; if (!c) return; const ctx = c.getContext("2d"); d.current.paint(ctx, ctx.createImageData(W, H)); };
   useEffect(paint, []);
-  useEffect(() => { sent.current = null; if (live) push(); }, [live]);   // (re)connected: send the whole picture once
+  useEffect(() => { sent.current = null; }, [live]);          // (re)connected: the first stroke sends the whole picture
+
+  // leaving Draw: the keychain goes back to the face it was on, and the board starts fresh next time
+  const kcNow = useRef(kc); kcNow.current = kc;
+  const before = useRef(kc.screen);
+  useEffect(() => () => {
+    clearTimeout(timer.current); clearTimeout(saveTimer.current);
+    const k = kcNow.current, blank = new Uint8Array(1024);
+    setPicture(blank);
+    if (k.link !== "on" || !k.pic) return;
+    const pic = k.names.indexOf("My picture");
+    k.send("P:clear");
+    if (k.screen === pic) k.act.show(before.current !== pic ? before.current : 0);
+  }, []);
 
   const busy = useRef(false), again = useRef(false);
   async function push() {                                    // what changed since what the keychain HAS -> keychain
