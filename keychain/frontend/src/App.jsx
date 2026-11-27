@@ -11,6 +11,7 @@ import { useLatestFirmware, downloadFirmware, flashUsb, newer, canUsb } from "./
 const TABS = [["screens", "Screens"], ["draw", "Draw"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
 const PLAYER = "Record player";
 const PICTURE = "My picture";
+const DOCK_NAMES = { music: "Music" };       // short names for the bottom bar on phones
 
 // the picture on the board, kept on this device too
 function loadPicture() {
@@ -624,7 +625,7 @@ export default function App() {
         {TABS.map(([id, name]) => (
           <a key={id} href={"#" + id} aria-current={tab === id ? "page" : undefined}>
             <svg viewBox="0 0 24 24" aria-hidden="true">{ICONS[id]}</svg>
-            <span>{name}</span>
+            <span>{DOCK_NAMES[id] || name}</span>
           </a>
         ))}
       </nav>

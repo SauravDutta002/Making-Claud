@@ -164,3 +164,18 @@ label.btn { cursor: pointer; }
   .upd-btn { padding-inline: 10px; }
 }
 @media (prefers-reduced-motion: reduce) { .upd-btn i, .modal, .modal-card { animation: none; } }
+
+/* ---------- the bottom bar and the header, on any phone width */
+@media (max-width: 720px) {
+  .dock { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; }
+  .dock a { min-width: 0; }
+  .dock span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .top .end { gap: 8px; }
+}
+@media (max-width: 380px) {
+  .dock { left: 8px; right: 8px; padding: 5px; border-radius: 20px; }
+  .dock a { padding: 7px 2px 6px; font-size: 10.5px; border-radius: 14px; }
+  .dock svg { width: 20px; height: 20px; }
+  .top .led { font-size: 0; gap: 0; padding: 7px; }          /* just the dot */
+  .top .btn.sm { padding-inline: 10px; }
+}
