@@ -4,7 +4,9 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.Manifest;
 import android.media.MediaMetadata;
+import android.media.audiofx.Visualizer;
 import android.media.session.MediaController;
 import android.media.session.MediaSessionManager;
 import android.media.session.PlaybackState;
@@ -17,7 +19,10 @@ import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -28,7 +33,9 @@ import java.util.List;
  * Sends a "change" event to the web app whenever the song, play/pause or position
  * changes. Needs Notification access once (see MediaListener).
  */
-@CapacitorPlugin(name = "NowPlaying")
+@CapacitorPlugin(name = "NowPlaying", permissions = {
+    @Permission(alias = "audio", strings = { Manifest.permission.RECORD_AUDIO, Manifest.permission.MODIFY_AUDIO_SETTINGS })
+})
 public class NowPlayingPlugin extends Plugin {
     private MediaSessionManager msm;
     private final List<MediaController> watched = new ArrayList<>();
@@ -129,6 +136,72 @@ public class NowPlayingPlugin extends Plugin {
 
     @PluginMethod
     public void current(PluginCall call) { start(); call.resolve(snapshot()); }
+
+    /* ---- the beat: how loud the phone's music is right now, ~10x a second
+       ("level" events, 0-99), like Claude Buddy's bridge does on the laptop.
+       Android's Visualizer on the phone's mixed output (session 0); it needs the
+       RECORD_AUDIO permission, but only reads what the phone itself plays. */
+    private Visualizer vis;
+    private float peak = 20;
+
+    private boolean audioGranted() { return getPermissionState("audio") == PermissionState.GRANTED; }
+
+    @PluginMethod
+    public void beat(PluginCall call) {               // { on: true|false } -> { granted, running }
+        boolean on = call.getBoolean("on", true);
+        if (!on) { stopBeat(); call.resolve(beatState()); return; }
+        if (!audioGranted()) { requestPermissionForAlias("audio", call, "beatPerm"); return; }
+        startBeat();
+        call.resolve(beatState());
+    }
+
+    @PermissionCallback
+    private void beatPerm(PluginCall call) {
+        if (audioGranted()) startBeat();
+        call.resolve(beatState());
+    }
+
+    private JSObject beatState() {
+        JSObject o = new JSObject();
+        o.put("granted", audioGranted());
+        o.put("running", vis != null);
+        return o;
+    }
+
+    private void startBeat() {
+        if (vis != null) return;
+        try {
+            vis = new Visualizer(0);
+            vis.setEnabled(false);
+            vis.setCaptureSize(Visualizer.getCaptureSizeRange()[0] < 256 ? 256 : Visualizer.getCaptureSizeRange()[0]);
+            int rate = Math.min(Visualizer.getMaxCaptureRate(), 12000);   // ~12 a second
+            vis.setDataCaptureListener(new Visualizer.OnDataCaptureListener() {
+                @Override public void onWaveFormDataCapture(Visualizer v, byte[] w, int sr) {
+                    double sum = 0;
+                    for (byte b : w) { int x = (b & 0xff) - 128; sum += x * x; }
+                    float rms = (float) Math.sqrt(sum / Math.max(1, w.length));
+                    peak = Math.max(rms, peak * 0.995f);           // follows the volume, so quiet songs still move
+                    if (peak < 6) peak = 6;
+                    JSObject o = new JSObject();
+                    o.put("level", Math.min(99, Math.round(rms / peak * 90)));
+                    notifyListeners("level", o);
+                }
+                @Override public void onFftDataCapture(Visualizer v, byte[] f, int sr) {}
+            }, rate, true, false);
+            vis.setEnabled(true);
+        } catch (Exception e) {                        // some phones don't allow it: the keychain fakes a gentle beat
+            stopBeat();
+        }
+    }
+
+    private void stopBeat() {
+        if (vis == null) return;
+        try { vis.setEnabled(false); vis.release(); } catch (Exception ignored) {}
+        vis = null;
+    }
+
+    @Override
+    protected void handleOnDestroy() { stopBeat(); }
 
     @PluginMethod
     public void openSettings(PluginCall call) {

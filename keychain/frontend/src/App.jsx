@@ -4,7 +4,7 @@ import { loadScreens } from "./screens.js";
 import { useKeychain, canBluetooth } from "./ble.js";
 import { useSpotify, spotifyLogin, spotifyLogout, spotifyRedirect, savedClientId } from "./spotify.js";
 import { useLastfm, savedLastfm, saveLastfm, forgetLastfm } from "./lastfm.js";
-import { useNowPlaying, openNotificationAccess, isNativeApp } from "./nowplaying.js";
+import { useNowPlaying, useBeat, openNotificationAccess, isNativeApp } from "./nowplaying.js";
 
 const TABS = [["screens", "Screens"], ["music", "Now playing"], ["settings", "Settings"], ["help", "Help"]];
 const PLAYER = "Record player";
@@ -69,14 +69,16 @@ function Logo() {
 // screen window playing what the keychain shows, and the real measurements
 function Keychain({ index, player, dim }) {
   return (
-    <figure className={"kc-fig" + (dim ? " off" : "")} aria-hidden="true">
+    <figure className={"device kc-fig" + (dim ? " off" : "")} aria-hidden="true">
       <div className="kc">
         <div className="kc-loop"><i className="kc-hole" /></div>
         <div className="kc-case">
+          <i className="screw a" /><i className="screw b" /><i className="screw c" /><i className="screw d" />
           <div className="kc-window">
             <Screen index={index} player={player} />
-            <i className="kc-glass" />
           </div>
+          <span className="print">SNOOPY · KEYCHAIN</span>
+          <i className="pad" />
         </div>
       </div>
     </figure>
@@ -176,7 +178,7 @@ function Screens({ names, current, onPick, linked }) {
   );
 }
 
-function PhoneMusic({ np }) {
+function PhoneMusic({ np, beat }) {
   return (
     <section className="panel">
       <div className="panel-head"><h2>Music on this phone</h2>{np.granted && <span className="pill ok">On</span>}</div>
@@ -191,11 +193,16 @@ function PhoneMusic({ np }) {
           <p className="hint">In the list, switch on <b>Keychain Remote</b>, then come back.</p>
         </>
       )}
+      <Row title="Move to the beat" hint="The record player and equalizer follow the song's loudness. Android asks for the microphone for this; it only reads what this phone plays.">
+        <Toggle checked={beat.running} label="Move to the beat" onChange={beat.set} />
+      </Row>
+      {beat.granted && !beat.running && localStorage.getItem("kc-beat") === "1" &&
+        <p className="hint">This phone doesn't share its sound: the keychain keeps a gentle beat of its own.</p>}
     </section>
   );
 }
 
-function Music({ kc, sp, lf, np, relinkLastfm, manual, setManual, sendManual, showPlayer }) {
+function Music({ kc, sp, lf, np, beat, relinkLastfm, manual, setManual, sendManual, showPlayer }) {
   const [cid, setCid] = useState(savedClientId());
   const [lfUser, setLfUser] = useState(savedLastfm().user);
   const [lfKey, setLfKey] = useState(savedLastfm().key);
@@ -220,7 +227,7 @@ function Music({ kc, sp, lf, np, relinkLastfm, manual, setManual, sendManual, sh
         {(lf.error || sp.error) && <p className="note err">{lf.error || sp.error}</p>}
       </section>
 
-      {isNativeApp && <PhoneMusic np={np} />}
+      {isNativeApp && <PhoneMusic np={np} beat={beat} />}
       <GetAndroid />
       {!isNativeApp && <>
       <section className="panel">
@@ -336,6 +343,14 @@ export default function App() {
   const [lfVersion, setLfVersion] = useState(0);
   const lf = useLastfm(lfVersion);
   const np = useNowPlaying();
+  // the beat -> keychain, ~8x a second while a song plays (A:<0-99>, as Claude Buddy's bridge sends)
+  const beatAt = useRef(0), linkedRef = useRef(false), playingRef = useRef(false);
+  const beat = useBeat((level) => {
+    const now = Date.now();
+    if (!linkedRef.current || !playingRef.current || now - beatAt.current < 120) return;
+    beatAt.current = now;
+    kc.send("A:" + level);
+  });
   const track = np.track || lf.track || sp.track;
   const tab = useTab();
   const [theme, flipTheme] = useTheme();
@@ -348,6 +363,7 @@ export default function App() {
   useEffect(() => { loadScreens().then((l) => setLocalNames([...l.map((s) => s.name), PLAYER])).catch(() => {}); }, []);
 
   const linked = kc.link === "on";
+  linkedRef.current = linked; playingRef.current = !!track?.playing;
   const names = linked && kc.names.length ? kc.names.map((n, i) => n || localNames[i] || "…") : localNames;
   const current = linked ? kc.screen : preview;
   const playerIndex = names.indexOf(PLAYER);
@@ -436,7 +452,7 @@ export default function App() {
       <main className="content">
         <UpdateBanner />
         {tab === "screens" && <Screens names={names} current={current} onPick={pick} linked={linked} />}
-        {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
+        {tab === "music" && <Music kc={kc} sp={sp} lf={lf} np={np} beat={beat} relinkLastfm={() => setLfVersion((v) => v + 1)} manual={manual} setManual={setManual} sendManual={sendManual} showPlayer={showPlayer} />}
         {tab === "settings" && <Settings kc={kc} />}
         {tab === "help" && <Help />}
       </main>

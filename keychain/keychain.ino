@@ -376,6 +376,36 @@ uint8_t  beforeMusic = 0;                 // ...and this is where we were
 uint32_t trackPos = 0, trackDur = 180, trackAt = 0;
 float    discAngle = 0;
 
+/* the beat, like the Claude face: the phone sends A:<0-99> (how loud the song
+   is right now) ~8x a second. No A: lines (the phone doesn't share its sound)?
+   A gentle beat of its own, so it still moves with the music. */
+uint8_t  musicLevel  = 0;                 // loudness right now (0-99)
+float    musicAvg    = 0;                 // ...on average (a jump above it = a beat)
+float    musicSmooth = 0;                 // eased, for smooth movement
+float    beatGlow    = 0;                 // eased beat pulse
+uint32_t levelAt = 0, beatAt = 0;
+bool     eqView = false, viewFlip = false;   // the player screen: record <-> equalizer, every 12 s
+uint32_t viewAt = 0;
+
+float beatPulse() {                       // 1 right on a beat, fading to 0 over 250 ms
+  uint32_t d = millis() - beatAt;
+  return d < 250 ? 1 - d / 250.0f : 0;
+}
+
+void beatUpdate() {                       // once a frame
+  uint32_t now = millis();
+  bool real = now - levelAt < 1500;
+  float target = 0;
+  if (real) target = musicLevel;
+  else if (musicOn) {                     // no sound from the phone: about 115 beats a minute
+    static uint32_t nextBeat = 0;
+    if ((int32_t)(now - nextBeat) >= 0) { beatAt = now; nextBeat = now + 520; }
+    target = 34 + 26 * beatPulse() + 8 * sinf(now * 0.004f);
+  }
+  musicSmooth += (target - musicSmooth) * 0.2f;
+  beatGlow    += (beatPulse() - beatGlow) * 0.15f;
+}
+
 void txt(int x, int y, const char* t) {
   display.setTextSize(1); display.setTextColor(C_WHITE);
   display.setCursor(x, y); display.print(t);
@@ -410,7 +440,7 @@ void grooveRing(int cx, int cy, int r, float ang) {   // dashes travelling round
 
 void drawPlayer(uint32_t f) {
   const int RX = 64;
-  if (musicOn) discAngle += 0.07f;
+  if (musicOn) discAngle += 0.05f + musicSmooth * 0.0006f;   // a little faster when it's louder
   char song[44], artist[44] = "";
   strncpy(song, musicTitle[0] ? musicTitle : "music", sizeof(song) - 1);
   song[sizeof(song) - 1] = 0;
@@ -442,6 +472,7 @@ void drawPlayer(uint32_t f) {
   const int cx = 30, cy = 32;                             // the record
   display.drawCircle(cx, cy, 28, C_WHITE);
   display.drawCircle(cx, cy, 27, C_WHITE);
+  if (musicOn && beatGlow > 0.3f) display.drawCircle(cx, cy, 29, C_WHITE);   // the beat: the rim swells
   grooveRing(cx, cy, 24, discAngle);
   grooveRing(cx, cy, 20, discAngle);
   grooveRing(cx, cy, 16, discAngle);
@@ -465,6 +496,65 @@ void drawPlayer(uint32_t f) {
   display.drawLine(61, 8, ex + 1, ey, C_WHITE);
   display.drawLine(ex, ey, tx, ty, C_WHITE);
   display.fillRect(tx - 2, ty - 1, 4, 3, C_WHITE);
+}
+
+/* the equalizer, Snoopy style: a ring of rays round a heart that beats with
+   the song. The ring turns slowly (a little faster when it's louder), each ray
+   leaves a peak dot that drifts back down, two notes float up at the sides and
+   the song glides along the bottom. All eased: nothing flashes. */
+void eqHeart(int cx, int cy, float s) {
+  int r = (int)(s * 0.55f);
+  display.fillCircle(cx - r, cy - r / 2, r, C_WHITE);
+  display.fillCircle(cx + r, cy - r / 2, r, C_WHITE);
+  display.fillTriangle(cx - 2 * r, cy - r / 2 + 1, cx + 2 * r, cy - r / 2 + 1, cx, cy + 2 * r, C_WHITE);
+}
+
+void eqNote(int x, int y) {
+  display.fillCircle(x, y + 6, 2, C_WHITE);
+  display.drawFastVLine(x + 2, y, 7, C_WHITE);
+  display.drawLine(x + 2, y, x + 5, y + 2, C_WHITE);
+  display.drawLine(x + 2, y + 1, x + 5, y + 3, C_WHITE);
+}
+
+void drawEqualizer(uint32_t f) {
+  const int CX = 64, CY = 27, IN = 11, N = 32, MAXL = 14;
+  static float bar[N], peak[N], spin = 0;
+  float lv = levelAt && millis() - levelAt < 1500 ? musicLevel : musicSmooth;
+  if (musicOn) spin += 0.004f + musicSmooth * 0.00008f;
+  for (uint8_t i = 0; i < N; i++) {
+    float target = 0;
+    if (musicOn) {
+      float shape = (0.4f + 0.6f * (sinf(f * 0.23f + i * 1.3f) * 0.5f + 0.5f)) * (0.6f + 0.4f * sinf(i * 0.7f + f * 0.05f));
+      target = lv * 0.16f * (shape + beatPulse() * 0.35f);
+    }
+    bar[i] = target > bar[i] ? bar[i] + (target - bar[i]) * 0.6f : bar[i] * 0.85f;   // quick up, soft fall
+    if (bar[i] > MAXL) bar[i] = MAXL;
+    peak[i] = bar[i] > peak[i] ? bar[i] : peak[i] - 0.25f;
+    if (peak[i] < 0) peak[i] = 0;
+    float a = spin + i * 2 * PI / N, c = cosf(a), sn = sinf(a);
+    int len = 1 + (int)bar[i];
+    display.drawLine(CX + (int)lroundf(c * IN), CY + (int)lroundf(sn * IN),
+                     CX + (int)lroundf(c * (IN + len)), CY + (int)lroundf(sn * (IN + len)), C_WHITE);
+    float pr = IN + peak[i] + 3;
+    display.drawPixel(CX + (int)lroundf(c * pr), CY + (int)lroundf(sn * pr), C_WHITE);
+  }
+  eqHeart(CX, CY, 5.5f + beatGlow * 2.5f);              // Snoopy's heart, beating with the song
+  if (musicOn) {                                        // notes floating up at the sides
+    for (uint8_t k = 0; k < 2; k++) {
+      int y = 46 - (int)((f / 2 + k * 18) % 40);
+      int x = (k ? 108 : 12) + (int)(sinf(f * 0.05f + k * 2) * 2);
+      eqNote(x, y);
+    }
+  }
+  display.fillRect(0, 55, 128, 9, C_BLACK);             // the song along the bottom
+  const char* t = musicTitle[0] ? musicTitle : "music";
+  int w = (int)strlen(t) * 6;
+  if (w <= 120) txt((128 - w) / 2, 56, t);
+  else {
+    int span = w + 30, off = (int)((f / 3) % span);
+    txt(4 - off, 56, t);
+    txt(4 - off + span, 56, t);
+  }
 }
 
 /* ============================================================
@@ -553,6 +643,12 @@ void handleLine(char* line) {
       if (v[0] == '0') musicTitle[0] = 0;
       break;
     }
+    case 'A': {                                       // A:<level> ~8x a second
+      musicLevel = constrain(atoi(v), 0, 99); levelAt = millis();
+      if (musicLevel > musicAvg + 14 && millis() - beatAt > 180) beatAt = millis();
+      musicAvg = musicAvg * 0.9f + musicLevel * 0.1f;
+      break;
+    }
     case 'Q': {
       int ps = 0, d = 0;
       sscanf(v, "%d,%d", &ps, &d);
@@ -589,7 +685,7 @@ void serialUpdate() {
 void drawScreen() {
   display.clearDisplay();
   if (screen < KC_ANIM_COUNT) drawCustom(screen);
-  else if (BUILTIN_PLAYER && screen == PLAYER_SCREEN) drawPlayer(sceneFrame);
+  else if (BUILTIN_PLAYER && screen == PLAYER_SCREEN) { if (eqView) drawEqualizer(sceneFrame); else drawPlayer(sceneFrame); }
   else drawRide(sceneFrame);
   drawCaption();
 }
@@ -643,7 +739,9 @@ void drawTransition() {
     musicStart(screen);
     frameIdx = 0; frameAt = millis(); sceneFrame = 0;
     transSaved = false;
+    eqView = viewFlip = false; viewAt = millis();     // a new screen: the player starts on its record
   }
+  if (t >= T_CLOSE && viewFlip) { eqView = !eqView; viewFlip = false; viewAt = millis(); }
   if (t < T_CLOSE) {                                  // closing over the old screen
     float p = t / (float)T_CLOSE;
     shutters((int)(32 * p * p));
@@ -886,6 +984,10 @@ void autoMusic() {
   if (screen == PLAYER_SCREEN) newSong = false;
   bool on = (musicState == 1 && now - musicAt < 60000UL)          // the app re-sends every 15 s while playing
          || (musicState == 2 && now - musicAt < 300000UL);        // paused a long time: the music's over
+  if (screen == PLAYER_SCREEN) {                 // record <-> equalizer while it plays; the record when it stops
+    bool playing = on && musicState == 1;
+    if ((eqView && !playing) || (playing && now - viewAt > 12000UL)) { viewFlip = true; transTo = screen; transAt = now; return; }
+  }
   if (on) {
     bool backOff = manualAt && now - manualAt < 45000UL && !newSong;
     if (musicState == 1 && !backOff && screen != PLAYER_SCREEN) {
@@ -911,6 +1013,7 @@ void loop() {
   if (SLEEP_MIN > 0 && now - lastTouch > SLEEP_MIN * 60000UL) goToSleep();
   if (now - last < 25) return;                            // about 40 fps
   last = now;
+  beatUpdate();
   sceneFrame++;
   if (menuOpen) drawSettings(sceneFrame);
   else { drawScreen(); drawTransition(); }
